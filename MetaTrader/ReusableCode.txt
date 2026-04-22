@@ -1,0 +1,29 @@
+﻿// 🔥 GLOBAL MOMENTUM FILTER (MUST BE FIRST)
+                if (MomentumFilterEngine.ShouldBlockTrade(
+                    SYMBOL,
+                    tradeDecision.Momentum,
+                    ctx.AtrPercentile,
+                    out double effectiveThreshold,
+                    out double baseThreshold))
+                 {
+                    LogFile.Write(
+                        $"[{SYMBOL}] Momentum too weak {tradeDecision.Momentum:F2} < {effectiveThreshold:F2} " +
+                        $"(Base={baseThreshold:F2}, ATR%={ctx.AtrPercentile:F2})");
+
+                    return;
+                }
+
+
+                // 🔥 Late impulse protection (execution layer)
+                double atrNormalized = ctx.AtrPercentile > 1.0
+                ? ctx.AtrPercentile / 100.0
+                : ctx.AtrPercentile;
+
+                bool isHighVol = atrNormalized > 0.85;
+                bool momentumFalling = tradeDecision.Momentum < ctx.PreviousMomentum * 0.97;
+
+                if (isHighVol && momentumFalling)
+                {
+                    LogFile.Write($"[{SYMBOL}] Late impulse blocked (momentum weakening)");
+                    return;
+                }

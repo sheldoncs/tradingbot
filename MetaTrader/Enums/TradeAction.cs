@@ -1,0 +1,34 @@
+﻿namespace MetaTrader.Enums
+{
+    public enum TradeAction
+    {
+        Hold,
+        TightenStop,
+        CloseTrade,
+        OpenTrade,
+        EnterSell,
+        EnterBuy,
+        ResistanceSupport,
+        Bullish,
+        Bearish,
+        Sell,
+        Buy,
+        Close,
+        DoNothing,
+        MoveStopToBreakEven,
+        Continue,
+        Allow,
+        H4Weak,
+        WeakMom,
+        MomentumBreakout,
+        StrongSignal,
+        Choppy,
+        ImpulseOverride,
+        DynamicBearishExhaustion,
+        DynamicBullishExhaustion,
+        PriceExtendedTooFarFromEMA9,
+        Cooling,
+        Standby,
+        None
+    }
+}
