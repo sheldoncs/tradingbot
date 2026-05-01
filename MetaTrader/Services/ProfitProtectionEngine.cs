@@ -1,105 +1,158 @@
 ﻿using MetaTrader.Data.Entities;
+using MetaTrader.Enums;
+using MetaTrader.Services.Helper;
 using MetaTrader.Util;
+using MtApi5;
 using System;
 
 namespace MetaTrader.Services
 {
     public static class ProfitProtectionEngine
     {
-        private const double BASE_BUFFER_USD = 0.20;
-
-        public static bool ShouldCloseTrade(TrackedTrade trade, string symbol)
+        private class Profile
         {
-            if (trade == null)
+            public double ActivationAtrFactor;
+            public double Stage1AtrFactor;
+            public double Stage2AtrFactor;
+            public double Stage3AtrFactor;
+        }
+
+        // --------------------------------
+        // 🔥 PROFILE PER ASSET
+        // --------------------------------
+        private static Profile GetProfile(string symbol)
+        {
+            if (symbol.Contains("XAU"))
+            {
+                return new Profile
+                {
+                    ActivationAtrFactor = 1.2,
+                    Stage1AtrFactor = 1.0,
+                    Stage2AtrFactor = 1.8,
+                    Stage3AtrFactor = 2.8
+                };
+            }
+
+            if (symbol.Contains("US100") || symbol.Contains("NAS") || symbol.Contains("SPX"))
+            {
+                return new Profile
+                {
+                    ActivationAtrFactor = 1.4,
+                    Stage1AtrFactor = 1.2,
+                    Stage2AtrFactor = 2.0,
+                    Stage3AtrFactor = 3.2
+                };
+            }
+
+            if (symbol.Contains("USD") &&
+                (symbol.Contains("ETH") || symbol.Contains("BTC") || symbol.Contains("SOL") ||
+                 symbol.Contains("AVAX") || symbol.Contains("BNB") || symbol.Contains("XRP")))
+            {
+                return new Profile
+                {
+                    ActivationAtrFactor = 1.6,
+                    Stage1AtrFactor = 1.3,
+                    Stage2AtrFactor = 2.3,
+                    Stage3AtrFactor = 3.5
+                };
+            }
+
+            // FX default
+            return new Profile
+            {
+                ActivationAtrFactor = 1.0,
+                Stage1AtrFactor = 0.8,
+                Stage2AtrFactor = 1.5,
+                Stage3AtrFactor = 2.2
+            };
+        }
+
+        public static bool ShouldCloseTrade(
+            TrackedTrade trade,
+            string symbol,
+            double atr, MqlRates[] rates1Hr, double[] emaFast)
+        {
+            if (trade == null || atr <= 0)
                 return false;
 
-            // Track peak profit
+            // --------------------------------
+            // 🔥 TRACK MAX PROFIT
+            // --------------------------------
             trade.MaxProfitUsd = Math.Max(trade.MaxProfitUsd, trade.ProfitUsd);
 
-            // ----------------------------------------------------------
-            // 🔥 DETECT ASSET TYPE
-            // ----------------------------------------------------------
-            bool isGold = symbol.Contains("XAU");
-            bool isIndex = symbol.Contains("US100") || symbol.Contains("NAS");
-            bool isFx = symbol.Length == 6 && symbol.EndsWith("USD") && !isGold && !isIndex;
-            bool isCrypto = !isGold && !isIndex && !isFx;
+            // --------------------------------
+            // 🔥 HARD GUARD — NEVER CLOSE LOSING TRADES
+            // --------------------------------
+            if (trade.ProfitUsd <= 0)
+                return false;
 
-            // ----------------------------------------------------------
-            // 🔥 DYNAMIC PROFIT FLOOR + BUFFER
-            // ----------------------------------------------------------
-            double profitFloor = 3.0;
-            double buffer = BASE_BUFFER_USD;
+            var profile = GetProfile(symbol);
 
-            if (isGold)
-            {
-                profitFloor = 5.0;
-                buffer = 0.40;
-            }
-            else if (isIndex)
-            {
-                profitFloor = 6.0;
-                buffer = 0.60;
-            }
-            else if (isCrypto)
-            {
-                profitFloor = 5.0;
-                buffer = 0.50;
-            }
-            else if (isFx)
-            {
-                profitFloor = 2.5;
-                buffer = 0.20;
-            }
+            // --------------------------------
+            // 🔥 ACTIVATION (ATR-BASED)
+            // --------------------------------
+            double activationLevel = atr * profile.ActivationAtrFactor;
 
-            // ----------------------------------------------------------
-            // 🔥 NEW: MINIMUM HOLD PHASE (CRITICAL FIX)
-            // ----------------------------------------------------------
-            double activationLevel = profitFloor * 1.5;
-
-            // Do NOT protect too early — let trade breathe
             if (trade.MaxProfitUsd < activationLevel)
                 return false;
 
-            // ----------------------------------------------------------
-            // 🔥 STAGE 1 — INITIAL TRAILING (DELAYED)
-            // ----------------------------------------------------------
-            if (trade.MaxProfitUsd >= activationLevel &&
-                trade.MaxProfitUsd < profitFloor * 3)
+            // --------------------------------
+            // 🔥 STAGE 1
+            // --------------------------------
+            if (trade.MaxProfitUsd < activationLevel * 2)
             {
-                double dynamicBuffer = buffer * 1.8; // wider buffer
+                double buffer = atr * profile.Stage1AtrFactor;
 
-                if (trade.ProfitUsd <= trade.MaxProfitUsd - dynamicBuffer)
+                bool stillHealthy = ContinuationValidator.IsHealthyContinuation(symbol,
+                    trade.Side == TradeSide.Buy ? TradeAction.EnterBuy : TradeAction.EnterSell,
+                    rates1Hr,
+                    emaFast,
+                    atr);
+
+                if (!stillHealthy && trade.ProfitUsd <= trade.MaxProfitUsd - buffer)
                 {
-                    LogFile.Write($"[{symbol}] ProfitProtection: delayed initial trailing");
+                    LogFile.Write($"[{symbol}] Protection exit (continuation failed)");
                     return true;
                 }
             }
 
-            // ----------------------------------------------------------
-            // 🔥 STAGE 2 — MEDIUM PROFITS (TREND CAPTURE)
-            // ----------------------------------------------------------
-            if (trade.MaxProfitUsd >= profitFloor * 3 &&
-                trade.MaxProfitUsd < profitFloor * 5)
+            // --------------------------------
+            // 🔥 STAGE 2
+            // --------------------------------
+            if (trade.MaxProfitUsd >= activationLevel * 2 &&
+                trade.MaxProfitUsd < activationLevel * 4)
             {
-                double dynamicBuffer = buffer * 2.5;
+                double buffer = atr * profile.Stage2AtrFactor;
 
-                if (trade.ProfitUsd <= trade.MaxProfitUsd - dynamicBuffer)
+                bool stillHealthy = ContinuationValidator.IsHealthyContinuation(symbol,
+                    trade.Side == TradeSide.Buy ? TradeAction.EnterBuy : TradeAction.EnterSell,
+                    rates1Hr,
+                    emaFast,
+                    atr);
+
+                if (!stillHealthy && trade.ProfitUsd <= trade.MaxProfitUsd - buffer)
                 {
-                    LogFile.Write($"[{symbol}] ProfitProtection: trend trailing");
+                    LogFile.Write($"[{symbol}] Protection exit (continuation failed)");
                     return true;
                 }
             }
 
-            // ----------------------------------------------------------
-            // 🔥 STAGE 3 — LARGE PROFITS (LET IT RUN)
-            // ----------------------------------------------------------
-            if (trade.MaxProfitUsd >= profitFloor * 5)
+            // --------------------------------
+            // 🔥 STAGE 3 (RUNNER MODE)
+            // --------------------------------
+            if (trade.MaxProfitUsd >= activationLevel * 4)
             {
-                double dynamicBuffer = buffer * 3.5;
+                double buffer = atr * profile.Stage3AtrFactor;
 
-                if (trade.ProfitUsd <= trade.MaxProfitUsd - dynamicBuffer)
+                bool stillHealthy = ContinuationValidator.IsHealthyContinuation(symbol,
+                    trade.Side == TradeSide.Buy ? TradeAction.EnterBuy : TradeAction.EnterSell,
+                    rates1Hr,
+                    emaFast,
+                    atr);
+
+                if (!stillHealthy && trade.ProfitUsd <= trade.MaxProfitUsd - buffer)
                 {
-                    LogFile.Write($"[{symbol}] ProfitProtection: runner trailing");
+                    LogFile.Write($"[{symbol}] Protection exit (continuation failed)");
                     return true;
                 }
             }

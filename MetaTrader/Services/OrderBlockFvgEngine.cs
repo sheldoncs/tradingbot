@@ -10,6 +10,7 @@ namespace MetaTrader.Services
         {
             public double MinImpulseAtr;
             public double MinFvgAtr;
+            public double ZoneToleranceAtr;
         }
 
         private static Profile GetProfile(string symbol)
@@ -19,7 +20,8 @@ namespace MetaTrader.Services
                 return new Profile
                 {
                     MinImpulseAtr = 1.2,
-                    MinFvgAtr = 0.4
+                    MinFvgAtr = 0.4,
+                    ZoneToleranceAtr = 0.15
                 };
             }
 
@@ -27,8 +29,9 @@ namespace MetaTrader.Services
             {
                 return new Profile
                 {
-                    MinImpulseAtr = 1.5,   // crypto needs stronger impulse
-                    MinFvgAtr = 0.5
+                    MinImpulseAtr = 1.5,
+                    MinFvgAtr = 0.5,
+                    ZoneToleranceAtr = 0.20
                 };
             }
 
@@ -37,7 +40,8 @@ namespace MetaTrader.Services
                 return new Profile
                 {
                     MinImpulseAtr = 1.6,
-                    MinFvgAtr = 0.5
+                    MinFvgAtr = 0.5,
+                    ZoneToleranceAtr = 0.20
                 };
             }
 
@@ -45,7 +49,8 @@ namespace MetaTrader.Services
             return new Profile
             {
                 MinImpulseAtr = 1.0,
-                MinFvgAtr = 0.3
+                MinFvgAtr = 0.3,
+                ZoneToleranceAtr = 0.10
             };
         }
 
@@ -64,9 +69,9 @@ namespace MetaTrader.Services
 
             var profile = GetProfile(symbol);
 
-            var c0 = rates[^1];
-            var c1 = rates[^2];
-            var c2 = rates[^3];
+            var c0 = rates[^1]; // current closed
+            var c1 = rates[^2]; // impulse candle
+            var c2 = rates[^3]; // OB candle
 
             double ema9 = emaFast[^1];
             double ema21 = emaSlow[^1];
@@ -83,14 +88,16 @@ namespace MetaTrader.Services
                 return false;
 
             // --------------------------------
-            // FVG DETECTION
+            // FVG DETECTION (with tolerance)
             // --------------------------------
+            double fvgTolerance = atr * 0.05;
+
             bool bullishFvg =
-                c2.high < c0.low &&
+                c2.high <= c0.low + fvgTolerance &&
                 (c0.low - c2.high) > atr * profile.MinFvgAtr;
 
             bool bearishFvg =
-                c2.low > c0.high &&
+                c2.low >= c0.high - fvgTolerance &&
                 (c2.low - c0.high) > atr * profile.MinFvgAtr;
 
             // --------------------------------
@@ -100,13 +107,20 @@ namespace MetaTrader.Services
             bool bearishOB = c2.close > c2.open;
 
             // --------------------------------
-            // RETURN INTO ZONE
+            // RETURN INTO ZONE (with ATR tolerance)
             // --------------------------------
-            bool inBullZone = c0.low <= c1.low && c0.low >= c2.high;
-            bool inBearZone = c0.high >= c1.high && c0.high <= c2.low;
+            double zoneTol = atr * profile.ZoneToleranceAtr;
+
+            bool inBullZone =
+                c0.low <= c1.low + zoneTol &&
+                c0.low >= c2.high - zoneTol;
+
+            bool inBearZone =
+                c0.high >= c1.high - zoneTol &&
+                c0.high <= c2.low + zoneTol;
 
             // --------------------------------
-            // FINAL
+            // FINAL CONDITIONS
             // --------------------------------
             bool buy =
                 trendUp &&

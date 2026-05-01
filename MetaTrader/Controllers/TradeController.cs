@@ -5,6 +5,7 @@ using MetaTrader.Enums;
 using MetaTrader.helper;
 using MetaTrader.Services;
 using MetaTrader.Services.Contract;
+using MetaTrader.Services.Helper;
 using MetaTrader.Services.Interfaces;
 using MetaTrader.Streamer;
 using MetaTrader.Util;
@@ -32,6 +33,7 @@ namespace MetaTrader.Controllers
         private readonly IConfiguration _configuration;
         private readonly TradeServiceEngine _tradeService;
         private readonly ITradingPairProperties _tradingPairProperties;
+        private readonly IServiceProvider _provider;
         public TradeController(
                                 //ITradeService tradeService,
                                 TradeServiceEngine tradeService,
@@ -41,7 +43,8 @@ namespace MetaTrader.Controllers
                                    IMetaTraderConnectionService metaTraderConnectionService,
                                    TradeStateStore stateStore,
                                      ITradingPairProperties tradingPairProperties,
-        ILogger<TradeController> logger) : base(logger)
+        ILogger<TradeController> logger,
+        IServiceProvider provider) : base(logger)
         {
             _stateStore = stateStore;
             _chatHub = chatHub;
@@ -50,6 +53,7 @@ namespace MetaTrader.Controllers
             _notificationService = notificationService;
             _configuration = configuration;
             _tradingPairProperties = tradingPairProperties;
+            _provider = provider;
         }
 
         [HttpGet("connection/provider")]
@@ -150,6 +154,40 @@ namespace MetaTrader.Controllers
 
         }
 
+        [HttpGet("activelock")]
+        public IActionResult TestActiveLock()
+        {
+           
+            if (GlobalTradeManager.HasActiveLock(_provider) == true)
+            {
+                LogFile.Write("Global trade lock active (provider) — skipping new entries");
+                
+            }
+            else
+            {
+                LogFile.Write("Acquiring global trade lock for provider...");
+                GlobalTradeManager.TryAcquireTradeLock(_provider);
+            }
+
+
+            return Ok(GlobalTradeManager.HasActiveLock(_provider));
+          
+        }
+
+        [HttpGet("relaselock")]
+        public IActionResult TestReleaseLock()
+        {
+
+            if (GlobalTradeManager.HasActiveLock(_provider) == true)
+            {
+                LogFile.Write("Global trade lock active (provider) — skipping new entries");
+                GlobalTradeManager.ReleaseTradeLock(_provider);
+            }
+            
+            return Ok(GlobalTradeManager.HasActiveLock(_provider));
+
+        }
+
         [HttpPost("connect/{connectionId}")]
         public async Task<IActionResult> connect(String connectionId, CancellationToken cancellationToken)
         {
@@ -170,44 +208,44 @@ namespace MetaTrader.Controllers
                 {
                     TradingEventBus.onMarketPhaseLoop += async (marketPhase) =>
                     {
-                        await _chatHub.Clients.Group("dashboards").SendAsync("onMarketPhaseUpdate", marketPhase);
+                        await _chatHub.Clients.Group("test").SendAsync("onMarketPhaseUpdate", marketPhase);
                     };
 
                     TradingEventBus.OnState += async (tradeaction) =>
                     {
-                        await _chatHub.Clients.Group("dashboards").SendAsync("onStateUpdate", tradeaction);
+                        await _chatHub.Clients.Group("test").SendAsync("onStateUpdate", tradeaction);
                     };
 
                     TradingEventBus.onSniper += async (sniperaction) =>
                     {
-                        await _chatHub.Clients.Group("dashboards").SendAsync("onSniperUpdate", sniperaction);
+                        await _chatHub.Clients.Group("test").SendAsync("onSniperUpdate", sniperaction);
                     };
 
                     TradingEventBus.OnDecision += async (decision) =>
                     {
-                        await _chatHub.Clients.Group("dashboards").SendAsync("onDecisionAction", decision);
+                        await _chatHub.Clients.Group("test").SendAsync("onDecisionAction", decision);
                     };
 
                     TradingEventBus.OnTrade += async (trade) =>
                     {
-                        await _chatHub.Clients.Group("dashboards").SendAsync("onTradeAction", trade);
+                        await _chatHub.Clients.Group("test").SendAsync("onTradeAction", trade);
                     };
 
                     TradingEventBus.onM15Snapshot += async (m15Snapshot) =>
                     {
-                        await _chatHub.Clients.Group("dashboards").SendAsync("onM15Snapshot", m15Snapshot);
+                        await _chatHub.Clients.Group("test").SendAsync("onM15Snapshot", m15Snapshot);
                     };
 
                     TradingEventBus.onPerformanceContext += async (performanceContext) =>
                     {
-                        await _chatHub.Clients.Group("dashboards").SendAsync("onPerformanceContext", performanceContext);
+                        await _chatHub.Clients.Group("test").SendAsync("onPerformanceContext", performanceContext);
                     };
 
                 _tradeService.connect(
                     async (chunk) =>
                     {
                         // This is the callback — it's called with every message chunk from the assistant
-                        await _chatHub.Clients.Group("dashboards").SendAsync("BuySellIndicator", chunk);
+                        await _chatHub.Clients.Group("test").SendAsync("BuySellIndicator", chunk);
                     });
                 }
             }

@@ -388,6 +388,37 @@ namespace MetaTrader.Util
                 if (ctx.ExpansionCandles == 2)
                     ctx.TransitionTo(MarketState.Continuation);
 
+                // ---------------------------------
+                // 🧠 DETECT LATE EXPANSION (NEW)
+                // ---------------------------------
+                double ema9 = emaFast1H[^1];
+                double ema21 = emaSlow1H[^1];
+
+                double emaSpread = Math.Abs(ema9 - ema21);
+                double atrMultiple = emaSpread / atrRaw;
+
+                // slope weakening
+                double slopeNow = emaFast1H[^1] - emaFast1H[^2];
+                double slopePrev = emaFast1H[^2] - emaFast1H[^3];
+
+                bool slopeWeakening = Math.Abs(slopeNow) < Math.Abs(slopePrev);
+
+                // extension
+                double distanceFromEMA = Math.Abs(rates1H[^1].close - ema9);
+                bool extended = distanceFromEMA > atrRaw * 1.5;
+
+                bool strongTrend = atrMultiple > 1.2;
+
+                if (strongTrend && (slopeWeakening || extended))
+                {
+                    if (ctx.State != MarketState.LateExpansion)
+                    {
+                        Console.WriteLine($"⚠️ {SYMBOL} → LateExpansion");
+                        //ctx.TransitionTo(MarketState.LateExpansion);
+                    }
+                }
+
+
                 if (ctx.IsLateExpansion)
                     ctx.TransitionTo(MarketState.Exhaustion);
 

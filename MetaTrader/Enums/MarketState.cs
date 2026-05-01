@@ -10,7 +10,8 @@
         Pullback,
         Armed,
         Tradable,
-        FailedExpansion
+        FailedExpansion,
+        LateExpansion
     }
 
 }

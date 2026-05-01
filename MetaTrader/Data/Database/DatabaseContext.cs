@@ -24,6 +24,7 @@ namespace MetaTrader.Data.Database
 
       
         public DbSet<TelegramProperties> Telegram { get; set; }
+        public DbSet<GlobalTradeLock> GlobalTradeLock { get; set; }
         public DbSet<TradingPairs> Tradingpairs { get; set; }
         public DbSet<ApiToken> Apitoken { get; set; }
         public DbSet<Diagnostic> Diagnostic { get; set; }
@@ -42,6 +43,7 @@ namespace MetaTrader.Data.Database
             _configuration = configuration;
             _logger = logger;
         }
+
         public TData AddEntry<TData>(TData data, Boolean saveType)
         {
             if (saveType)

@@ -12,23 +12,23 @@ namespace MetaTrader.Services
 {
     public static class SniperEntryEngineV3
     {
-        public static double MinAtrPercentile = 0.55;
+        public static double MinAtrPercentile = 0.40;
         public static int StructureLookback = 3;
 
-        public static double ImpulseRangeAtr = 1.00;
+        public static double ImpulseRangeAtr = 0.80;
         public static double ImpulseBodyRatio = 0.50;
 
-        public static double PullbackMaxAtr = 0.85;
-        public static double PullbackWickRatioMax = 0.75;
-        public static double PullbackNearEmaAtr = 0.55;
+        public static double PullbackMaxAtr = 0.95;
+        public static double PullbackWickRatioMax = 0.80;
+        public static double PullbackNearEmaAtr = 0.80;
 
-        public static double ContinuationRangeAtr = 0.60;
-        public static double ContinuationBodyRatio = 0.50;
+        public static double ContinuationRangeAtr = 0.50;
+        public static double ContinuationBodyRatio = 0.45;
 
-        public static double EmaDistanceAtrMin = 0.12;
+        public static double EmaDistanceAtrMin = 0.08;
         public static double MaxSpreadAtrFactor = 0.30;
 
-        const int MinScore = 6;
+        const int MinScore = 5;
 
         public static TradeAction Decide(
             string symbol,
@@ -65,86 +65,70 @@ namespace MetaTrader.Services
                 if (ExecutionGuards.IsSpreadTooWide(client, symbol, atr, MaxSpreadAtrFactor))
                     return TradeAction.Hold;
 
-                var lastClosed = ratesH1[^1];
-                if (VolatilityGuard.IsShockBlocking(symbol, lastClosed.time, atr))
+                var c0 = ratesH1[^1];
+                var c1 = ratesH1[^2];
+                var c2 = ratesH1[^3];
+
+                if (VolatilityGuard.IsShockBlocking(symbol, c0.time, atr))
                     return TradeAction.Hold;
 
-                // -----------------------------
+                // =========================
                 // TREND
-                // -----------------------------
-                bool bullish = emaFastH1[^1] > emaSlowH1[^1] && emaFastH1[^1] > emaFastH1[^2];
-                bool bearish = emaFastH1[^1] < emaSlowH1[^1] && emaFastH1[^1] < emaFastH1[^2];
+                // =========================
+                bool bullish = emaFastH1[^1] > emaSlowH1[^1];
+                bool bearish = emaFastH1[^1] < emaSlowH1[^1];
 
                 if (!bullish && !bearish)
                     return TradeAction.Hold;
 
                 double emaSlope = emaFastH1[^1] - emaFastH1[^2];
+                bool slopeOk = bullish ? emaSlope > 0 : emaSlope < 0;
 
-                if (bullish && emaSlope <= 0) return TradeAction.Hold;
-                if (bearish && emaSlope >= 0) return TradeAction.Hold;
+                if (!slopeOk)
+                    return TradeAction.Hold;
 
                 double emaDist = Math.Abs(emaFastH1[^1] - emaSlowH1[^1]);
                 if (emaDist < atr * EmaDistanceAtrMin)
                     return TradeAction.Hold;
 
-                // -----------------------------
-                // PATTERN
-                // -----------------------------
-                var c0 = ratesH1[^1];
-                var c1 = ratesH1[^2];
-                var c2 = ratesH1[^3];
-
-                // --------------------------------
-                // 🔥 ANTI-LATE SNIPER GUARD (NEW)
-                // --------------------------------
-
-                // Current EMA9
+                // =========================
+                // EMA EXTENSION (SMART)
+                // =========================
                 double ema9 = emaFastH1[^1];
-
-                // Distance from EMA9
                 double distanceFromEma = Math.Abs(c0.close - ema9);
 
-                // Asset-based tuning (important for your system)
                 double maxDistanceAtr =
-                    symbol.Contains("XAU") ? 0.7 :
-                    symbol.Contains("US100") ? 0.7 :
-                    symbol.Contains("ETH") || symbol.Contains("BTC") ? 0.9 :
-                    0.5; // FX default
+                    symbol.Contains("XAU") ? 1.1 :
+                    symbol.Contains("US100") ? 1.0 :
+                    symbol.Contains("ETH") || symbol.Contains("BTC") ? 1.2 :
+                    0.7;
 
-                bool tooExtended = distanceFromEma > atr * maxDistanceAtr;
+                bool strongTrend = Math.Abs(emaSlope) > atr * 0.05;
+
+                bool tooExtended = !strongTrend && distanceFromEma > atr * maxDistanceAtr;
 
                 if (tooExtended)
                 {
-                    LogFile.Write($"[SNIPER] {symbol} blocked: too extended from EMA9");
+                    LogFile.Write($"[SNIPER] {symbol} blocked: too extended (non-trend)");
                     return TradeAction.Hold;
                 }
 
-                // --------------------------------
-                // 🔥 PRIOR IMPULSE BLOCK (NEW)
-                // --------------------------------
-
-                // If previous candle already expanded strongly, skip (avoid late entry)
+                // =========================
+                // PRIOR IMPULSE (RELAXED)
+                // =========================
                 double prevRange = c1.high - c1.low;
 
-                if (prevRange > atr * 1.0)
+                if (prevRange > atr * 1.4)
                 {
-                    LogFile.Write($"[SNIPER] {symbol} blocked: prior candle already impulsive");
+                    LogFile.Write($"[SNIPER] {symbol} blocked: extreme impulse");
                     return TradeAction.Hold;
                 }
-                // -----------------------------
-                // FOLLOW THROUGH
-                // -----------------------------
-                double impulseRange = c2.high - c2.low;
-                double followThrough = Math.Abs(c1.close - c2.close);
 
-                if (followThrough < impulseRange * 0.20)
-                    return TradeAction.Hold;
-
-                // -----------------------------
-                // SCORING
-                // -----------------------------
+                // =========================
+                // STRUCTURE SCORING
+                // =========================
                 bool impulseOk = IsImpulse(c2, atr, bullish ? TradeDirection.Bullish : TradeDirection.Bearish);
-                if (impulseOk) score += 3;
+                if (impulseOk) score += 2;
 
                 bool pullbackOk = IsControlledPullback(c1, atr, ema9);
                 if (pullbackOk) score += 2;
@@ -155,28 +139,40 @@ namespace MetaTrader.Services
                 bool brokeStructure = BreaksStructure(ratesH1, c0, atr, bullish ? TradeDirection.Bullish : TradeDirection.Bearish);
                 if (brokeStructure) score += 1;
 
-                // --------------------------------
-                // 🔥 GOLD MOMENTUM FILTER
-                // --------------------------------
-                bool strongMomentum = MomentumEvaluator.IsStrong(c0, atr, 0.9, 0.6);
+                // =========================
+                // MOMENTUM (RELAXED)
+                // =========================
+                bool strongMomentum = MomentumEvaluator.IsStrong(c0, atr, 0.6, 0.45);
 
-                if (!strongMomentum)
+                if (!strongMomentum && !continuationOk)
+                {
+                    ev.Regime = "WeakMomentum";
                     return TradeAction.Hold;
+                }
 
-                // -----------------------------
+                // =========================
                 // M15 CONFIRMATION
-                // -----------------------------
+                // =========================
                 TradeAction direction =
                     bullish ? TradeAction.Bullish : TradeAction.Bearish;
-                var reason = "";
-                
+
+                string reason = "";
                 if (M15Service.IsTradeAllowed(symbol, direction, EntryModel.Sniper, ctx.CurrentMomentum, out reason))
                     score += 1;
 
+                // =========================
+                // FINAL SCORE
+                // =========================
                 if (score < MinScore)
+                {
+                    ev.Regime = "LowScore";
+                    ev.ActionDescription = $"Score too low ({score})";
                     return TradeAction.Hold;
+                }
 
                 var action = bullish ? TradeAction.EnterBuy : TradeAction.EnterSell;
+
+                LogFile.Write($"[SNIPER V4] {symbol} - Score: {score} - Action: {action}");
 
                 ev.Regime = "ContinuationEntry";
                 ev.ActionDescription = $"Sniper score = {score}";
@@ -213,7 +209,7 @@ namespace MetaTrader.Services
             if (range <= 0) return false;
 
             double body = Math.Abs(c.close - c.open);
-            double wickRatio = (c.high - c.low - body) / range;
+            double wickRatio = (range - body) / range;
 
             double mid = (c.open + c.close) / 2;
 

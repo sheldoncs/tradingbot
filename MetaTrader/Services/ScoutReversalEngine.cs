@@ -89,9 +89,10 @@ namespace MetaTrader.Services
             double bodyRatio = body0 / range0;
 
             // --------------------------------
-            // REGIME CHECK
+            // REGIME (RELAXED)
             // --------------------------------
-            if (ctx.State != MarketState.Exhaustion)
+            if (ctx.State != MarketState.Exhaustion &&
+                ctx.State != MarketState.LateExpansion)
                 return false;
 
             // --------------------------------
@@ -101,31 +102,31 @@ namespace MetaTrader.Services
             bool wasUptrend = emaFast[^2] > emaSlow[^2];
 
             // --------------------------------
-            // STRONG REVERSAL CANDLE
+            // STRONG REVERSAL CANDLE (RELAXED)
             // --------------------------------
             bool strongBullish =
                 c0.close > c0.open &&
-                range0 >= atr * profile.MinRangeAtr &&
-                bodyRatio >= profile.BodyRatio;
+                range0 >= atr * (profile.MinRangeAtr * 0.85) &&
+                bodyRatio >= (profile.BodyRatio * 0.85);
 
             bool strongBearish =
                 c0.close < c0.open &&
-                range0 >= atr * profile.MinRangeAtr &&
-                bodyRatio >= profile.BodyRatio;
+                range0 >= atr * (profile.MinRangeAtr * 0.85) &&
+                bodyRatio >= (profile.BodyRatio * 0.85);
 
             // --------------------------------
-            // STRUCTURE BREAK
+            // STRUCTURE BREAK (FIXED LOGIC)
             // --------------------------------
             bool breaksUp =
-                c0.close > c1.high * profile.BreakStrength;
+                c0.close > c1.high + (atr * profile.BreakStrength * 0.2);
 
             bool breaksDown =
-                c0.close < c1.low * profile.BreakStrength;
+                c0.close < c1.low - (atr * profile.BreakStrength * 0.2);
 
             // --------------------------------
             // BUY SCOUT
             // --------------------------------
-            if (wasDowntrend && strongBullish && breaksUp)
+            if (wasDowntrend && strongBullish && (breaksUp || bodyRatio > 0.7))
             {
                 LogFile.Write($"[{symbol}] 🟢 Scout BUY (adaptive)");
                 action = TradeAction.EnterBuy;
@@ -135,7 +136,7 @@ namespace MetaTrader.Services
             // --------------------------------
             // SELL SCOUT
             // --------------------------------
-            if (wasUptrend && strongBearish && breaksDown)
+            if (wasUptrend && strongBearish && (breaksDown || bodyRatio > 0.7))
             {
                 LogFile.Write($"[{symbol}] 🔴 Scout SELL (adaptive)");
                 action = TradeAction.EnterSell;
@@ -155,7 +156,6 @@ namespace MetaTrader.Services
             s.Contains("US100") || s.Contains("NAS") || s.Contains("SPX");
 
         private static bool IsCrypto(string s) =>
-            s.Contains("BTC") || s.Contains("ETH") || s.Contains("SOL");
-
+            s.Contains("BTC") || s.Contains("ETH") || s.Contains("SOL") || s.Contains("AVAX") || s.Contains("BNB");
     }
 }

@@ -12,22 +12,68 @@ namespace MetaTrader.Services
 {
     public static class BreakoutContinuationEntryEngine
     {
-        public static double MinAtrPercentile = 0.70;
-        public static double BodyAtrMin = 0.55;
-        public static double CloseNearExtreme = 0.75;
+        private class Profile
+        {
+            public double MinAtrPercentile;
+            public double BodyAtrMin;
+            public double Ema9DistanceAtr;
+            public double BreakoutBufferAtr;
+        }
+
+        private static Profile GetProfile(string symbol)
+        {
+            if (symbol.Contains("XAU"))
+            {
+                return new Profile
+                {
+                    MinAtrPercentile = 0.60,
+                    BodyAtrMin = 0.45,          // 🔧 relaxed
+                    Ema9DistanceAtr = 1.6,
+                    BreakoutBufferAtr = 0.10
+                };
+            }
+
+            if (symbol.Contains("US100") || symbol.Contains("NAS") || symbol.Contains("SPX"))
+            {
+                return new Profile
+                {
+                    MinAtrPercentile = 0.55,
+                    BodyAtrMin = 0.35,          // 🔧 relaxed
+                    Ema9DistanceAtr = 1.7,
+                    BreakoutBufferAtr = 0.10    // 🔧 slightly reduced
+                };
+            }
+
+            if (symbol.Contains("USD") &&
+                (symbol.Contains("ETH") || symbol.Contains("BTC") ||
+                 symbol.Contains("SOL") || symbol.Contains("AVAX") ||
+                 symbol.Contains("BNB")))
+            {
+                return new Profile
+                {
+                    MinAtrPercentile = 0.65,
+                    BodyAtrMin = 0.40,          // 🔧 relaxed
+                    Ema9DistanceAtr = 2.0,
+                    BreakoutBufferAtr = 0.12    // 🔧 relaxed
+                };
+            }
+
+            // FX default
+            return new Profile
+            {
+                MinAtrPercentile = 0.50,
+                BodyAtrMin = 0.30,              // 🔧 relaxed
+                Ema9DistanceAtr = 1.3,
+                BreakoutBufferAtr = 0.08
+            };
+        }
+
         public static int StructureLookback = 8;
         public static int CooldownMinutes = 60;
-
         public static double MaxSpreadAtrFactor = 0.25;
+        public static double CloseNearExtreme = 0.65; // 🔧 relaxed from 0.75
 
         private static readonly Dictionary<string, DateTime> _lastEntryUtc = new();
-        private static int breakoutCounter = 0;
-
-        public static void breakoutContinuationCounter()
-        {
-            LogFile.Write($"Break test entries count: {breakoutCounter + 1}");
-            breakoutCounter++;
-        }
 
         public static TradeAction Decide(
             string symbol,
@@ -51,39 +97,24 @@ namespace MetaTrader.Services
             if (ratesH1Closed == null || ratesH1Closed.Length < StructureLookback + 5)
                 return TradeAction.Hold;
 
-            if (emaFastH1 == null || emaSlowH1 == null)
+            if (emaFastH1 == null || emaSlowH1 == null || atr <= 0)
                 return TradeAction.Hold;
 
-            if (atr <= 0)
-                return TradeAction.Hold;
+            var profile = GetProfile(symbol);
 
             var lastClosed = ratesH1Closed[^1];
-            var prevClosed = ratesH1Closed[^2];
 
             double ema9 = emaFastH1[^1];
             double ema21 = emaSlowH1[^1];
 
             // --------------------------------
-            // IMPULSE COOLDOWN GUARD
-            // --------------------------------
-            double impulseRange = lastClosed.high - lastClosed.low;
-
-            if (impulseRange > atr * 1.8)
-            {
-                ev.Regime = "ImpulseBlock";
-                ev.ActionDescription = "Large impulse candle";
-                return TradeAction.Hold;
-            }
-
-            // --------------------------------
-            // EXTENSION GUARD
+            // EXTENSION GUARD (keep as-is)
             // --------------------------------
             double distanceFromEMA9 = Math.Abs(lastClosed.close - ema9);
 
-            if (distanceFromEMA9 > atr * 1.2)
+            if (distanceFromEMA9 > atr * profile.Ema9DistanceAtr)
             {
                 ev.Regime = "Extended";
-                ev.ActionDescription = "Price too far from EMA9";
                 return TradeAction.Hold;
             }
 
@@ -95,20 +126,6 @@ namespace MetaTrader.Services
             if (distanceFromEMA21 > atr * 2.5)
             {
                 ev.Regime = "TrendExhausted";
-                ev.ActionDescription = "Trend too extended";
-                return TradeAction.Hold;
-            }
-
-            // --------------------------------
-            // EMA SLOPE FILTER
-            // --------------------------------
-            double slopeNow = emaFastH1[^1] - emaFastH1[^2];
-            double slopePrev = emaFastH1[^2] - emaFastH1[^3];
-
-            if (Math.Abs(slopeNow) < Math.Abs(slopePrev) * 0.5)
-            {
-                ev.Regime = "WeakSlope";
-                ev.ActionDescription = "EMA momentum weakening";
                 return TradeAction.Hold;
             }
 
@@ -124,7 +141,7 @@ namespace MetaTrader.Services
             // --------------------------------
             // ATR REGIME
             // --------------------------------
-            if (atrPercentile < MinAtrPercentile)
+            if (atrPercentile < profile.MinAtrPercentile)
             {
                 ev.Regime = "LowATR";
                 return TradeAction.Hold;
@@ -164,7 +181,7 @@ namespace MetaTrader.Services
             }
 
             // --------------------------------
-            // BREAKOUT CANDLE QUALITY
+            // CANDLE QUALITY (RELAXED)
             // --------------------------------
             double range = lastClosed.high - lastClosed.low;
             if (range <= 0) return TradeAction.Hold;
@@ -177,14 +194,14 @@ namespace MetaTrader.Services
             bool closeStrongBull = closePos >= CloseNearExtreme;
             bool closeStrongBear = closePos <= (1.0 - CloseNearExtreme);
 
-            if (bodyAtr < BodyAtrMin)
+            if (bodyAtr < profile.BodyAtrMin)
             {
                 ev.Regime = "WeakBody";
                 return TradeAction.Hold;
             }
 
             // --------------------------------
-            // STRUCTURE BREAK
+            // STRUCTURE BREAK (RELAXED BUFFER)
             // --------------------------------
             var lookback = ratesH1Closed
                 .Skip(Math.Max(0, ratesH1Closed.Length - (StructureLookback + 1)))
@@ -194,7 +211,7 @@ namespace MetaTrader.Services
             double priorHigh = lookback.Max(c => c.high);
             double priorLow = lookback.Min(c => c.low);
 
-            double breakoutBuffer = atr * 0.10;
+            double breakoutBuffer = atr * profile.BreakoutBufferAtr;
 
             bool brokeUp = lastClosed.close > priorHigh + breakoutBuffer;
             bool brokeDown = lastClosed.close < priorLow - breakoutBuffer;
@@ -214,14 +231,16 @@ namespace MetaTrader.Services
             }
 
             // --------------------------------
-            // OPTIONAL M15 CONFIRMATION
+            // OPTIONAL M15 CONFIRMATION (unchanged)
             // --------------------------------
             if (m15Service != null)
             {
                 var dir = action == TradeAction.EnterBuy
                     ? TradeAction.Bullish
                     : TradeAction.Bearish;
+
                 var reason = "";
+
                 if (!m15Service.IsTradeAllowed(symbol, dir, EntryModel.Continuation, ctx.CurrentMomentum, out reason))
                 {
                     ev.Regime = "M15Block";
@@ -231,10 +250,8 @@ namespace MetaTrader.Services
 
             _lastEntryUtc[symbol] = DateTime.UtcNow;
 
-            breakoutContinuationCounter();
-
             ev.Regime = "BreakoutContinuation";
-            ev.ActionDescription = $"Breakout continuation ({action}) | bodyATR={bodyAtr:F2}";
+            ev.ActionDescription = $"Breakout continuation ({action})";
             ev.SniperAction = action.ToString();
 
             return action;
