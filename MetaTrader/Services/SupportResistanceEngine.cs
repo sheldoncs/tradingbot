@@ -178,6 +178,7 @@ namespace MetaTrader.Services
                     LogFile.Write($"[{symbol}] ❌ Buy blocked: holding resistance");
                     return true;
                 }
+                LogFile.Write($"[{symbol}] ✅ Buy allowed: no strong resistance nearby");
             }
 
             // --------------------------------
@@ -191,6 +192,8 @@ namespace MetaTrader.Services
                     LogFile.Write($"[{symbol}] ❌ Sell blocked: holding support");
                     return true;
                 }
+
+                LogFile.Write($"[{symbol}] ✅ Sell allowed: no strong support nearby");
             }
 
             return false;

@@ -17,6 +17,7 @@
         Trap,
         Override,
         Sniper,
+        Hold,
         TrendRide,
         Fallback,
         Exhaustion,

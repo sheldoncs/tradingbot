@@ -182,13 +182,20 @@ namespace MetaTrader.Util
         private static double CalculateAtrPercentile(
             double currentAtr,
             Queue<double> history)
-        {
-            if (history.Count < 10)
-                return 50.0;
+                {
+                    if (history == null || history.Count < 20)
+                        return 50.0;
 
-            int below = history.Count(x => x < currentAtr);
+                    int belowOrEqual = history.Count(x => x <= currentAtr);
 
-            return (double)below / history.Count * 100.0;
+                    double percentile =
+                        ((double)belowOrEqual / history.Count) * 100.0;
+
+                    // safety clamp
+                    percentile = Math.Max(1.0, percentile);
+                    percentile = Math.Min(99.0, percentile);
+
+                    return percentile;
         }
 
         // ----------------------------

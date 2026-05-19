@@ -11,7 +11,8 @@ namespace MetaTrader.Services
             Chop,
             Building,
             Tradable,
-            Expansion
+            Expansion,
+            Exhaustion
         }
 
         public enum AssetProfile
@@ -125,6 +126,40 @@ namespace MetaTrader.Services
             // -----------------------------------------
             // REGIME DECISION
             // -----------------------------------------
+
+            // -----------------------------------------
+            // 5. EXHAUSTION DETECTION
+            // -----------------------------------------
+
+            double body0 = Math.Abs(c0.close - c0.open);
+            double body1 = Math.Abs(c1.close - c1.open);
+
+            double bodyRatio0 =
+                body0 / Math.Max(range0, 0.00001);
+
+            double emaExtension =
+                Math.Abs(c0.close - ema9);
+
+            bool excessiveExtension =
+                emaExtension > atr * 2.2;
+
+            bool climacticExpansion =
+                expansionNow &&
+                expansionRecent &&
+                bodyRatio0 >= 0.75;
+
+            bool repeatedExpansion =
+                range0 > atr * expansionFactor &&
+                range1 > atr * expansionFactor;
+
+            bool exhaustionMomentum =
+                climacticExpansion &&
+                repeatedExpansion;
+
+            bool exhaustion =
+                trendAligned &&
+                excessiveExtension &&
+                exhaustionMomentum;
 
             // 🔥 EXPANSION (money phase)
             if (trendAligned && slopeStrong && expansionNow && cleanMomentum)
