@@ -834,8 +834,41 @@ namespace MetaTrader.Services
                 LogFile.Write("🔓 No open positions found — releasing stale global lock");
                 GlobalTradeManager.ReleaseTradeLock(_provider);
             }
+
             if (trackedTrade != null)
             {
+                GoldBreakEvenLock.Apply(trackedTrade, mid, atrRaw, ModifyTrade);
+                if (LiveAdverseMoveGuard.ShouldClose(
+                    trackedTrade,
+                    trackedTrade.Symbol,
+                    bid,
+                    ask,
+                    atrRaw,
+                    rates1H,
+                    emaFast1H,
+                    emaSlow1H))
+                {
+                    generalCloseTrade(bid, ask, ctx);
+                    return;
+                }
+            }
+
+            if (trackedTrade != null)
+            {
+
+                PerTradeEquityLossGuard.Arm(
+                    trackedTrade.Ticket,
+                    trackedTrade.Symbol,
+                    accountEquity
+                );
+
+                if (PerTradeEquityLossGuard.ShouldClose(trackedTrade.Ticket, trackedTrade.Symbol, accountEquity))
+                {
+                    generalCloseTrade(bid, ask, ctx);
+                    PerTradeEquityLossGuard.Reset(trackedTrade.Ticket);
+                    return;
+                }
+
                 if (!HasAnyOpenPositionBySymbol(trackedTrade.Symbol))
                 {
                     if (GlobalTradeManager.HasActiveLock(_provider))
@@ -862,21 +895,14 @@ namespace MetaTrader.Services
                     // - Sniper continuation
                     // - structure logic
                 }
-                double atrUsd = ConvertAtrToUsd(trackedTrade.Symbol, atrRaw, trackedTrade.Volume);
-
-                bool closeAll = EquityProtectionEngine.ShouldCloseAll(
-                    trackedTrade.Symbol,
-                    accountEquity,
-                    atrUsd,
-                    currentCandleTime
-                  );
-
-                if (_client.PositionsTotal() > 0 && closeAll)
+                
+                if (EquityGivebackProtection.ShouldCloseAll(accountEquity, "FTMO10K"))
                 {
-                    LogFile.Write($"🛑 EQUITY STOP: equity={accountEquity:F2} peak={EquityProtectionEngine.MaxEquity:F2}");
+                    LogFile.Write($"🛑 EQUITY GIVEBACK STOP: equity={accountEquity:F2} startingEquity={startingEquity:F2}");
                     PostExitCooldown.RegisterForcedExit(SYMBOL); // 👈 memory added
                     generalCloseTrade(bid, ask, ctx);
-                    EquityProtectionEngine.Initialize(accountEquity); // re-baseline after forced close
+                    EquityGivebackProtection.Reset(accountEquity);
+
                     return;
                 }
             }
@@ -1531,211 +1557,7 @@ namespace MetaTrader.Services
                     atr,
                     out var conditionReason);
 
-                if (regime == MarketRegimeDetector.Regime.Tradable || regime == MarketRegimeDetector.Regime.Expansion)
-                {
-                    if (CascadeBreakdownEngine.ShouldEnter(SYMBOL, _client, rates1H, atr, emaFast, emaSlow, out var cascadeAction))
-                    {
 
-                        engine = "CascadeBreakdownEngine";
-
-                        switch (condition)
-                        {
-                            case MarketCondition.Compression:
-                                LogFile.Write($"🟡 {symbol}: compression");
-
-                                // ❌ block both
-                                return (TradeAction.DoNothing, EntryModel.Nothing);
-
-                            case MarketCondition.Expansion:
-                                LogFile.Write($"🟢 {symbol}: expansion");
-                                break;
-
-                            case MarketCondition.ExtendedTrend:
-                                LogFile.Write($"🟠 {symbol}: extended trend");
-                                break;
-
-                            case MarketCondition.Exhaustion:
-                                LogFile.Write($"❌ {symbol} blocked: exhaustion");
-
-                                return (TradeAction.DoNothing, EntryModel.Nothing);
-
-                            default:
-                                return (TradeAction.DoNothing, EntryModel.Nothing);
-                        }
-
-                        bool isBuy = cascadeAction == TradeAction.EnterBuy;
-
-                        bool strongMomentum = isBuy
-                            ? CascadeMomentumHelper.IsStrongCascadeBuy(rates1H, atr, ask, VelocityProfile.Gold)
-                            : CascadeMomentumHelper.IsStrongCascadeSell(rates1H, atr, bid, VelocityProfile.Gold);
-
-                        // 🔥 NEW: Break Intent
-                        var last = rates1H[^1];
-                        var prev = rates1H[^2];
-
-                        if (CandleQualityHelper.IsIndecisionCandle(symbol, last))
-                        {
-                            LogFile.Write($"❌ {symbol} blocked: indecision candle");
-                            return (TradeAction.DoNothing, EntryModel.Nothing);
-                        }
-
-                        var profile = GetBreakoutProfile(symbol);
-
-                        bool breakIntent = isBuy
-                            ? ask > prev.high + (atr * profile.BreakBuffer)
-                            : bid < prev.low - (atr * profile.BreakBuffer);
-
-                        double range = last.high - last.low;
-                        bool strongBreakCandle = range > atr * profile.MinBreakCandle;
-
-                        // =========================
-                        // S/R Decision
-                        // =========================
-                        bool shouldBlock = SupportResistanceEngine.ShouldBlockTrade(
-                            symbol,
-                            cascadeAction,
-                            rates1H,
-                            atr,
-                            tradeDecision.Momentum,
-                            currentPrice);
-
-                        if (shouldBlock)
-                        {
-                            // 🔥 ONLY allow override if BOTH conditions are true
-                            if (!(strongMomentum && breakIntent && strongBreakCandle))
-                            {
-                                LogFile.Write("❌ Cascade blocked by S/R (no valid breakout)");
-                                return (TradeAction.DoNothing, EntryModel.Nothing);
-                            }
-
-                            LogFile.Write("⚡ Cascade override: strong momentum + break intent");
-                        }
-
-                        if (!_m15Service.IsTradeAllowed(SYMBOL, cascadeAction, EntryModel.Sniper, tradeDecision.Momentum, out var reason))
-                        {
-                            return (TradeAction.DoNothing, EntryModel.Nothing);
-                        }
-
-                        LogFile.Write("⚠️ Price extended → skipping continuation logic, evaluating cascade...");
-
-                        TradingEventBus.Decision(new DecisionEvent
-                        {
-                            Symbol = ctx.Symbol,
-                            Action = cascadeAction.ToString(),
-                            Category = DecisionCategory.Cascade.ToString(),
-                            Reason = $"Cascade Breakdown Entry {cascadeAction}",
-                            Message = $"Cascade Breakdown Entry {cascadeAction}",
-                            Momentum = tradeDecision.Momentum,
-                            EarlyMomentum = false,
-                            EmaCompressed = false,
-                            Regime = DecisionCategory.Continuation.ToString(),
-                            Time = DateTime.UtcNow
-                        });
-
-                        return (cascadeAction, EntryModel.CascadeBreakdown);
-                    }
-
-                    // 1) Velocity (live, first 15 mins)
-                    if (VelocityEntryEngine.ShouldEnter(symbol, client, atr, atrPercentile, emaFast, emaSlow, ctx, VelocityProfile.Gold, out var velAction))
-                    {
-                        engine = "VelocityEntryEngine";
-
-                        switch (condition)
-                        {
-                            case MarketCondition.Compression:
-                                LogFile.Write($"🟡 {symbol}: compression");
-
-                                // ❌ block both
-                                return (TradeAction.DoNothing, EntryModel.Nothing);
-
-                            case MarketCondition.Expansion:
-                                LogFile.Write($"🟢 {symbol}: expansion");
-
-                                // ✅ best zone
-                                break;
-
-                            case MarketCondition.ExtendedTrend:
-                                LogFile.Write($"🟠 {symbol}: extended trend");
-
-                                // ⚠️ selective
-                                return (TradeAction.DoNothing, EntryModel.Nothing);
-
-                            case MarketCondition.Exhaustion:
-                                LogFile.Write($"❌ {symbol} blocked: exhaustion");
-
-                                return (TradeAction.DoNothing, EntryModel.Nothing);
-
-                            default:
-                                return (TradeAction.DoNothing, EntryModel.Nothing);
-                        }
-
-                        bool isBuy = velAction == TradeAction.EnterBuy;
-
-                        bool strongMomentum = isBuy
-                            ? MomentumHelper.IsStrongVelocityBuy(rates1H, atr, ask, VelocityProfile.Gold)
-                            : MomentumHelper.IsStrongVelocitySell(rates1H, atr, bid, VelocityProfile.Gold);
-
-                        // 🔥 Break Intent (slightly looser than cascade)
-                        var last = rates1H[^1];
-                        var prev = rates1H[^2];
-
-                        if (CandleQualityHelper.IsIndecisionCandle(symbol, last))
-                        {
-                            LogFile.Write($"❌ {symbol} blocked: indecision candle");
-                            return (TradeAction.DoNothing, EntryModel.Nothing);
-                        }
-
-                        var profile = GetVelocityBreakoutProfile(symbol);
-
-                        bool breakIntent = isBuy
-                            ? ask > prev.high + (atr * profile.BreakBuffer)
-                            : bid < prev.low - (atr * profile.BreakBuffer);
-
-                        double range = last.high - last.low;
-                        bool strongBreakCandle = range > atr * profile.MinBreakCandle;
-
-                        bool shouldBlock = SupportResistanceEngine.ShouldBlockTrade(
-                            symbol,
-                            velAction,
-                            rates1H,
-                            atr,
-                            tradeDecision.Momentum,
-                            currentPrice);
-
-                        if (shouldBlock)
-                        {
-                            // ⚡ Velocity override (softer than cascade, but still controlled)
-                            if (!(strongMomentum && breakIntent))
-                            {
-                                LogFile.Write("❌ Velocity blocked by S/R (no valid breakout)");
-                                return (TradeAction.DoNothing, EntryModel.Nothing);
-                            }
-
-                            LogFile.Write("⚡ Velocity override: momentum + break intent");
-                        }
-
-                        if (!_m15Service.IsTradeAllowed(SYMBOL, cascadeAction, EntryModel.Sniper, tradeDecision.Momentum, out var reason))
-                        {
-                            return (TradeAction.DoNothing, EntryModel.Nothing);
-                        }
-
-                        TradingEventBus.Decision(new DecisionEvent
-                        {
-                            Symbol = ctx.Symbol,
-                            Action = velAction.ToString(),
-                            Category = DecisionCategory.Regime.ToString(),
-                            Reason = $"Velocity entry ({velAction})",
-                            Message = $"Velocity entry ({velAction})",
-                            Momentum = tradeDecision.Momentum,
-                            EarlyMomentum = false,
-                            EmaCompressed = false,
-                            Regime = DecisionCategory.Velocity.ToString(),
-                            Time = DateTime.UtcNow
-                        });
-
-                        return (velAction, EntryModel.Velocity);
-                    }
-                }
                 if (OrderBlockFvgEngine.ShouldEnter(symbol, rates1H, atr, emaFast, emaSlow, out var obAction))
                 {
                     engine = "OrderBlockFvgEngine";
@@ -1775,152 +1597,6 @@ namespace MetaTrader.Services
                     return (obAction, EntryModel.PullbackContinuation);
                 }
 
-                // 3) Breakout Continuation (closed candle)
-                var bocAction = BreakoutContinuationEntryEngine.Decide(
-                    symbol,
-                    client,
-                    rates1H,   // shift=1 closed series
-                    atr,
-                    atrPercentile,
-                    emaFast,
-                    emaSlow,
-                    ctx,
-                    _m15Service,     // or null if you want to disable M15 confirm
-                    out var bocEv);
-
-                if (bocAction == TradeAction.EnterBuy || bocAction == TradeAction.EnterSell)
-                {
-                    engine = "BreakoutContinuationEntryEngine";
-                    if (SupportResistanceEngine.ShouldBlockTrade(
-                            symbol,
-                            bocAction,
-                            rates1H,
-                            atr,
-                            tradeDecision.Momentum,
-                            currentPrice))
-                    {
-                        return (TradeAction.DoNothing, EntryModel.Nothing);
-                    }
-
-                    if (!_m15Service.IsTradeAllowed(SYMBOL, bocAction, EntryModel.Continuation, tradeDecision.Momentum, out var reason))
-                    {
-                        return (TradeAction.DoNothing, EntryModel.Nothing);
-                    }
-                    TradingEventBus.M15SnapshotUpdate(new M15Snapshot()
-                    {
-                        Message = "M15 Confirmed",
-                        Symbol = symbol,
-                    });
-                    TradingEventBus.Decision(new DecisionEvent
-                    {
-                        Symbol = ctx.Symbol,
-                        Action = bocAction.ToString(),
-                        Category = DecisionCategory.Sniper.ToString(),
-                        Reason = $"Continuation Entry {bocAction.ToString()}",
-                        Message = $"Continuation Entry {bocAction.ToString()}",
-                        Momentum = tradeDecision.Momentum,
-                        EarlyMomentum = false,
-                        EmaCompressed = false,
-                        Regime = DecisionCategory.Continuation.ToString(),
-                        Time = DateTime.UtcNow
-                    });
-
-                    return (bocAction, EntryModel.Continuation);
-                }
-
-
-                // 2) Pull back Continue 
-                if (EmaPullbackContinuationEngine.ShouldEnter(
-                    symbol,
-                    _client,
-                    rates1H,
-                    atr,
-                    emaFast,
-                    emaSlow,
-                    tradeDecision.Momentum,
-                    out var emaPullbackAction))
-                {
-                    engine = "EmaPullbackContinuationEngine";
-                    if (SupportResistanceEngine.ShouldBlockTrade(
-                            symbol,
-                            emaPullbackAction,
-                            rates1H,
-                            atr,
-                            tradeDecision.Momentum,
-                            currentPrice))
-                    {
-                        return (TradeAction.DoNothing, EntryModel.Nothing);
-                    }
-                    if (!_m15Service.IsTradeAllowed(SYMBOL, emaPullbackAction, EntryModel.Continuation, tradeDecision.Momentum, out var reason))
-                    {
-                        return (TradeAction.DoNothing, EntryModel.Nothing);
-                    }
-                    TradingEventBus.M15SnapshotUpdate(new M15Snapshot()
-                    {
-                        Message = "M15 Confirmed",
-                        Symbol = symbol,
-                    });
-                    TradingEventBus.Decision(new DecisionEvent
-                    {
-                        Symbol = ctx.Symbol,
-                        Action = emaPullbackAction.ToString(),
-                        Category = DecisionCategory.Sniper.ToString(),
-                        Reason = $"Pullback Entry {emaPullbackAction.ToString()}",
-                        Message = $"Pullback Entry {emaPullbackAction.ToString()}",
-                        Momentum = tradeDecision.Momentum,
-                        EarlyMomentum = false,
-                        EmaCompressed = false,
-                        Regime = DecisionCategory.Continuation.ToString(),
-                        Time = DateTime.UtcNow
-                    });
-                    return (emaPullbackAction, EntryModel.PullbackContinuation);
-                }
-                
-                // 4) Break Retest Continuation (live or closed, no M15 confirm)
-                if (BreakRetestEntryEngine.ShouldEnter(
-                    symbol,
-                    rates1H,
-                    atr,
-                    emaFast,
-                    emaSlow,
-                    out var breakAction))
-                {
-                    engine = "BreakRetestEntryEngine";
-                    if (SupportResistanceEngine.ShouldBlockTrade(
-                            symbol,
-                            breakAction,
-                            rates1H,
-                            atr,
-                            tradeDecision.Momentum,
-                            currentPrice))
-                    {
-                        return (TradeAction.DoNothing, EntryModel.Nothing);
-                    }
-                    if (!_m15Service.IsTradeAllowed(SYMBOL, breakAction, EntryModel.Continuation, tradeDecision.Momentum, out var reason))
-                    {
-                        return (TradeAction.DoNothing, EntryModel.Nothing);
-                    }
-                    TradingEventBus.M15SnapshotUpdate(new M15Snapshot()
-                    {
-                        Message = "M15 Confirmed",
-                        Symbol = symbol,
-                    });
-                    TradingEventBus.Decision(new DecisionEvent
-                    {
-                        Symbol = ctx.Symbol,
-                        Action = breakAction.ToString(),
-                        Category = DecisionCategory.Sniper.ToString(),
-                        Reason = $"Break Retest Continuation Entry {breakAction.ToString()}",
-                        Message = $"Break Retest Continuation Entry {breakAction.ToString()}",
-                        Momentum = tradeDecision.Momentum,
-                        EarlyMomentum = false,
-                        EmaCompressed = false,
-                        Regime = DecisionCategory.Continuation.ToString(),
-                        Time = DateTime.UtcNow
-                    });
-                    return (breakAction, EntryModel.BreakRetest);
-                }
-
                 // 5) Trend Ride Continuation (live, no M15 confirm)
                 if (TrendRideContinuationEngine.ShouldEnter(
                 symbol,
@@ -1933,8 +1609,7 @@ namespace MetaTrader.Services
                 _client,
                 out var trendRideAction))
                 {
-                    engine = "TrendRideContinuationEngine";
-
+                    engine = "trend ride";
                     if (SupportResistanceEngine.ShouldBlockTrade(
                             symbol,
                             trendRideAction,
@@ -1943,11 +1618,10 @@ namespace MetaTrader.Services
                             tradeDecision.Momentum,
                             currentPrice))
                     {
-                        LogFile.Write("⚠️ Price extended → skipping trend ride continuation, evaluating support/resistance...");
                         return (TradeAction.DoNothing, EntryModel.Nothing);
                     }
                     bool m15Allowed = _m15Service.IsTradeAllowed(SYMBOL, trendRideAction, EntryModel.Continuation, tradeDecision.Momentum, out var trendReason);
-                    
+
                     string m15DecisionReason;
 
                     bool allowTrade = M15ConfirmationGate.ShouldAllowTrade(
@@ -1990,12 +1664,6 @@ namespace MetaTrader.Services
                         return (TradeAction.DoNothing, EntryModel.Nothing);
                     }
 
-                    if (!m15Allowed)
-                    {
-                        LogFile.Write(
-                            $"⚠️ M15 soft bypass TrendRide ({trendRideAction}) — {m15DecisionReason}");
-                    }
-
                     TradingEventBus.M15SnapshotUpdate(new M15Snapshot()
                     {
                         Message = "M15 Confirmed",
@@ -2017,209 +1685,8 @@ namespace MetaTrader.Services
 
                     return (trendRideAction, EntryModel.TrendRideContinuation);
                 }
-                
-                /*
-                if (ExhaustionReversalEngine.ShouldEnter(
-                    symbol,
-                    client,
-                    atr,
-                    atrPercentile,
-                    emaFast,
-                    emaSlow,
-                    ctx,
-                    out var exhaustionReversalAction))
-                {
-                    engine = "ExhaustionReversalEngine";
-                    if (SupportResistanceEngine.ShouldBlockTrade(
-                            symbol,
-                            exhaustionReversalAction,
-                            rates1H,
-                            atr,
-                            tradeDecision.Momentum,
-                            currentPrice))
-                    {
-                        LogFile.Write("⚠️ Price extended → skipping exhaustion reversal, evaluating support/resistance...");
-                        return (TradeAction.DoNothing, EntryModel.Nothing);
-                    }
-                    var reason = "";
-                    if (!_m15Service.IsTradeAllowed(SYMBOL, exhaustionReversalAction, EntryModel.ExhaustionReversal, tradeDecision.Momentum, out reason))
-                    {
-                        LogFile.Write($"⚠️ Trade not allowed by M15 service → skipping exhaustion reversal... Reason: {reason}");
-                        return (TradeAction.DoNothing, EntryModel.Nothing);
-                    }
-                    TradingEventBus.M15SnapshotUpdate(new M15Snapshot()
-                    {
-                        Message = "M15 Confirmed",
-                        Symbol = symbol,
-                    });
-                    TradingEventBus.Decision(new DecisionEvent
-                    {
-                        Symbol = ctx.Symbol,
-                        Action = exhaustionReversalAction.ToString(),
-                        Category = DecisionCategory.Exhaustion.ToString(),
-                        Reason = $"Exhaustion Reversal {exhaustionReversalAction.ToString()}",
-                        Message = $"Exhaustion Reversal {exhaustionReversalAction.ToString()}",
-                        Momentum = tradeDecision.Momentum,
-                        EarlyMomentum = false,
-                        EmaCompressed = false,
-                        Regime = DecisionCategory.Exhaustion.ToString(),
-                        Time = DateTime.UtcNow
-                    });
-                    return (exhaustionReversalAction, EntryModel.ExhaustionReversal);
-                }
-                */
-                double point = _client.SymbolInfoDouble(symbol, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_POINT);
-                if (ExplosionEntryEngine.ShouldEnter(
-                    symbol,
-                    rates1H,
-                    atr,
-                    emaFast,
-                    emaSlow,
-                    ask,
-                    bid,
-                    point,
-                    out var explosionAction))
-                {
-                    engine = "ExplosionEntryEngine";
-                    if (SupportResistanceEngine.ShouldBlockTrade(
-                            symbol,
-                            explosionAction,
-                            rates1H,
-                            atr,
-                            tradeDecision.Momentum,
-                            currentPrice))
-                    {
-                        LogFile.Write("⚠️ Price extended → skipping explosion entry, evaluating support/resistance...");
-                        return (TradeAction.DoNothing, EntryModel.Nothing);
-                    }
-                    var reason = "";
-                    if (!_m15Service.IsTradeAllowed(SYMBOL, explosionAction, EntryModel.Explosion, tradeDecision.Momentum, out reason))
-                    {
-                        LogFile.Write($"⚠️ Trade not allowed by M15 service → skipping explosion entry... Reason: {reason}");
-                        return (TradeAction.DoNothing, EntryModel.Nothing);
-                    }
-                    TradingEventBus.M15SnapshotUpdate(new M15Snapshot()
-                    {
-                        Message = "M15 Confirmed",
-                        Symbol = symbol,
-                    });
-                    TradingEventBus.Decision(new DecisionEvent
-                    {
-                        Symbol = ctx.Symbol,
-                        Action = explosionAction.ToString(),
-                        Category = DecisionCategory.Explosion.ToString(),
-                        Reason = $"Explosion Entry {explosionAction.ToString()}",
-                        Message = $"Explosion Entry {explosionAction.ToString()}",
-                        Momentum = tradeDecision.Momentum,
-                        EarlyMomentum = false,
-                        EmaCompressed = false,
-                        Regime = DecisionCategory.Explosion.ToString(),
-                        Time = DateTime.UtcNow
-                    });
-                    return (explosionAction, EntryModel.Explosion);
-                }
-
-                LogFile.Write("ExecutionLoop reached Sniper section");
-                // 6) Sniper V2 (CLOSED H1 only)
-                var sniperAction = SniperEntryEngineV3.Decide(
-                    symbol,
-                    client,
-                    rates1H,          // <-- MUST be shift=1 series
-                    atr,
-                    atrPercentile,
-                    emaFast,
-                    emaSlow,
-                    ctx,
-                    _m15Service,
-                    _tradingPairProperties,
-                    out var ev);
-                if (sniperAction == TradeAction.EnterBuy || sniperAction == TradeAction.EnterSell)
-                {
-                    engine = "SniperEntryEngineV3";
-                    if (SupportResistanceEngine.ShouldBlockTrade(
-                            symbol,
-                            sniperAction,
-                            rates1H,
-                            atr,
-                            tradeDecision.Momentum,
-                            currentPrice))
-                    {
-                        LogFile.Write("⚠️ Price extended → skipping sniper entry, evaluating support/resistance...");
-                        return (TradeAction.DoNothing, EntryModel.Nothing);
-                    }
-                    bool m15Allowed = _m15Service.IsTradeAllowed(SYMBOL, trendRideAction, EntryModel.Continuation, tradeDecision.Momentum, out var trendReason);
-
-                    string m15DecisionReason;
-
-                    bool allowTrade = M15ConfirmationGate.ShouldAllowTrade(
-                        symbol,
-                        trendRideAction,
-                        EntryModel.Sniper,
-                        m15Allowed,
-                        trendReason,
-                        ctx,
-                        atrPercentile,
-                        out m15DecisionReason
-                    );
-
-                    if (!allowTrade)
-                    {
-                        LogFile.Write($"⏸️ M15 blocked TrendRide ({trendRideAction}) — {m15DecisionReason}");
-                        return (TradeAction.DoNothing, EntryModel.Nothing);
-                    }
-
-                    double exhaustionMomentumThreshold =
-                        symbol.Contains("XAU") ? 2.2 :
-                        symbol.Contains("ETH") ||
-                        symbol.Contains("BTC") ||
-                        symbol.Contains("SOL") ||
-                        symbol.Contains("BNB") ||
-                        symbol.Contains("XRP") ? 3.0 :
-                        symbol.Contains("US100") ||
-                        symbol.Contains("NAS") ? 2.8 :
-                        2.0; // FX
-
-                    bool dangerousLateMove =
-                        tradeDecision.Momentum >= exhaustionMomentumThreshold ||
-                        regime == MarketRegimeDetector.Regime.Exhaustion;
-
-                    if (!m15Allowed && dangerousLateMove)
-                    {
-                        LogFile.Write(
-                            $"⛔ TrendRide blocked: M15 disagreement during late expansion");
-
-                        return (TradeAction.DoNothing, EntryModel.Nothing);
-                    }
-
-                    TradingEventBus.M15SnapshotUpdate(new M15Snapshot()
-                    {
-                        Message = "M15 Confirmed",
-                        Symbol = symbol,
-                    });
-                    TradingEventBus.Decision(new DecisionEvent
-                    {
-                        Symbol = ctx.Symbol,
-                        Action = sniperAction.ToString(),
-                        Category = DecisionCategory.Sniper.ToString(),
-                        Reason = $"Sniper Entry {sniperAction.ToString()}",
-                        Message = $"Sniper Entry {sniperAction.ToString()}",
-                        Momentum = tradeDecision.Momentum,
-                        EarlyMomentum = false,
-                        EmaCompressed = false,
-                        Regime = DecisionCategory.Sniper.ToString(),
-                        Time = DateTime.UtcNow
-                    });
-                    SniperDiagnostics.Print();
-                    TradingEventBus.Sniper(ev);
-                    return (sniperAction, EntryModel.Sniper);
-                }
-                else
-                {
-                    TradingEventBus.Sniper(ev);
-                }
-
-                
             }
+            
             engine = "None";
             return (TradeAction.DoNothing, EntryModel.Nothing);
             
@@ -2489,7 +1956,8 @@ namespace MetaTrader.Services
                     OpenTime = DateTime.UtcNow,
                     ContractSize = tradingPairsDto.contractsize,
                     InitialRiskUsd = (double)(slDistancePrice * (double)decision.Lot * tradingPairsDto.contractsize),
-                    MaxProfitUsd = (double)(tpDistancePrice * (double)decision.Lot * tradingPairsDto.contractsize),
+                    MaxProfitUsd = 0,
+                    ProfitUsd = 0,
                     EntryPrice = price,
                     Volume = (double)decision.Lot,
                     StopLoss = (double)sl,
@@ -3328,14 +2796,20 @@ namespace MetaTrader.Services
             foreach (var tracked in openTrades.ToList())
             {
                 
-                _client.PositionSelectByTicket(tracked.Ticket);
-                tracked.ProfitUsd = _client.PositionGetDouble(ENUM_POSITION_PROPERTY_DOUBLE.POSITION_PROFIT);
-                tracked.MaxProfitUsd = Math.Max(tracked.MaxProfitUsd, tracked.ProfitUsd);
-                if (ProfitProtectionEngine.ShouldCloseTrade(tracked, SYMBOL, atr, rates1Hr, emaFast1H) == true)
+                bool selected = _client.PositionSelectByTicket(tracked.Ticket);
+
+                if (!selected)
                 {
-                    Console.WriteLine($"Trade {tracked.Ticket} CLOSED BY PROFIT PROTECTION ENGINE.");
-                    LogFile.Write($"Trade {tracked.Ticket} CLOSED BY PROFIT PROTECTION ENGINE.");
-                    // Remove from your tracking list
+                    LogFile.Write($"[PPE ERROR] PositionSelectByTicket failed | ticket={tracked.Ticket}");
+                    continue;
+                }
+
+                tracked.ProfitUsd =
+                    _client.PositionGetDouble(ENUM_POSITION_PROPERTY_DOUBLE.POSITION_PROFIT);
+
+                if (ProfitGivebackProtection.ShouldClose(tracked))
+                {
+                    LogFile.Write($"Trade {tracked.Ticket} CLOSED BY PROFIT GIVEBACK PROTECTION.");
                     TradeServiceEngine.closingTrade = true;
                     return;
                 }

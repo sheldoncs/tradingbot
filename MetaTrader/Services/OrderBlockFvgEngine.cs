@@ -17,6 +17,8 @@ namespace MetaTrader.Services
             public double ZoneToleranceAtr;
             public double MaxDistanceFromEma9Atr;
             public double MinRejectionBodyRatio;
+            public double MinMitigationRatio;
+            public double MaxZoneHeightAtr;
             public int ScanLookback;
         }
 
@@ -48,9 +50,6 @@ namespace MetaTrader.Services
 
             symbol = symbol.ToUpperInvariant();
 
-            // =============================
-            // GOLD / METALS
-            // =============================
             if (symbol.Contains("XAU") ||
                 symbol.Contains("XAG") ||
                 symbol.Contains("GOLD") ||
@@ -61,15 +60,14 @@ namespace MetaTrader.Services
                     MinImpulseAtr = 1.00,
                     MinFvgAtr = 0.25,
                     ZoneToleranceAtr = 0.25,
-                    MaxDistanceFromEma9Atr = 1.45,
+                    MaxDistanceFromEma9Atr = 1.35,
                     MinRejectionBodyRatio = 0.35,
+                    MinMitigationRatio = 0.80,
+                    MaxZoneHeightAtr = 2.00,
                     ScanLookback = 8
                 };
             }
 
-            // =============================
-            // CRYPTO
-            // =============================
             if (symbol.Contains("BTC") ||
                 symbol.Contains("ETH") ||
                 symbol.Contains("SOL") ||
@@ -88,13 +86,12 @@ namespace MetaTrader.Services
                     ZoneToleranceAtr = 0.30,
                     MaxDistanceFromEma9Atr = 1.70,
                     MinRejectionBodyRatio = 0.32,
+                    MinMitigationRatio = 0.75,
+                    MaxZoneHeightAtr = 2.40,
                     ScanLookback = 10
                 };
             }
 
-            // =============================
-            // INDICES / CFDs
-            // =============================
             if (symbol.Contains("US100") ||
                 symbol.Contains("NAS") ||
                 symbol.Contains("USTEC") ||
@@ -113,13 +110,12 @@ namespace MetaTrader.Services
                     ZoneToleranceAtr = 0.28,
                     MaxDistanceFromEma9Atr = 1.55,
                     MinRejectionBodyRatio = 0.33,
+                    MinMitigationRatio = 0.72,
+                    MaxZoneHeightAtr = 2.30,
                     ScanLookback = 8
                 };
             }
 
-            // =============================
-            // FX DEFAULT
-            // =============================
             return new Profile
             {
                 MinImpulseAtr = 0.85,
@@ -127,6 +123,8 @@ namespace MetaTrader.Services
                 ZoneToleranceAtr = 0.18,
                 MaxDistanceFromEma9Atr = 1.10,
                 MinRejectionBodyRatio = 0.32,
+                MinMitigationRatio = 0.68,
+                MaxZoneHeightAtr = 2.00,
                 ScanLookback = 8
             };
         }
@@ -157,7 +155,6 @@ namespace MetaTrader.Services
             }
 
             var profile = GetProfile(symbol);
-
             var current = rates[^1];
 
             double ema9 = emaFast[^1];
@@ -166,6 +163,9 @@ namespace MetaTrader.Services
             bool trendUp = ema9 > ema21;
             bool trendDown = ema9 < ema21;
 
+            bool isGold = IsGold(symbol);
+            bool isCrypto = IsCrypto(symbol);
+
             if (!trendUp && !trendDown)
             {
                 LogFile.Write($"[{symbol}] OB/FVG blocked: no EMA trend | {GetFrequencySummary(symbol)}");
@@ -173,17 +173,7 @@ namespace MetaTrader.Services
                 return false;
             }
 
-            // =============================
-            // FIND RECENT OB/FVG ZONE
-            // =============================
-            var zone = FindRecentZone(
-                symbol,
-                rates,
-                atr,
-                profile,
-                trendUp,
-                trendDown
-            );
+            var zone = FindRecentZone(symbol, rates, atr, profile, trendUp, trendDown);
 
             if (zone == null)
             {
@@ -192,27 +182,95 @@ namespace MetaTrader.Services
                 return false;
             }
 
-            // =============================
-            // EXTENSION GUARD
-            // Do not chase too far from EMA9.
-            // =============================
             double distanceFromEma9 = Math.Abs(current.close - ema9);
+
+            double recentHigh = double.MinValue;
+            double recentLow = double.MaxValue;
+
+            int lookback = Math.Min(8, rates.Length - 1);
+
+            for (int i = 1; i <= lookback; i++)
+            {
+                recentHigh = Math.Max(recentHigh, rates[^i].high);
+                recentLow = Math.Min(recentLow, rates[^i].low);
+            }
+
+            double recentMoveAtr = (recentHigh - recentLow) / atr;
+
+            double lateMoveTrigger =
+                isGold ? 3.00 :
+                isCrypto ? 3.50 :
+                3.50;
+
+            double closeNearExtremeAtr =
+                isGold ? 0.85 :
+                isCrypto ? 0.75 :
+                0.75;
+
+            if (trendDown &&
+                recentMoveAtr >= lateMoveTrigger &&
+                current.close <= recentLow + atr * closeNearExtremeAtr)
+            {
+                LogFile.Write(
+                    $"[{symbol}] OB/FVG blocked: late sell after large move | " +
+                    $"recentMoveAtr={recentMoveAtr:F2}, trigger={lateMoveTrigger:F2} | " +
+                    GetFrequencySummary(symbol));
+
+                TrackBlock(symbol);
+                return false;
+            }
+
+            if (trendUp &&
+                recentMoveAtr >= lateMoveTrigger &&
+                current.close >= recentHigh - atr * closeNearExtremeAtr)
+            {
+                LogFile.Write(
+                    $"[{symbol}] OB/FVG blocked: late buy after large move | " +
+                    $"recentMoveAtr={recentMoveAtr:F2}, trigger={lateMoveTrigger:F2} | " +
+                    GetFrequencySummary(symbol));
+
+                TrackBlock(symbol);
+                return false;
+            }
+
+            int sameDirectionCount = 0;
+
+            for (int i = 1; i <= 6 && i < rates.Length; i++)
+            {
+                var candle = rates[^i];
+
+                if (trendDown && candle.close < candle.open)
+                    sameDirectionCount++;
+                else if (trendUp && candle.close > candle.open)
+                    sameDirectionCount++;
+                else
+                    break;
+            }
+
+            int maxSameDirection = isGold ? 4 : 5;
+
+            if (sameDirectionCount >= maxSameDirection)
+            {
+                LogFile.Write(
+                    $"[{symbol}] OB/FVG blocked: exhaustion sequence | " +
+                    $"sameDirectionCount={sameDirectionCount}, max={maxSameDirection} | " +
+                    GetFrequencySummary(symbol));
+
+                TrackBlock(symbol);
+                return false;
+            }
 
             if (distanceFromEma9 > atr * profile.MaxDistanceFromEma9Atr)
             {
                 LogFile.Write(
                     $"[{symbol}] OB/FVG blocked: too far from EMA9 | " +
                     $"dist={distanceFromEma9:F5}, max={atr * profile.MaxDistanceFromEma9Atr:F5} | " +
-                    GetFrequencySummary(symbol)
-                );
+                    GetFrequencySummary(symbol));
 
                 TrackBlock(symbol);
                 return false;
             }
 
-            // =============================
-            // RETURN INTO ZONE
-            // =============================
             double zoneTol = atr * profile.ZoneToleranceAtr;
 
             bool returnedToBullZone =
@@ -231,16 +289,74 @@ namespace MetaTrader.Services
                     $"[{symbol}] OB/FVG blocked: price has not returned to zone | " +
                     $"zoneLow={zone.ZoneLow:F5}, zoneHigh={zone.ZoneHigh:F5}, " +
                     $"currentLow={current.low:F5}, currentHigh={current.high:F5} | " +
-                    GetFrequencySummary(symbol)
-                );
+                    GetFrequencySummary(symbol));
 
                 TrackBlock(symbol);
                 return false;
             }
 
-            // =============================
-            // REJECTION / CONTINUATION CONFIRMATION
-            // =============================
+            double zoneHeight = zone.ZoneHigh - zone.ZoneLow;
+
+            if (zoneHeight <= 0)
+            {
+                LogFile.Write(
+                    $"[{symbol}] OB/FVG blocked: invalid zone height | " +
+                    $"zoneLow={zone.ZoneLow:F5}, zoneHigh={zone.ZoneHigh:F5} | " +
+                    GetFrequencySummary(symbol));
+
+                TrackBlock(symbol);
+                return false;
+            }
+
+            if (zoneHeight > atr * profile.MaxZoneHeightAtr)
+            {
+                LogFile.Write(
+                    $"[{symbol}] OB/FVG blocked: zone too large | " +
+                    $"zoneHeightAtr={(zoneHeight / atr):F2}, max={profile.MaxZoneHeightAtr:F2}, " +
+                    $"zoneLow={zone.ZoneLow:F5}, zoneHigh={zone.ZoneHigh:F5} | " +
+                    GetFrequencySummary(symbol));
+
+                TrackBlock(symbol);
+                return false;
+            }
+
+            double requiredBearTap = zone.ZoneLow + zoneHeight * profile.MinMitigationRatio;
+            double requiredBullTap = zone.ZoneHigh - zoneHeight * profile.MinMitigationRatio;
+
+            bool deepBullMitigation =
+                zone.IsBullish &&
+                current.low <= requiredBullTap;
+
+            bool deepBearMitigation =
+                !zone.IsBullish &&
+                current.high >= requiredBearTap;
+
+            if (zone.IsBullish && returnedToBullZone && !deepBullMitigation)
+            {
+                LogFile.Write(
+                    $"[{symbol}] OB/FVG blocked: shallow bullish mitigation | " +
+                    $"requiredLow<={requiredBullTap:F5}, currentLow={current.low:F5}, " +
+                    $"zoneLow={zone.ZoneLow:F5}, zoneHigh={zone.ZoneHigh:F5}, " +
+                    $"mitigation={profile.MinMitigationRatio:P0} | " +
+                    GetFrequencySummary(symbol));
+
+                TrackBlock(symbol);
+                return false;
+            }
+
+            if (!zone.IsBullish && returnedToBearZone && !deepBearMitigation)
+            {
+                LogFile.Write(
+                    $"[{symbol}] OB/FVG blocked: shallow bearish mitigation | " +
+                    $"requiredHigh>={requiredBearTap:F5}, currentHigh={current.high:F5}, " +
+                    $"zoneLow={zone.ZoneLow:F5}, zoneHigh={zone.ZoneHigh:F5}, " +
+                    $"mitigation={profile.MinMitigationRatio:P0} | " +
+                    GetFrequencySummary(symbol));
+
+                TrackBlock(symbol);
+                return false;
+            }
+
             bool bullishRejection = IsBullishRejection(current, zone.ZoneLow, zone.ZoneHigh, atr, profile);
             bool bearishRejection = IsBearishRejection(current, zone.ZoneLow, zone.ZoneHigh, atr, profile);
 
@@ -266,8 +382,7 @@ namespace MetaTrader.Services
                     $"zoneLow={zone.ZoneLow:F5}, zoneHigh={zone.ZoneHigh:F5}, " +
                     $"fvgLow={zone.FvgLow:F5}, fvgHigh={zone.FvgHigh:F5}, " +
                     $"distEMA9={distanceFromEma9:F5} | " +
-                    GetFrequencySummary(symbol)
-                );
+                    GetFrequencySummary(symbol));
 
                 return true;
             }
@@ -282,8 +397,7 @@ namespace MetaTrader.Services
                     $"zoneLow={zone.ZoneLow:F5}, zoneHigh={zone.ZoneHigh:F5}, " +
                     $"fvgLow={zone.FvgLow:F5}, fvgHigh={zone.FvgHigh:F5}, " +
                     $"distEMA9={distanceFromEma9:F5} | " +
-                    GetFrequencySummary(symbol)
-                );
+                    GetFrequencySummary(symbol));
 
                 return true;
             }
@@ -292,16 +406,12 @@ namespace MetaTrader.Services
                 $"[{symbol}] OB/FVG blocked: zone touched but no rejection | " +
                 $"bullReject={bullishRejection}, bearReject={bearishRejection}, " +
                 $"zoneLow={zone.ZoneLow:F5}, zoneHigh={zone.ZoneHigh:F5} | " +
-                GetFrequencySummary(symbol)
-            );
+                GetFrequencySummary(symbol));
 
             TrackBlock(symbol);
             return false;
         }
 
-        // =============================
-        // FIND RECENT OB/FVG ZONE
-        // =============================
         private static ObFvgZone? FindRecentZone(
             string symbol,
             MqlRates[] rates,
@@ -311,19 +421,18 @@ namespace MetaTrader.Services
             bool trendDown)
         {
             int maxLookback = Math.Min(profile.ScanLookback, rates.Length - 4);
+            double maxZoneAgeHours = IsGold(symbol) ? 6.0 : 10.0;
 
-            // We scan from newest valid pattern backward.
-            // Pattern:
-            // c2 = order-block candle
-            // c1 = impulse candle
-            // c0 = displacement/FVG confirmation candle
-            //
-            // Later, the current candle can return into the zone.
             for (int offset = 2; offset <= maxLookback; offset++)
             {
                 var c0 = rates[^offset];
                 var c1 = rates[^(offset + 1)];
                 var c2 = rates[^(offset + 2)];
+
+                double zoneAgeHours = (rates[^1].time - c1.time).TotalHours;
+
+                if (zoneAgeHours > maxZoneAgeHours)
+                    continue;
 
                 double impulseRange = c1.high - c1.low;
                 double impulseBody = Math.Abs(c1.close - c1.open);
@@ -340,15 +449,11 @@ namespace MetaTrader.Services
                 if (!strongImpulse)
                     continue;
 
-                // Bullish OB/FVG:
-                // OB candle is bearish, impulse/displacement moves up,
-                // and gap exists between c2 high and c0 low.
                 bool bullishOB = c2.close < c2.open;
                 bool bullishImpulse = c1.close > c1.open;
                 double bullishGap = c0.low - c2.high;
 
-                bool bullishFvg =
-                    bullishGap >= atr * profile.MinFvgAtr;
+                bool bullishFvg = bullishGap >= atr * profile.MinFvgAtr;
 
                 if (trendUp && bullishOB && bullishImpulse && bullishFvg)
                 {
@@ -366,15 +471,11 @@ namespace MetaTrader.Services
                     };
                 }
 
-                // Bearish OB/FVG:
-                // OB candle is bullish, impulse/displacement moves down,
-                // and gap exists between c0 high and c2 low.
                 bool bearishOB = c2.close > c2.open;
                 bool bearishImpulse = c1.close < c1.open;
                 double bearishGap = c2.low - c0.high;
 
-                bool bearishFvg =
-                    bearishGap >= atr * profile.MinFvgAtr;
+                bool bearishFvg = bearishGap >= atr * profile.MinFvgAtr;
 
                 if (trendDown && bearishOB && bearishImpulse && bearishFvg)
                 {
@@ -396,9 +497,6 @@ namespace MetaTrader.Services
             return null;
         }
 
-        // =============================
-        // REJECTION HELPERS
-        // =============================
         private static bool IsBullishRejection(
             MqlRates c,
             double zoneLow,
@@ -471,9 +569,6 @@ namespace MetaTrader.Services
                    decentBody;
         }
 
-        // =============================
-        // FREQUENCY TRACKING
-        // =============================
         private static void TrackEvaluation(string symbol)
         {
             symbol = NormalizeSymbol(symbol);
@@ -519,8 +614,7 @@ namespace MetaTrader.Services
 
             double hoursRunning = Math.Max(
                 0.01,
-                (stat.LastSeenUtc - stat.FirstSeenUtc).TotalHours
-            );
+                (stat.LastSeenUtc - stat.FirstSeenUtc).TotalHours);
 
             double firesPerHour = stat.Fires / hoursRunning;
 
@@ -534,6 +628,32 @@ namespace MetaTrader.Services
             return string.IsNullOrWhiteSpace(symbol)
                 ? "UNKNOWN"
                 : symbol.ToUpperInvariant();
+        }
+
+        private static bool IsGold(string symbol)
+        {
+            string s = NormalizeSymbol(symbol);
+
+            return s.Contains("XAU") ||
+                   s.Contains("XAG") ||
+                   s.Contains("GOLD") ||
+                   s.Contains("SILVER");
+        }
+
+        private static bool IsCrypto(string symbol)
+        {
+            string s = NormalizeSymbol(symbol);
+
+            return s.Contains("BTC") ||
+                   s.Contains("ETH") ||
+                   s.Contains("SOL") ||
+                   s.Contains("AVAX") ||
+                   s.Contains("BNB") ||
+                   s.Contains("XRP") ||
+                   s.Contains("ADA") ||
+                   s.Contains("DOGE") ||
+                   s.Contains("LTC") ||
+                   s.Contains("LINK");
         }
     }
 }

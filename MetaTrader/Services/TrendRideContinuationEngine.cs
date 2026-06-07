@@ -29,26 +29,25 @@ namespace MetaTrader.Services
         {
             action = TradeAction.Hold;
 
-            if (rates == null || rates.Length < 6 ||
+            if (rates == null || rates.Length < 8 ||
                 emaFast == null || emaSlow == null ||
                 emaFast.Length < 5 || emaSlow.Length < 5 ||
                 atr <= 0)
                 return false;
 
-            var c0 = rates[^2]; // latest closed continuation candle
-            var c1 = rates[^3]; // pullback candle
+            // IMPORTANT:
+            // Your MqlRates[] array is ordered so rates[^1] is the latest CLOSED candle.
+            var c0 = rates[^1]; // latest closed continuation candle
+            var c1 = rates[^2]; // pullback candle
 
-            double ema9 = emaFast[^2];
-            double ema21 = emaSlow[^2];
+            double ema9 = emaFast[^1];
+            double ema21 = emaSlow[^1];
 
-            double ema9Prev = emaFast[^3];
-            double ema21Prev = emaSlow[^3];
+            double ema9Prev = emaFast[^2];
+            double ema21Prev = emaSlow[^2];
 
             string s = symbol.ToUpperInvariant();
 
-            // =============================
-            // SYMBOL-ADAPTIVE SETTINGS
-            // =============================
             double minAtrPercentile =
                 IsFx(s) ? 0.35 :
                 IsGold(s) ? 0.40 :
@@ -67,34 +66,29 @@ namespace MetaTrader.Services
                 IsGold(s) ? 1.25 :
                 IsCrypto(s) ? 1.45 :
                 IsIndex(s) ? 1.15 :
-                0.95; // FX/default
+                0.95;
 
             double pullbackToSlowMax =
                 IsGold(s) ? MaxPullbackAtr :
                 IsCrypto(s) ? 1.7 :
                 IsIndex(s) ? 1.6 :
-                1.35; // FX/default
+                1.35;
 
             double bodyStrengthRequired =
                 IsFx(s) ? 0.38 :
-                IsGold(s) ? 0.48 :
                 BodyStrength;
 
-            // Normalize ATR percentile if your system sends 40 instead of 0.40
             double normalizedAtrPercentile = atrPercentile > 1.0
                 ? atrPercentile / 100.0
                 : atrPercentile;
 
-            // =============================
-            // TREND
-            // =============================
             bool trendUp =
-                emaFast[^2] > emaSlow[^2] &&
-                emaFast[^2] > emaFast[^3];
+                emaFast[^1] > emaSlow[^1] &&
+                emaFast[^1] > emaFast[^2];
 
             bool trendDown =
-                emaFast[^2] < emaSlow[^2] &&
-                emaFast[^2] < emaFast[^3];
+                emaFast[^1] < emaSlow[^1] &&
+                emaFast[^1] < emaFast[^2];
 
             if (!trendUp && !trendDown)
             {
@@ -102,12 +96,9 @@ namespace MetaTrader.Services
                 return false;
             }
 
-            double emaSlope = emaFast[^2] - emaFast[^3];
+            double emaSlope = emaFast[^1] - emaFast[^2];
             bool strongTrend = Math.Abs(emaSlope) > atr * 0.05;
 
-            // =============================
-            // ATR REGIME
-            // =============================
             if (normalizedAtrPercentile < minAtrPercentile)
             {
                 LogFile.Write(
@@ -117,9 +108,6 @@ namespace MetaTrader.Services
                 return false;
             }
 
-            // =============================
-            // EXTENSION
-            // =============================
             double distanceFromEMA9 = Math.Abs(c0.close - ema9);
 
             if (!strongTrend && distanceFromEMA9 > atr * maxDistance)
@@ -131,13 +119,6 @@ namespace MetaTrader.Services
                 return false;
             }
 
-            // =============================
-            // PULLBACK
-            // Improved:
-            // - Allows close near EMA9
-            // - Allows wick touch/rejection around EMA9
-            // - Allows controlled pullback toward EMA21
-            // =============================
             double tolerance = atr * PullbackAtrFactor;
 
             bool pullbackCloseNearFast =
@@ -171,11 +152,73 @@ namespace MetaTrader.Services
                 return false;
             }
 
+
+            double stallNearEmaAtr =
+                IsGold(s) ? 0.28 :
+                IsFx(s) ? 0.32 :
+                IsIndex(s) ? 0.35 :
+                IsCrypto(s) ? 0.40 :
+                0.35;
+
+            double smallBodyThreshold =
+                IsGold(s) ? 0.40 :
+                IsFx(s) ? 0.35 :
+                IsIndex(s) ? 0.34 :
+                IsCrypto(s) ? 0.30 :
+                0.35;
+
             // =============================
-            // DEPTH CHECK
-            // Do not allow pullback to be too far from EMA21.
-            // This keeps TrendRide from entering after a messy deep retrace.
+            // EMA9 STALL GUARD - IMPROVED
+            // Blocks dead sideways chop near EMA9,
+            // but allows valid continuation candles.
             // =============================
+            int stallCount = 0;
+            int smallBodyCount = 0;
+
+            for (int i = 1; i <= 4 && i < rates.Length && i < emaFast.Length; i++)
+            {
+                var c = rates[^i];
+                double emaAtCandle = emaFast[^i];
+
+                double candleRange = c.high - c.low;
+                double candleBody = Math.Abs(c.close - c.open);
+
+                bool nearEma9 =
+                    Math.Abs(c.close - emaAtCandle) < atr * 0.35;
+
+                bool smallBody =
+                    candleRange > 0 &&
+                    (candleBody / candleRange) < 0.35;
+
+                if (nearEma9)
+                    stallCount++;
+
+                if (nearEma9 && smallBody)
+                    smallBodyCount++;
+            }
+
+            bool currentContinuationPush =
+                trendUp
+                    ? c0.close > c0.open && c0.close > c1.high
+                    : c0.close < c0.open && c0.close < c1.low;
+
+            bool priceProgressing =
+                trendUp
+                    ? c0.close > c1.close
+                    : c0.close < c1.close;
+
+            if (stallCount >= 3 &&
+                smallBodyCount >= 2 &&
+                !currentContinuationPush &&
+                !priceProgressing)
+            {
+                LogFile.Write(
+                    $"[{symbol}] TrendRide blocked: pullback stalled near EMA9 | " +
+                    $"stallCount={stallCount}, smallBodyCount={smallBodyCount}"
+                );
+                return false;
+            }
+
             double distToSlow = Math.Abs(c1.close - ema21Prev);
 
             if (distToSlow > atr * pullbackToSlowMax)
@@ -187,11 +230,9 @@ namespace MetaTrader.Services
                 return false;
             }
 
-            // =============================
-            // CONTINUATION CANDLE
-            // =============================
             double range = c0.high - c0.low;
-            if (range <= 0) return false;
+            if (range <= 0)
+                return false;
 
             double body = Math.Abs(c0.close - c0.open);
             double bodyRatio = body / range;
@@ -203,6 +244,13 @@ namespace MetaTrader.Services
             bool bearishCandle =
                 c0.close < c0.open &&
                 bodyRatio >= bodyStrengthRequired;
+
+            LogFile.Write(
+                $"[{symbol}] TrendRide candle debug | " +
+                $"c0Time={c0.time}, open={c0.open:F5}, close={c0.close:F5}, " +
+                $"bullish={c0.close > c0.open}, bearish={c0.close < c0.open}, " +
+                $"bodyRatio={bodyRatio:F2}, need={bodyStrengthRequired:F2}"
+            );
 
             if (trendUp && !bullishCandle)
             {
@@ -222,58 +270,22 @@ namespace MetaTrader.Services
                 return false;
             }
 
-            // =============================
-            // POST-SHOCK / LIQUIDITY WICK GUARD
-            // =============================
-
-            if (IsGold(symbol))
+            // --------------------------------------------------
+            // GOLD ONLY: Late-entry / exhaustion guard
+            // Blocks late BUYs after extended bullish moves
+            // Blocks late SELLs after extended bearish moves
+            // --------------------------------------------------
+            if (IsGold(s))
             {
-                var c2 = rates[^4];
+                bool isBuySetup = trendUp && bullishCandle;
+                bool isSellSetup = trendDown && bearishCandle;
 
-                double c1Range = c1.high - c1.low;
-                double c1Body = Math.Abs(c1.close - c1.open);
-
-                double upperWick = c1.high - Math.Max(c1.open, c1.close);
-                double lowerWick = Math.Min(c1.open, c1.close) - c1.low;
-
-                bool largeShockCandle = c1Range > atr * 1.8;
-
-                bool largeCounterWick =
-                    trendDown
-                        ? lowerWick > atr * 0.75   // big buying wick after sell-side flush
-                        : upperWick > atr * 0.75;  // big selling wick after buy-side spike
-
-                if (largeShockCandle || largeCounterWick)
-                {
-                    LogFile.Write(
-                        $"[{symbol}] TrendRide blocked: post-shock / liquidity wick stabilization required | " +
-                        $"rangeATR={(c1Range / atr):F2}, lowerWickATR={(lowerWick / atr):F2}, upperWickATR={(upperWick / atr):F2}"
-                    );
+                if (IsGoldLateEntry(symbol, rates, atr, ema9, isBuySetup, isSellSetup))
                     return false;
-                }
-
-                // =============================
-                // OVERLAP / DIGESTION GUARD
-                // =============================
-                bool overlapping =
-                    c0.high <= c1.high &&
-                    c0.low >= c1.low;
-
-                if (overlapping)
-                {
-                    LogFile.Write($"[{symbol}] TrendRide blocked: overlapping continuation candle after pullback.");
-                    return false;
-                }
             }
-            // =============================
-            // ENTRY
-            // =============================
 
             double bid = _client.SymbolInfoDouble(ctx.Symbol, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_BID);
-
             double ask = _client.SymbolInfoDouble(ctx.Symbol, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_ASK);
-
-            
 
             if (trendUp && validPullback && bullishCandle)
             {
@@ -281,7 +293,10 @@ namespace MetaTrader.Services
 
                 if (liveDistanceAtr > maxTrendRideExtensionAtr)
                 {
-                    LogFile.Write($"[{ctx.Symbol}] TrendRide blocked: too extended at execution");
+                    LogFile.Write(
+                        $"[{ctx.Symbol}] TrendRide blocked: too extended at execution | " +
+                        $"liveDistATR={liveDistanceAtr:F2}, max={maxTrendRideExtensionAtr:F2}"
+                    );
                     return false;
                 }
 
@@ -297,12 +312,14 @@ namespace MetaTrader.Services
 
             if (trendDown && validPullback && bearishCandle)
             {
-
                 double liveDistanceAtr = Math.Abs(bid - ema9) / atr;
 
                 if (liveDistanceAtr > maxTrendRideExtensionAtr)
                 {
-                    LogFile.Write($"[{ctx.Symbol}] TrendRide blocked: too extended at execution");
+                    LogFile.Write(
+                        $"[{ctx.Symbol}] TrendRide blocked: too extended at execution | " +
+                        $"liveDistATR={liveDistanceAtr:F2}, max={maxTrendRideExtensionAtr:F2}"
+                    );
                     return false;
                 }
 
@@ -319,9 +336,107 @@ namespace MetaTrader.Services
             return false;
         }
 
-        // =============================
-        // SYMBOL HELPERS
-        // =============================
+        private static bool IsGoldLateEntry(
+            string symbol,
+            MqlRates[] rates,
+            double atr,
+            double ema9,
+            bool isBuySetup,
+            bool isSellSetup)
+        {
+            if (rates == null || rates.Length < 8 || atr <= 0)
+                return false;
+
+            var c0 = rates[^1];
+
+            double extensionAtr = Math.Abs(c0.close - ema9) / atr;
+
+            int lookback = Math.Min(8, rates.Length - 1);
+
+            double recentHigh = double.MinValue;
+            double recentLow = double.MaxValue;
+
+            for (int i = 1; i <= lookback; i++)
+            {
+                var c = rates[^i];
+                recentHigh = Math.Max(recentHigh, c.high);
+                recentLow = Math.Min(recentLow, c.low);
+            }
+
+            double recentMoveAtr = (recentHigh - recentLow) / atr;
+
+            int sameDirectionCount =
+                CountRecentSameDirectionCandles(rates, isBuySetup);
+
+            const double MaxGoldExtensionAtr = 1.55;
+            const double MaxGoldRecentMoveAtr = 3.00;
+            const int MaxGoldSameDirectionCandles = 4;
+
+            if (extensionAtr > MaxGoldExtensionAtr)
+            {
+                LogFile.Write(
+                    $"[{symbol}] TrendRide blocked: gold too extended from EMA9 | " +
+                    $"extensionATR={extensionAtr:F2}, max={MaxGoldExtensionAtr:F2}"
+                );
+                return true;
+            }
+
+            if (isSellSetup &&
+                recentMoveAtr >= MaxGoldRecentMoveAtr &&
+                c0.close <= recentLow + atr * 0.85)
+            {
+                LogFile.Write(
+                    $"[{symbol}] TrendRide SELL blocked: GOLD late sell after large move | " +
+                    $"recentMoveATR={recentMoveAtr:F2}, closeNearLow=true"
+                );
+                return true;
+            }
+
+            if (isBuySetup &&
+                recentMoveAtr >= MaxGoldRecentMoveAtr &&
+                c0.close >= recentHigh - atr * 0.85)
+            {
+                LogFile.Write(
+                    $"[{symbol}] TrendRide BUY blocked: GOLD late buy after large move | " +
+                    $"recentMoveATR={recentMoveAtr:F2}, closeNearHigh=true"
+                );
+                return true;
+            }
+
+            if (sameDirectionCount >= MaxGoldSameDirectionCandles)
+            {
+                LogFile.Write(
+                    $"[{symbol}] TrendRide blocked: gold chase protection | " +
+                    $"sameDir={sameDirectionCount}"
+                );
+                return true;
+            }
+
+            return false;
+        }
+
+        private static int CountRecentSameDirectionCandles(
+            MqlRates[] rates,
+            bool isBuySetup)
+        {
+            int count = 0;
+
+            for (int i = rates.Length - 1; i >= rates.Length - 6 && i >= 0; i--)
+            {
+                var c = rates[i];
+
+                bool bullish = c.close > c.open;
+                bool bearish = c.close < c.open;
+
+                if (isBuySetup && bullish)
+                    count++;
+                else if (!isBuySetup && bearish)
+                    count++;
+            }
+
+            return count;
+        }
+
         private static bool IsGold(string symbol)
         {
             return symbol.Contains("XAU") ||

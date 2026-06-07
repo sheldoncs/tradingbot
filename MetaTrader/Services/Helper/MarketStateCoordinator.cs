@@ -2,14 +2,14 @@
 using MetaTrader.Enums;
 using MetaTrader.Enums.MetaTrader.Enums;
 using MetaTrader.helper;
-using MetaTrader.Services;
+using MetaTrader.Util;
 using MtApi5;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using static MetaTrader.Services.HybridMomentumEngine;
 
-namespace MetaTrader.Util
+namespace MetaTrader.Services.Helper
 {
     public class MarketStateCoordinator
     {
@@ -24,7 +24,18 @@ namespace MetaTrader.Util
         private readonly Dictionary<string, SymbolContext> _contexts;
 
         private bool _previousCryptoWindow;
-        
+
+        private class SymbolFreshness
+        {
+            public double DistanceFromEma9Atr;
+            public int ExpansionCandles;
+            public bool IsLateExpansion;
+            public bool IsTooExtended;
+            public DateTime LastUpdatedUtc;
+        }
+
+        private readonly Dictionary<string, SymbolFreshness> _freshness = new();
+
         public MarketStateCoordinator(
             MtApi5Client client,
             IEnumerable<string> symbols,
@@ -42,13 +53,10 @@ namespace MetaTrader.Util
             _client = client;
             _symbols = symbols;
             _contexts = contexts;
-
         }
 
         private TradeCoordinator GetCoordinator(string symbol)
         {
-
-
             var universe = GetUniverse(symbol);
 
             return universe switch
@@ -65,56 +73,54 @@ namespace MetaTrader.Util
         {
             UpdateSymbolState(symbol);
         }
+
         private static readonly HashSet<string> FxSymbols = new()
-        {
-                "EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD"
-        };
+    {
+        "EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD"
+    };
 
         private static readonly HashSet<string> CryptoSymbols = new()
-        {
-            "BNBUSD",
-            "SOLUSD",
-            "XRPUSD",
-            "ETHUSD"
-        };
+    {
+        "SOLUSD",
+        "ETHUSD",
+        "BTCUSD",
+        "BNBUSD",
+        "AVAUSD",
+        "LNKUSD"
+    };
 
         private static readonly HashSet<string> GoldSymbols = new()
-        {
-            "XAUUSD",
-            "XAUEUR"
-        };
+    {
+        "XAUUSD",
+        "XAUEUR"
+    };
 
         private MarketUniverse GetUniverse(string symbol)
         {
             var baseSymbol = NormalizeSymbol(symbol);
+
             if (baseSymbol.StartsWith("XAU") || baseSymbol.StartsWith("XAG"))
                 return MarketUniverse.Metals;
 
             if (FxSymbols.Contains(baseSymbol))
                 return MarketUniverse.FX;
 
-            if (GoldSymbols.Contains(symbol))
+            if (GoldSymbols.Contains(baseSymbol))
                 return MarketUniverse.Currency;
 
-
             return MarketUniverse.Crypto;
-
         }
 
         private bool IsAtrCool(SymbolContext ctx, string symbol, double atrRaw)
         {
             var u = GetUniverse(symbol);
 
-            // Capture peak if missing
             if (ctx.PeakAtr <= 0)
                 ctx.PeakAtr = atrRaw;
 
-            // Universe-specific thresholds
             double peakFactor = (u == MarketUniverse.Metals) ? 0.90 : 0.85;
 
             bool coolByPeak = atrRaw < ctx.PeakAtr * peakFactor;
-
-            // Metals: allow "cooling trend" as alternative
             bool coolByTrend = (u == MarketUniverse.Metals) && ctx.AtrDownCount >= 2;
 
             return coolByPeak || coolByTrend;
@@ -131,15 +137,11 @@ namespace MetaTrader.Util
 
         public string ScanAndSelectSymbol()
         {
-            DateTime nowAst = DateTime.UtcNow.AddHours(-4); // AST conversion
-
-            bool cryptoWindow = TradingUniverseSelector.IsCryptoWindow(nowAst);
-
             foreach (var symbol in _symbols)
             {
-                bool isGold = GoldSymbols.Contains(symbol);
-                
-                if (!isGold)
+                bool isCrypto = CryptoSymbols.Contains(NormalizeSymbol(symbol));
+
+                if (!isCrypto)
                     continue;
 
                 UpdateSymbolState(symbol);
@@ -148,14 +150,12 @@ namespace MetaTrader.Util
             return ChooseBestSymbol();
         }
 
-        // ----------------------------
-        // SYMBOL STATE UPDATE
-        // ----------------------------
         private void UpdateSymbolState(string marketSymbol)
-        {   
+        {
             var ctx = GetContext(marketSymbol);
-            //if (TradingConfig.Mode == TradingMode.XauUsdOnly)
+
             _client.CopyRates(marketSymbol, ENUM_TIMEFRAMES.PERIOD_H1, 1, 120, out MqlRates[] rates1H);
+
             if (rates1H == null || rates1H.Length < 3)
                 return;
 
@@ -179,31 +179,24 @@ namespace MetaTrader.Util
             UpdateMarketState(marketSymbol, ctx, momentum, emaFast1H, emaSlow1H, atrRaw, rates1H);
         }
 
-        private static double CalculateAtrPercentile(
-            double currentAtr,
-            Queue<double> history)
-                {
-                    if (history == null || history.Count < 20)
-                        return 50.0;
+        private static double CalculateAtrPercentile(double currentAtr, Queue<double> history)
+        {
+            if (history == null || history.Count < 20)
+                return 50.0;
 
-                    int belowOrEqual = history.Count(x => x <= currentAtr);
+            int belowOrEqual = history.Count(x => x <= currentAtr);
 
-                    double percentile =
-                        ((double)belowOrEqual / history.Count) * 100.0;
+            double percentile = ((double)belowOrEqual / history.Count) * 100.0;
 
-                    // safety clamp
-                    percentile = Math.Max(1.0, percentile);
-                    percentile = Math.Min(99.0, percentile);
+            percentile = Math.Max(1.0, percentile);
+            percentile = Math.Min(99.0, percentile);
 
-                    return percentile;
+            return percentile;
         }
-
-        // ----------------------------
-        // MARKET STATE MACHINE
-        // ----------------------------
 
         public DateTime LastProcessedCandleTime { get; set; } = DateTime.MinValue;
         private TradeCoordinator coordinator;
+
         private void UpdateMarketState(
             string SYMBOL,
             SymbolContext ctx,
@@ -214,32 +207,27 @@ namespace MetaTrader.Util
             MqlRates[] rates1H
         )
         {
-
-            if (SYMBOL == "XAUUSD")
-            {
-                Console.WriteLine("");
-            }
-
             if (TradingConfig.Mode == TradingMode.XauUsdOnly &&
-                  SYMBOL != "XAUUSD.s")
+                SYMBOL != "XAUUSD.s")
             {
                 return;
-            } 
-            if (TradingConfig.Mode == TradingMode.XauUsdOnly)
-                Console.WriteLine($"Symbol={ctx.Symbol} previous State={ctx.PreviousState} current State={ctx.State} pullback sufficient={ctx.PullbackSufficient} cooldown={ctx.AtrCooldown}");
-            
+            }
+
             coordinator = GetCoordinator(SYMBOL);
 
             ctx.ArmedHybrid = 0.0;
 
             DateTime currentCandleTime = rates1H[^1].time;
+
             VolatilityGuard.UpdateShockStatus(SYMBOL, rates1H, atrRaw);
 
-            // 🔒 GUARD: only process on candle close
             if (ctx.LastProcessedCandleTime == currentCandleTime)
                 return;
 
             ctx.LastProcessedCandleTime = currentCandleTime;
+
+            UpdateFreshness(SYMBOL, ctx, emaFast1H, atrRaw, rates1H);
+
             if (ctx.InRecoveryMode)
             {
                 ctx.ClosedCandlesSinceRecovery++;
@@ -250,42 +238,30 @@ namespace MetaTrader.Util
                 }
                 else
                 {
-                    return; // block trading during recovery buffer
+                    return;
                 }
             }
 
-
-            // -----------------------------
-            // 📉 ATR TREND TRACKING (per candle close)
-            // -----------------------------
             if (ctx.PrevAtr > 0 && atrRaw < ctx.PrevAtr)
                 ctx.AtrDownCount++;
             else
                 ctx.AtrDownCount = 0;
 
             ctx.PrevAtr = atrRaw;
-            // -----------------------------
-            // 📊 ATR Percentile Tracking
-            // -----------------------------
 
             ctx.AtrHistory.Enqueue(atrRaw);
 
-            if (ctx.AtrHistory.Count > 50)   // 50-candle rolling window
+            if (ctx.AtrHistory.Count > 50)
                 ctx.AtrHistory.Dequeue();
 
             ctx.AtrPercentile = CalculateAtrPercentile(atrRaw, ctx.AtrHistory);
 
-
             var last = rates1H[^1];
 
-            // ---------------------------------
-            // 🧠 IMPULSE WITH ABSORPTION DETECTION (XAU-safe)
-            // ---------------------------------
             double full = last.high - last.low;
             double body = Math.Abs(last.open - last.close);
             double lowerWick = Math.Min(last.open, last.close) - last.low;
 
-            // treat gold differently (it wicks more)
             double absorptionThreshold =
                 GetUniverse(SYMBOL) == MarketUniverse.Metals ? 0.30 : 0.25;
 
@@ -310,9 +286,6 @@ namespace MetaTrader.Util
                 ctx.CandlesSinceImpulse++;
             }
 
-            // -------------------------------------------------
-            // 🔄 FAILED EXPANSION RESET (NON-CHOSEN SYMBOLS)
-            // -------------------------------------------------
             if (ctx.State == MarketState.FailedExpansion)
             {
                 Console.WriteLine($"Failed Expansion for symbol {ctx.Symbol}");
@@ -328,9 +301,6 @@ namespace MetaTrader.Util
                 momentum
             );
 
-            // ---------------------------------
-            // 🔥 STRONG IMPULSE OVERRIDES COMPRESSION
-            // ---------------------------------
             if (ctx.State == MarketState.Neutral &&
                 momentum.Strong &&
                 momentum.Hybrid > dynamicThreshold)
@@ -348,9 +318,6 @@ namespace MetaTrader.Util
                 return;
             }
 
-            // ---------------------------------
-            // COMPRESSION (ONLY if momentum weak)
-            // ---------------------------------
             if (ctx.State == MarketState.Neutral &&
                 emaCompressed &&
                 !momentum.Strong)
@@ -362,9 +329,6 @@ namespace MetaTrader.Util
                 return;
             }
 
-            // ---------------------------------
-            // FRESH EXPANSION
-            // ---------------------------------
             if (momentum.Breakout &&
                 ctx.State == MarketState.Compression)
             {
@@ -384,47 +348,14 @@ namespace MetaTrader.Util
                 return;
             }
 
-            // ---------------------------------
-            // EXPANSION → LATE → EXHAUSTION
-            // ---------------------------------
             if (ctx.State == MarketState.Impulse ||
                 ctx.State == MarketState.Continuation)
             {
                 ctx.IncrementExpansion();
+                UpdateFreshness(SYMBOL, ctx, emaFast1H, atrRaw, rates1H);
 
                 if (ctx.ExpansionCandles == 2)
                     ctx.TransitionTo(MarketState.Continuation);
-
-                // ---------------------------------
-                // 🧠 DETECT LATE EXPANSION (NEW)
-                // ---------------------------------
-                double ema9 = emaFast1H[^1];
-                double ema21 = emaSlow1H[^1];
-
-                double emaSpread = Math.Abs(ema9 - ema21);
-                double atrMultiple = emaSpread / atrRaw;
-
-                // slope weakening
-                double slopeNow = emaFast1H[^1] - emaFast1H[^2];
-                double slopePrev = emaFast1H[^2] - emaFast1H[^3];
-
-                bool slopeWeakening = Math.Abs(slopeNow) < Math.Abs(slopePrev);
-
-                // extension
-                double distanceFromEMA = Math.Abs(rates1H[^1].close - ema9);
-                bool extended = distanceFromEMA > atrRaw * 1.5;
-
-                bool strongTrend = atrMultiple > 1.2;
-
-                if (strongTrend && (slopeWeakening || extended))
-                {
-                    if (ctx.State != MarketState.LateExpansion)
-                    {
-                        Console.WriteLine($"⚠️ {SYMBOL} → LateExpansion");
-                        //ctx.TransitionTo(MarketState.LateExpansion);
-                    }
-                }
-
 
                 if (ctx.IsLateExpansion)
                     ctx.TransitionTo(MarketState.Exhaustion);
@@ -432,9 +363,6 @@ namespace MetaTrader.Util
                 return;
             }
 
-            // ---------------------------------
-            // 🟢 EXHAUSTION → PULLBACK (RECOVERY)
-            // ---------------------------------
             if (ctx.State == MarketState.Exhaustion)
             {
                 var lastClosed = rates1H[^2];
@@ -443,13 +371,13 @@ namespace MetaTrader.Util
 
                 bool emaReclaimed =
                     lastClosed.low <= ema9 &&
-                    lastClosed.high >= ema9;   // price interacted with EMA again
+                    lastClosed.high >= ema9;
 
                 bool volatilityCooled =
                     Math.Abs(midPrice - ema9) / atrRaw < 0.35;
 
                 bool timeDecay =
-                    ctx.ExpansionCandles >= 2; // simple decay (2 candles max)
+                    ctx.ExpansionCandles >= 2;
 
                 if ((emaReclaimed && volatilityCooled) || timeDecay)
                 {
@@ -462,20 +390,18 @@ namespace MetaTrader.Util
                     ctx.PeakAtr = 0.0;
                     ctx.PeakAtrCaptured = false;
 
+                    UpdateFreshness(SYMBOL, ctx, emaFast1H, atrRaw, rates1H);
+
                     return;
                 }
             }
 
-            // ---------------------------------
-            // 🚫 FAILED EXPANSION DETECTION
-            // ---------------------------------
             if (ExpansionFailureEngine.IsFailedExpansion(
                     ctx.State,
                     emaFast1H,
                     emaSlow1H
                     ))
             {
-
                 ctx.LastImpulseHadAbsorption = false;
                 ctx.CandlesSinceImpulse = 0;
 
@@ -485,13 +411,9 @@ namespace MetaTrader.Util
                 ctx.ResetExpansion();
                 ctx.ResetPullback();
 
-                ctx.LastImpulseHadAbsorption = false;
-                ctx.CandlesSinceImpulse = 0;
-
                 ctx.ActiveOrderBlock = null;
                 ctx.OrderBlockCreatedAt = null;
 
-                // 🔥 RESET ATR CONTEXT
                 ctx.PeakAtr = 0.0;
                 ctx.PeakAtrCaptured = false;
 
@@ -501,37 +423,22 @@ namespace MetaTrader.Util
                 return;
             }
 
-            // ---------------------------------
-            // EXHAUSTION → PULLBACK (MOMENTUM COOLING)
-            // ---------------------------------
             bool cooled =
-                    !momentum.Strong &&
-                    momentum.Hybrid < 1.0 &&
-                    !momentum.Breakout &&
-                    !momentum.Impulse;
+                !momentum.Strong &&
+                momentum.Hybrid < 1.0 &&
+                !momentum.Breakout &&
+                !momentum.Impulse;
 
             if (cooled && ctx.State == MarketState.Armed)
             {
-                // drop ONE level onlyne
                 ctx.TransitionTo(MarketState.Pullback);
                 ctx.ResetPullback();
                 ctx.MarketCoolingState();
                 SymbolPriorityEngine.Release(ctx.Symbol);
             }
-            /*
-            if (cooled && ctx.State != MarketState.Pullback)
-            {
-                ctx.TransitionTo(MarketState.Pullback);
-                ctx.ResetPullback();
-            }*/
 
-            // ---------------------------------
-            // 🧠 PRICE ACCEPTANCE CHECK (CRITICAL FIX)
-            // ---------------------------------
             var lastClosedCandle = rates1H[^2];
-            
 
-            // Direction from EMA regime (already trusted elsewhere)
             bool isBullish = emaFast1H[^1] > emaSlow1H[^1];
 
             bool priceAccepted = PriceAcceptanceEngine.IsPriceAccepted(
@@ -539,12 +446,11 @@ namespace MetaTrader.Util
                 lastClosedCandle,
                 emaFast1H,
                 atrRaw,
-                 isBullish ? TradeDirection.Bullish : TradeDirection.Bearish
+                isBullish ? TradeDirection.Bullish : TradeDirection.Bearish
             );
 
             ctx.PriceAccepted = priceAccepted;
 
-            // OPTIONAL: ATR cooling after impulse
             if (ctx.PeakAtr == 0)
                 ctx.PeakAtr = atrRaw;
 
@@ -556,16 +462,12 @@ namespace MetaTrader.Util
             }
 
             ctx.AtrCooldown = atrCooling;
-           
 
-            // ---------------------------------
-            // PULLBACK → ARMED (SAFE VERSION)
-            // ---------------------------------
             if (ctx.State == MarketState.Pullback)
             {
                 ctx.IncrementPullback();
 
-                bool bigShockCandle = (last.high - last.low) > atrRaw * 1.6; // tune 1.4–1.8
+                bool bigShockCandle = (last.high - last.low) > atrRaw * 1.6;
 
                 if (bigShockCandle)
                 {
@@ -576,51 +478,62 @@ namespace MetaTrader.Util
                 if (GetUniverse(SYMBOL) == MarketUniverse.Metals && bigShockCandle)
                 {
                     Console.WriteLine($"Shock candle detected — cooldown required {ctx.Symbol}");
-                    // force at least one more candle of stabilization
-                    
                 }
 
                 if (!coordinator.CanArm(SYMBOL))
                     return;
 
                 Console.WriteLine(
-                        $"🟢 before armed {SYMBOL} PullbackSufficient = {ctx.PullbackSufficient} | PriceAccepted={priceAccepted} ATRcool={atrCooling}"
-                    );
+                    $"🟢 before armed {SYMBOL} PullbackSufficient = {ctx.PullbackSufficient} | PriceAccepted={priceAccepted} ATRcool={atrCooling}"
+                );
 
-                //if (ctx.PullbackSufficient &&
-                //priceAccepted &&
-                //(!ctx.ShockActive || atrCooling))
-                // ---------------------------------------------
-                // SOFT ARMING (location-based)
-                // ---------------------------------------------
                 if (ctx.PullbackSufficient &&
                     (ctx.PriceAccepted || ctx.AtrCooldown))
+                {
+                    UpdateFreshness(SYMBOL, ctx, emaFast1H, atrRaw, rates1H);
+
+                    if (!IsFreshEnoughToArm(SYMBOL, ctx))
                     {
+                        LogFile.Write(
+                            $"⛔ {SYMBOL} arming blocked: stale/extended symbol | {GetFreshnessSummary(SYMBOL)}"
+                        );
+
+                        Console.WriteLine(
+                            $"⛔ {SYMBOL} arming blocked: stale/extended symbol | {GetFreshnessSummary(SYMBOL)}"
+                        );
+
+                        ctx.TransitionTo(MarketState.Pullback);
+                        ctx.ResetPullback();
+
+                        return;
+                    }
+
                     LogFile.Write($"SOFT ARMING CONDITIONS MET | {SYMBOL} | PullbackSufficient={ctx.PullbackSufficient} | PriceAccepted={ctx.PriceAccepted} | AtrCooldown={ctx.AtrCooldown}");
+
                     Console.WriteLine(
                         $"🟢 {SYMBOL} SOFT ARMED | PullbackSufficient={ctx.PullbackSufficient} | PriceAccepted={ctx.PriceAccepted} | AtrCooldown={ctx.AtrCooldown}"
-                    );  
-                    //  if (ctx.PullbackSufficient && priceAccepted && atrCooling)
-                    //{
-                    ctx.ArmedHybrid = momentum.Hybrid;   // 🔒 BASELINE CAPTURE (NON-ZERO)
+                    );
+
+                    ctx.ArmedHybrid = momentum.Hybrid;
                     coordinator.SetArmed(SYMBOL);
 
                     ctx.TransitionTo(MarketState.Armed);
+
                     bool proceed = HandleArmedStateTransition(ctx, ctx.PreviousState, ctx.State);
 
                     if (!proceed)
-                        return; // IMPORTANT: stop further processing for this symbol
-
+                        return;
 
                     BotStateUpdate armedState = new BotStateUpdate()
                     {
                         state = ctx.State.ToString(),
                         Symbol = ctx.Symbol,
-                        PriceAccepted=ctx.PriceAccepted,
+                        PriceAccepted = ctx.PriceAccepted,
                         AtrCoolDown = ctx.AtrCooldown,
                         PullbackSufficient = ctx.PullbackSufficient,
                         ListOfStates = ctx.GetListOfStates()
                     };
+
                     TradingEventBus.State(armedState);
 
                     Console.WriteLine(
@@ -631,20 +544,15 @@ namespace MetaTrader.Util
                 return;
             }
 
-            // ---------------------------------
-            // ARMED → DISARM (ACCEPTANCE LOST)
-            // ---------------------------------
             if (ctx.State == MarketState.Armed)
             {
                 bool acceptanceLost =
-                    ctx.PriceAccepted == false &&          // price left acceptance zone
-                        momentum.Impulse == false &&           // no continuation yet
-                                momentum.Hybrid < ctx.ArmedHybrid * 0.85; // momentum actually faded
-
+                    ctx.PriceAccepted == false &&
+                    momentum.Impulse == false &&
+                    momentum.Hybrid < ctx.ArmedHybrid * 0.85;
 
                 if (acceptanceLost)
                 {
-
                     Console.WriteLine($"🔓 {SYMBOL} DISARMED — acceptance lost");
 
                     ctx.TransitionTo(MarketState.Neutral);
@@ -652,7 +560,7 @@ namespace MetaTrader.Util
                     ctx.ResetExpansion();
 
                     SymbolPriorityEngine.Release(ctx.Symbol);
-                    
+
                     ctx.PeakAtr = 0.0;
                     ctx.PeakAtrCaptured = false;
                     ctx.ClearListOfStates();
@@ -660,22 +568,88 @@ namespace MetaTrader.Util
 
                     ctx.LastImpulseHadAbsorption = false;
                     ctx.CandlesSinceImpulse = 0;
-
-                }
-                else
-                {
-
                 }
 
-                    return;
+                return;
             }
 
-            // ---------------------------------
-            // ARMED: wait for trade execution
-            // ---------------------------------
             Console.WriteLine(
                 $"STATE={ctx.State} | Exp={ctx.ExpansionCandles} | PB={ctx.PullbackCandles} | Hybrid={momentum.Hybrid:F2}"
             );
+        }
+
+        private void UpdateFreshness(
+            string symbol,
+            SymbolContext ctx,
+            double[] emaFast1H,
+            double atrRaw,
+            MqlRates[] rates1H)
+        {
+            if (emaFast1H == null ||
+                emaFast1H.Length < 1 ||
+                rates1H == null ||
+                rates1H.Length < 2 ||
+                atrRaw <= 0)
+            {
+                return;
+            }
+
+            string normalized = NormalizeSymbol(symbol);
+
+            double ema9 = emaFast1H[^1];
+            double close = rates1H[^1].close;
+
+            double distanceFromEma9Atr = Math.Abs(close - ema9) / atrRaw;
+
+            double maxFreshDistance =
+                GetUniverse(symbol) == MarketUniverse.Metals ? 1.25 :
+                GetUniverse(symbol) == MarketUniverse.Crypto ? 1.45 :
+                GetUniverse(symbol) == MarketUniverse.FX ? 1.10 :
+                1.20;
+
+            bool tooExtended = distanceFromEma9Atr > maxFreshDistance;
+
+            _freshness[normalized] = new SymbolFreshness
+            {
+                DistanceFromEma9Atr = distanceFromEma9Atr,
+                ExpansionCandles = ctx.ExpansionCandles,
+                IsLateExpansion = ctx.IsLateExpansion,
+                IsTooExtended = tooExtended,
+                LastUpdatedUtc = DateTime.UtcNow
+            };
+        }
+
+        private bool IsFreshEnoughToArm(string symbol, SymbolContext ctx)
+        {
+            string normalized = NormalizeSymbol(symbol);
+
+            if (!_freshness.TryGetValue(normalized, out var f))
+                return true;
+
+            if (f.IsLateExpansion)
+                return false;
+
+            if (f.ExpansionCandles >= 5)
+                return false;
+
+            if (f.IsTooExtended)
+                return false;
+
+            return true;
+        }
+
+        private string GetFreshnessSummary(string symbol)
+        {
+            string normalized = NormalizeSymbol(symbol);
+
+            if (!_freshness.TryGetValue(normalized, out var f))
+                return "Freshness: unavailable";
+
+            return
+                $"Freshness: distEMA9Atr={f.DistanceFromEma9Atr:F2}, " +
+                $"expCandles={f.ExpansionCandles}, " +
+                $"late={f.IsLateExpansion}, " +
+                $"tooExtended={f.IsTooExtended}";
         }
 
         private bool HandleArmedStateTransition(
@@ -686,47 +660,57 @@ namespace MetaTrader.Util
             DateTime nowAst = DateTime.UtcNow.AddHours(-4);
             bool cryptoWindow = TradingUniverseSelector.IsCryptoWindow(nowAst);
 
-            // Only care about transitions INTO Armed
             if (previousState == MarketState.Armed ||
                 newState != MarketState.Armed)
-                return true; // allow normal flow
+                return true;
 
-            // Try to acquire global priority
+            if (!IsFreshEnoughToArm(ctx.Symbol, ctx))
+            {
+                ctx.TransitionTo(MarketState.Pullback);
+                ctx.ResetPullback();
+                ctx.ResetExpansion();
+
+                LogFile.Write($"⛔ {ctx.Symbol} demoted before priority: not fresh enough | {GetFreshnessSummary(ctx.Symbol)}");
+                return false;
+            }
+
             double myPriority = SymbolPriority.Get(ctx.Symbol, cryptoWindow);
             bool acquired = SymbolPriorityEngine.TryAcquire(ctx.Symbol, myPriority);
 
-
             if (!acquired)
             {
-                // ❌ Lost priority fight → demote self
                 ctx.TransitionTo(MarketState.Pullback);
                 ctx.ResetPullback();
                 ctx.ResetExpansion();
 
                 LogFile.Write($"⛔ {ctx.Symbol} demoted — higher priority symbol active");
-                return false; // STOP further processing for this symbol
+                return false;
             }
 
-            // ✅ Won priority → demote others
             foreach (var symbol in _symbols)
             {
                 if (symbol == ctx.Symbol)
                     continue;
-                
-                //ctx.Symbol is about to be armed
+
                 _contexts.TryGetValue(symbol, out SymbolContext symbolContext);
+
+                if (symbolContext == null)
+                    continue;
+
                 if (symbolContext.State == MarketState.Armed &&
                     SymbolPriority.Get(symbol, cryptoWindow) < myPriority)
                 {
                     symbolContext.TransitionTo(MarketState.Pullback);
                     symbolContext.ResetExpansion();
-                  
+
                     Console.WriteLine($"🔻 {symbolContext.Symbol} forced back to Pullback by {ctx.Symbol}");
                     LogFile.Write($"🔻 {symbolContext.Symbol} forced back to Pullback by {ctx.Symbol}");
                 }
             }
+
             Console.WriteLine($"🔐 {ctx.Symbol} acquired system priority");
             LogFile.Write($"🔐 {ctx.Symbol} acquired system priority");
+
             return true;
         }
 
@@ -738,30 +722,18 @@ namespace MetaTrader.Util
         {
             double t = 0.60;
 
-            // -----------------------------
-            // Volatility sensitivity
-            // -----------------------------
             if (atrRaw < 1.2)
                 t -= 0.05;
 
             if (atrRaw > 2.5)
                 t += 0.05;
 
-            // -----------------------------
-            // Compression penalty
-            // -----------------------------
             if (emaCompressed)
                 t += 0.05;
 
-            // -----------------------------
-            // Neutral / early state bonus
-            // -----------------------------
             if (state == MarketState.Neutral)
                 t -= 0.05;
 
-            // -----------------------------
-            // Momentum quality bonuses
-            // -----------------------------
             if (momentum.Breakout)
                 t -= 0.05;
 
@@ -771,14 +743,9 @@ namespace MetaTrader.Util
             return Math.Clamp(t, 0.45, 0.75);
         }
 
-
-        // ----------------------------
-        // SYMBOL SELECTION
-        // ----------------------------
         private string ChooseBestSymbol()
         {
-            // 🔒 If a symbol is armed, ONLY return that symbol
-            if (coordinator.HasArmedSymbol)
+            if (coordinator != null && coordinator.HasArmedSymbol)
                 return coordinator.ArmedSymbol;
 
             string bestSymbol = null;
@@ -794,8 +761,20 @@ namespace MetaTrader.Util
                 if (ctx.State == MarketState.Pullback) score += 1.0;
                 if (ctx.State == MarketState.Exhaustion) score -= 1.5;
 
-                // ✅ Primary: higher score wins
-                // ✅ Tie-breaker: earlier StateEnteredAt wins
+                string normalized = NormalizeSymbol(ctx.Symbol);
+
+                if (_freshness.TryGetValue(normalized, out var f))
+                {
+                    if (f.IsLateExpansion)
+                        score -= 2.5;
+
+                    if (f.ExpansionCandles >= 5)
+                        score -= 2.0;
+
+                    if (f.IsTooExtended)
+                        score -= 2.0;
+                }
+
                 if (score > bestScore ||
                     (score == bestScore && bestCtx != null &&
                      ctx.StateEnteredAt < bestCtx.StateEnteredAt))
@@ -813,20 +792,17 @@ namespace MetaTrader.Util
                 }
 
                 Console.WriteLine(
-                        $"Candidate {ctx.Symbol}: State={ctx.State}, Score={score}, EnteredAt={ctx.StateEnteredAt:HH:mm:ss}"
+                    $"Candidate {ctx.Symbol}: State={ctx.State}, Score={score}, EnteredAt={ctx.StateEnteredAt:HH:mm:ss} | {GetFreshnessSummary(ctx.Symbol)}"
                 );
-                LogFile.Write($"Candidate {ctx.Symbol}: State={ctx.State}, Score={score}, EnteredAt={ctx.StateEnteredAt:HH:mm:ss}");
 
+                LogFile.Write(
+                    $"Candidate {ctx.Symbol}: State={ctx.State}, Score={score}, EnteredAt={ctx.StateEnteredAt:HH:mm:ss} | {GetFreshnessSummary(ctx.Symbol)}"
+                );
             }
-
 
             return bestSymbol;
         }
 
-
-        // ----------------------------
-        // HELPERS
-        // ----------------------------
         public SymbolContext GetContext(string symbol)
         {
             if (!_contexts.ContainsKey(symbol))
@@ -835,7 +811,6 @@ namespace MetaTrader.Util
             }
 
             return _contexts.GetValueOrDefault(symbol);
-            
         }
 
         private bool IsEmaCompressed(
@@ -847,5 +822,4 @@ namespace MetaTrader.Util
             return dist < atrRaw * 0.15;
         }
     }
-
 }

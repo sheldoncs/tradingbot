@@ -152,14 +152,14 @@ namespace MetaTrader.Util
             string s = symbol?.ToUpperInvariant() ?? "";
 
             if (IsGold(s))
-            {
+            {   
                 return new Profile
                 {
-                    ArmAtrMultiplier = 0.55,
-                    GivebackAtrMultiplier = 0.55,
-                    MinArmUsd = 12.0,
-                    MinGivebackUsd = 7.0,
-                    StrongTrendBreathingFactor = 1.20,
+                    ArmAtrMultiplier = 0.75,
+                    GivebackAtrMultiplier = 1.15,
+                    MinArmUsd = 18.0,
+                    MinGivebackUsd = 18.0,
+                    StrongTrendBreathingFactor = 1.45,
                     MinCandlesAfterArm = 1
                 };
             }

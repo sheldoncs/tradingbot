@@ -35,9 +35,13 @@ namespace MetaTrader.Services.Helper
         // =====================================================
         // RISK SETTINGS
         // =====================================================
-        public static double RecoveryRiskPercent = 0.10;
-        public static double NormalRiskPercent = 0.25;
-        public static double AggressiveRiskPercent = 0.35;
+        //public static double RecoveryRiskPercent = 0.10;
+        //public static double NormalRiskPercent = 0.25;
+        //public static double AggressiveRiskPercent = 0.35;
+
+        public static double RecoveryRiskPercent = 0.05;
+        public static double NormalRiskPercent = 0.15;
+        public static double AggressiveRiskPercent = 0.25;
 
         public static bool AllowMomentumLotBoost = false;
 
@@ -63,7 +67,7 @@ namespace MetaTrader.Services.Helper
                 VolatilityFactor = 0.80,
                 HighVolatilityCut = 0.70,
                 LowVolatilityBoost = 1.00,
-                MaxLot = 0.03,
+                MaxLot = 0.02,
                 ContractSize = 100
             },
 
@@ -73,7 +77,7 @@ namespace MetaTrader.Services.Helper
                 VolatilityFactor = 0.75,
                 HighVolatilityCut = 0.70,
                 LowVolatilityBoost = 1.00,
-                MaxLot = 0.03,
+                MaxLot = 0.02,
                 ContractSize = 100
             },
 
