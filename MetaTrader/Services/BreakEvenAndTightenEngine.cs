@@ -8,6 +8,18 @@ namespace MetaTrader.Services
 {
     public static class BreakEvenAndTightenEngine
     {
+        private class Profile
+        {
+            public double BreakEvenAtProfit { get; set; }
+            public double BreakEvenBufferPrice { get; set; }
+
+            public double LockAtProfit { get; set; }
+            public double LockProfitAmount { get; set; }
+
+            public double TrailAtProfit { get; set; }
+            public double TrailGiveback { get; set; }
+        }
+
         public static void Manage(
             string symbol,
             MtApi5Client client,
@@ -15,77 +27,26 @@ namespace MetaTrader.Services
             double entryPrice,
             double currentPrice,
             double stopLoss,
-            double atr,
+            double currentProfitUsd,
             TradeAction tradeAction)
         {
             try
             {
-                if (atr <= 0) return;
+                var profile = GetProfile(symbol);
+
+                LogFile.Write(
+                    $"[{symbol}] BE/Tighten check | profit=${currentProfitUsd:F2} | " +
+                    $"BE=${profile.BreakEvenAtProfit:F2} | Lock=${profile.LockAtProfit:F2} | Trail=${profile.TrailAtProfit:F2}"
+                );
 
                 // =========================
-                // DETECT ASSET TYPE
+                // 1️⃣ SOFT BREAK EVEN
                 // =========================
-                bool isGold = symbol.Contains("XAU");
-                bool isCrypto = symbol.Contains("USD") && !symbol.Contains("XAU") && !symbol.Contains("US100");
-                bool isIndex = symbol.Contains("US100") || symbol.Contains("NAS") || symbol.Contains("USTEC");
-                bool isFx = symbol.Contains("USD") && !isCrypto && !isGold;
-
-                // =========================
-                // SETTINGS PER ASSET
-                // =========================
-                double beATR = 1.0;
-                double lockATR = 1.8;
-                double trailATR = 2.5;
-
-                double bufferATR = 0.4;
-                double lockBufferATR = 0.6;
-
-                if (isGold)
+                if (currentProfitUsd >= profile.BreakEvenAtProfit)
                 {
-                    beATR = 0.8;
-                    lockATR = 1.5;
-                    trailATR = 2.2;
-                    bufferATR = 0.3;
-                    lockBufferATR = 0.5;
-                }
-                else if (isIndex)
-                {
-                    beATR = 1.2;
-                    lockATR = 2.0;
-                    trailATR = 3.0;
-                    bufferATR = 0.5;
-                    lockBufferATR = 0.7;
-                }
-                else if (isFx)
-                {
-                    beATR = 1.0;
-                    lockATR = 1.6;
-                    trailATR = 2.3;
-                    bufferATR = 0.35;
-                    lockBufferATR = 0.55;
-                }
-                else if (isCrypto)
-                {
-                    beATR = 1.0;
-                    lockATR = 1.8;
-                    trailATR = 2.6;
-                    bufferATR = 0.4;
-                    lockBufferATR = 0.6;
-                }
-
-                // =========================
-                // PRICE MOVE
-                // =========================
-                double move = tradeAction == TradeAction.EnterBuy
-                    ? currentPrice - entryPrice
-                    : entryPrice - currentPrice;
-
-                // =========================
-                // 1️⃣ BREAK EVEN
-                // =========================
-                if (move >= atr * beATR)
-                {
-                    double newSL = entryPrice;
+                    double newSL = tradeAction == TradeAction.EnterBuy
+                        ? entryPrice - profile.BreakEvenBufferPrice
+                        : entryPrice + profile.BreakEvenBufferPrice;
 
                     bool shouldMove =
                         (tradeAction == TradeAction.EnterBuy && stopLoss < newSL) ||
@@ -94,18 +55,30 @@ namespace MetaTrader.Services
                     if (shouldMove)
                     {
                         client.PositionModify(ticket, newSL, 0);
-                        LogFile.Write($"[{symbol}] 🔹 SL → Break-Even");
+
+                        LogFile.Write(
+                            $"[{symbol}] 🔹 SL → Soft Break-Even | profit=${currentProfitUsd:F2} | entry={entryPrice:F5} | newSL={newSL:F5}"
+                        );
                     }
                 }
 
                 // =========================
                 // 2️⃣ PROFIT LOCK
                 // =========================
-                if (move >= atr * lockATR)
+                if (currentProfitUsd >= profile.LockAtProfit)
                 {
+                    double protectedProfit = profile.LockProfitAmount;
+
+                    double priceDistance = Math.Abs(currentPrice - entryPrice);
+                    double dollarsPerPriceUnit =
+                        currentProfitUsd / Math.Max(priceDistance, 0.0000001);
+
+                    double protectedPriceDistance =
+                        protectedProfit / Math.Max(dollarsPerPriceUnit, 0.0000001);
+
                     double newSL = tradeAction == TradeAction.EnterBuy
-                        ? entryPrice + atr * lockBufferATR
-                        : entryPrice - atr * lockBufferATR;
+                        ? entryPrice + protectedPriceDistance
+                        : entryPrice - protectedPriceDistance;
 
                     bool shouldLock =
                         (tradeAction == TradeAction.EnterBuy && newSL > stopLoss) ||
@@ -114,18 +87,33 @@ namespace MetaTrader.Services
                     if (shouldLock)
                     {
                         client.PositionModify(ticket, newSL, 0);
-                        LogFile.Write($"[{symbol}] 🟢 Profit locked");
+
+                        LogFile.Write(
+                            $"[{symbol}] 🟢 Profit locked | profit=${currentProfitUsd:F2} | protected=${protectedProfit:F2} | newSL={newSL:F5}"
+                        );
                     }
                 }
 
                 // =========================
-                // 3️⃣ TRAILING (RUNNER MODE)
+                // 3️⃣ DOLLAR TRAILING
                 // =========================
-                if (move >= atr * trailATR)
+                if (currentProfitUsd >= profile.TrailAtProfit)
                 {
+                    double protectedProfit = currentProfitUsd - profile.TrailGiveback;
+
+                    if (protectedProfit <= 0)
+                        return;
+
+                    double priceDistance = Math.Abs(currentPrice - entryPrice);
+                    double dollarsPerPriceUnit =
+                        currentProfitUsd / Math.Max(priceDistance, 0.0000001);
+
+                    double protectedPriceDistance =
+                        protectedProfit / Math.Max(dollarsPerPriceUnit, 0.0000001);
+
                     double newSL = tradeAction == TradeAction.EnterBuy
-                        ? currentPrice - atr * bufferATR
-                        : currentPrice + atr * bufferATR;
+                        ? entryPrice + protectedPriceDistance
+                        : entryPrice - protectedPriceDistance;
 
                     bool shouldTrail =
                         (tradeAction == TradeAction.EnterBuy && newSL > stopLoss) ||
@@ -134,14 +122,110 @@ namespace MetaTrader.Services
                     if (shouldTrail)
                     {
                         client.PositionModify(ticket, newSL, 0);
-                        LogFile.Write($"[{symbol}] 🚀 Trailing stop active");
+
+                        LogFile.Write(
+                            $"[{symbol}] 🚀 Dollar trailing active | profit=${currentProfitUsd:F2} | protected=${protectedProfit:F2} | newSL={newSL:F5}"
+                        );
                     }
                 }
             }
             catch (Exception ex)
             {
-                LogFile.Write($"[{symbol}] ProfitEngine error: {ex.Message}");
+                LogFile.Write($"[{symbol}] BreakEvenAndTightenEngine error: {ex.Message}");
             }
+        }
+
+        private static Profile GetProfile(string symbol)
+        {
+            string s = symbol.ToUpperInvariant();
+
+            if (s.Contains("XAU") || s.Contains("XAG"))
+            {
+                return new Profile
+                {
+                    BreakEvenAtProfit = 5.00,
+                    BreakEvenBufferPrice = 1.50,
+
+                    LockAtProfit = 8.00,
+                    LockProfitAmount = 2.00,
+
+                    TrailAtProfit = 12.00,
+                    TrailGiveback = 5.00
+                };
+            }
+
+            if (s.Contains("BNB"))
+            {
+                return new Profile
+                {
+                    BreakEvenAtProfit = 5.00,
+                    BreakEvenBufferPrice = 0.50,
+
+                    LockAtProfit = 8.00,
+                    LockProfitAmount = 2.00,
+
+                    TrailAtProfit = 12.00,
+                    TrailGiveback = 4.00
+                };
+            }
+
+            if (s.Contains("SOL"))
+            {
+                return new Profile
+                {
+                    BreakEvenAtProfit = 5.00,
+                    BreakEvenBufferPrice = 0.30,
+
+                    LockAtProfit = 8.00,
+                    LockProfitAmount = 2.00,
+
+                    TrailAtProfit = 12.00,
+                    TrailGiveback = 4.00
+                };
+            }
+
+            if (s.Contains("ETH") || s.Contains("BTC"))
+            {
+                return new Profile
+                {
+                    BreakEvenAtProfit = 6.00,
+                    BreakEvenBufferPrice = s.Contains("BTC") ? 20.00 : 2.00,
+
+                    LockAtProfit = 10.00,
+                    LockProfitAmount = 3.00,
+
+                    TrailAtProfit = 15.00,
+                    TrailGiveback = 5.00
+                };
+            }
+
+            if (s.Contains("US100") || s.Contains("NAS") || s.Contains("USTEC"))
+            {
+                return new Profile
+                {
+                    BreakEvenAtProfit = 6.00,
+                    BreakEvenBufferPrice = 3.00,
+
+                    LockAtProfit = 10.00,
+                    LockProfitAmount = 3.00,
+
+                    TrailAtProfit = 15.00,
+                    TrailGiveback = 5.00
+                };
+            }
+
+            // FX default
+            return new Profile
+            {
+                BreakEvenAtProfit = 3.00,
+                BreakEvenBufferPrice = 0.00030,
+
+                LockAtProfit = 5.00,
+                LockProfitAmount = 1.50,
+
+                TrailAtProfit = 8.00,
+                TrailGiveback = 2.50
+            };
         }
     }
 }

@@ -75,7 +75,7 @@ namespace MetaTrader.Services
                 1.35;
 
             double bodyStrengthRequired =
-                IsFx(s) ? 0.38 :
+                IsGold(s) ? 0.50 :
                 BodyStrength;
 
             double normalizedAtrPercentile = atrPercentile > 1.0
@@ -224,7 +224,7 @@ namespace MetaTrader.Services
             if (distToSlow > atr * pullbackToSlowMax)
             {
                 LogFile.Write(
-                    $"[{symbol}] TrendRide blocked: pullback too deep from EMA21 | " +
+                    $"[{symbol}] TrendRide blocked: pullback too far from EMA21 | " +
                     $"dist={distToSlow:F5}, max={atr * pullbackToSlowMax:F5}"
                 );
                 return false;

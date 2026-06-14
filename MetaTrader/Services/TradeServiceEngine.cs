@@ -178,7 +178,7 @@ namespace MetaTrader.Services
             {TradingEngineMode.TrendRideMode,new EngineTrade { wins = 0, losses = 0 }},
             {TradingEngineMode.ExhaustionReversalMode,new EngineTrade { wins = 0, losses = 0 }}
         };
-        
+
         // --- MT5 client wiring (non-breaking bridge) ---
         private static readonly object _clientSync = new();
 
@@ -268,9 +268,9 @@ namespace MetaTrader.Services
             _onMessageReceived = onMessageReceived;
 
             _client.ConnectionStateChanged += Api_ConnectionStateChanged;
-            
+
             _client.BeginConnect("127.0.0.1", 8228);
-            
+
             Results<string> results = new Results<string>
             {
                 messageType = "string",
@@ -426,7 +426,7 @@ namespace MetaTrader.Services
 
             DateTime nowUtc = now.ToUniversalTime();
 
-            if (TradingWindow.IsTradingWindow(now) )
+            if (TradingWindow.IsTradingWindow(now))
             {
                 Console.WriteLine($"[{now}] In trading window → running trading logic...");
                 LogFile.Write($"[{now}] In trading window → running trading logic...");
@@ -484,7 +484,7 @@ namespace MetaTrader.Services
 
                 LogFile.Write($"{engine.Key.ToString()}: {winRate:F2}%");
             }
-            
+
             if (ctx != null)
             {
                 ctx.PeakAtr = 0.0;
@@ -499,9 +499,9 @@ namespace MetaTrader.Services
                 Profit = _client.HistoryDealGetDouble(ticket, MtApi5.ENUM_DEAL_PROPERTY_DOUBLE.DEAL_PROFIT),
                 Risk = Math.Max((double)tradingPairsDto.riskpertrade, 0.01),
                 EntryPrice = currentSignal == "BUY" ? ask : bid,
-                StopLoss = openTrades.Select(t=>t).FirstOrDefault().StopLoss,
+                StopLoss = openTrades.Select(t => t).FirstOrDefault().StopLoss,
                 Volume = openTrades.Select(t => t).FirstOrDefault().Volume
-            }; 
+            };
 
 
 
@@ -564,13 +564,14 @@ namespace MetaTrader.Services
             try
             {
                 LogFile.Write("Begin Strategy...");
-                
+
                 await RunParallelStrategy(ct);
-                
+
             }
             catch (Exception ex)
             {
-                Console.WriteLine("Error: " + ex.Message);
+                
+                Console.WriteLine("Error: " + ex.Message + " "+ ex.StackTrace);
             }
         }
         public static void DailyModeUpdate()
@@ -737,8 +738,9 @@ namespace MetaTrader.Services
         private void tradeProfit(string symbol)
         {
             double profit = _client.HistoryDealGetDouble(ticket, ENUM_DEAL_PROPERTY_DOUBLE.DEAL_PROFIT);
+            SymbolTradeCooldown.MarkExit(symbol, globalEntryModel, profit);
             if (engineTrades.TryGetValue(EngineConfig.Mode, out var engine))
-            {    
+            {
                 if (profit < 0)
                     engine.losses++;
                 else if (profit > 0)
@@ -762,12 +764,12 @@ namespace MetaTrader.Services
             _orderInProgress = false;
             if (ctx != null)
                 ctx.AllowSniperNextCandle = false;
-            
+
             currentSignal = null;
             isTradeClosed = true;
             TradeServiceEngine.closingTrade = false;
             setCoolDownCandleStopLossHit();
-            
+
             openTrades.Clear();
 
         }
@@ -803,6 +805,7 @@ namespace MetaTrader.Services
         DateTime lastSeenH1Time;
         private TransitionResult transition;
         private static string tradingEngine = "";
+        private EntryModel globalEntryModel;
         private static readonly Dictionary<string, DateTime> _entryLockCandle = new();
         private static readonly HashSet<string> _orderInProgressSet = new();
 
@@ -882,7 +885,7 @@ namespace MetaTrader.Services
 
             if (trackedTrade != null)
             {
-               
+
                 if (currentCandleTime != lastSeenH1Time)
                 {
                     // 🎯 NEW candle detected
@@ -895,7 +898,7 @@ namespace MetaTrader.Services
                     // - Sniper continuation
                     // - structure logic
                 }
-                
+
                 if (EquityGivebackProtection.ShouldCloseAll(accountEquity, "FTMO10K"))
                 {
                     LogFile.Write($"🛑 EQUITY GIVEBACK STOP: equity={accountEquity:F2} startingEquity={startingEquity:F2}");
@@ -911,7 +914,7 @@ namespace MetaTrader.Services
             // =========================================================
             LogFile.Write("MT5 Connected - Starting Trade Logic help cant understand");
             InitializeTrade();
-            
+
             showBalances();
             Results<string> results = new Results<string>
             {
@@ -921,9 +924,9 @@ namespace MetaTrader.Services
                 status = 200
             };
             await _onMessageReceived(results);
-            
 
-            
+
+
 
             // =========================================================
             // 🔄 FORCE CLOSE FLOW (MANUAL / ENGINE)
@@ -943,11 +946,13 @@ namespace MetaTrader.Services
                 ResetTrade = true;
                 ResetTradeState(ctx.Symbol);
             }
-
-            if (PostExitCooldown.IsInCooldown(SYMBOL))
+            if (SYMBOL != null)
             {
-                LogFile.Write($"⏳ Cooldown active for {SYMBOL} — waiting 30 minutes after forced exit");
-                return;
+                if (PostExitCooldown.IsInCooldown(SYMBOL))
+                {
+                    LogFile.Write($"⏳ Cooldown active for {SYMBOL} — waiting 30 minutes after forced exit");
+                    return;
+                }
             }
             // =========================================================
             // 🔁 MANAGE OPEN TRADE (SYMBOL OWNER ONLY)
@@ -972,7 +977,7 @@ namespace MetaTrader.Services
                 // =======================================
                 var last = trackerTradeRates1H[^1];
                 var prev = trackerTradeRates1H[^2];
-                
+
                 MomentumResult momentum = HybridMomentumEngine.Calculate(last, prev, rates1H, emaFast1H, emaSlow1H, atrRaw, false);
                 ctx.PreviousMomentum = ctx.CurrentMomentum;
                 ctx.CurrentMomentum = momentum.Hybrid;
@@ -1023,6 +1028,7 @@ namespace MetaTrader.Services
                 return;
             }
 
+
             // =========================================================
             // 📊 PERFORMANCE REPORTING
             // =========================================================
@@ -1048,9 +1054,9 @@ namespace MetaTrader.Services
             }
 
             DailyModeUpdate();
-            
+
             checkTradingLosses();
-            
+
             // =========================================================
             // 🔍 SYMBOL SELECTION (ONLY IF NO TRADE EXISTS)
             // =========================================================
@@ -1072,7 +1078,7 @@ namespace MetaTrader.Services
                     return;
 
                 ctx = coordinator.GetContext(SYMBOL);
-                
+
                 TradingEventBus.State(new BotStateUpdate
                 {
                     state = ctx.State.ToString(),
@@ -1089,8 +1095,8 @@ namespace MetaTrader.Services
 
             Console.WriteLine($"Selected symbol: {SYMBOL}");
             LogFile.Write($"Selected symbol: {SYMBOL}");
-            
-           
+
+
             tradingPairsDto = await _tradingPairProperties.GetTradingPairPropertiesAsync(TradingConfig.Mode == TradingMode.XauUsdOnly ? SYMBOL.Substring(0, 6) : SYMBOL);
 
             bid = _client.SymbolInfoDouble(SYMBOL, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_BID);
@@ -1106,7 +1112,7 @@ namespace MetaTrader.Services
                 // -----------------------------------------
                 // 🎯 1) Run TF Momentum Governance
                 // -----------------------------------------
-                
+
                 var (tradeDecision, emaCompressed) = CheckMultiTfMomentum(
                     ctx,
                     ask, bid,
@@ -1125,7 +1131,7 @@ namespace MetaTrader.Services
                     generalCloseTrade(bid, ask, ctx);
                     return;
                 }
-                
+
                 if (tradeDecision.Action == TradeAction.Hold)
                 {
                     // ✅ If momentum not aligned, skip everything else and wait for next candle
@@ -1145,12 +1151,12 @@ namespace MetaTrader.Services
                     emaSlow1H,
                     ctx,
                     _m15Service, tradeDecision, emaCompressed, out var engine);
-                
+
                 tradingEngine = engine;
 
                 if (action == TradeAction.EnterBuy || action == TradeAction.EnterSell)
                 {
-                    if (engine.Contains("Trend") || engine.Contains("Sniper") 
+                    if (engine.Contains("Trend") || engine.Contains("Sniper")
                          || engine.Contains("Exhaustion") || engine.Contains("Cascade"))
                     {
 
@@ -1233,6 +1239,18 @@ namespace MetaTrader.Services
 
                         try
                         {
+                            EntryModel model = engine.Contains("TrendRide") || engine.Contains("fvg")
+                                ? EntryModel.Continuation :
+                                engine.Contains("Live")
+                                ? EntryModel.BreakoutContinuation : engine.Contains("Compression")
+                                ? EntryModel.CompressionBreakoutContinuation : EntryModel.Sniper;
+                            globalEntryModel = model;
+
+                            if (SymbolTradeCooldown.IsBlocked(SYMBOL, model))
+                            {
+                                return;
+                            }
+
                             await OpenTrade(
                                 action == TradeAction.EnterBuy ? TradeSide.Buy : TradeSide.Sell,
                                 action == TradeAction.EnterBuy ? ask : bid,
@@ -1473,7 +1491,7 @@ namespace MetaTrader.Services
             double atrPercentile,
             double[] emaFast,
             double[] emaSlow,
-            SymbolContext ctx, 
+            SymbolContext ctx,
             M15ConfirmationService _m15Service, TradeDecision tradeDecision, bool emaCompressed, out string engine)
         {
             //out TradeAction action
@@ -1597,6 +1615,150 @@ namespace MetaTrader.Services
                     return (obAction, EntryModel.PullbackContinuation);
                 }
 
+                if (BreakoutContinuationEngine.ShouldEnterLive(
+                    SYMBOL,
+                    rates1H,
+                    atr,
+                    emaFast,
+                    emaSlow,
+                    tradeDecision.Momentum,
+                    bid,
+                    ask,
+                    out TradeAction breakoutContinuationAction))
+                {
+                    engine = "BreakoutContinuationEngine";
+
+                    if (SupportResistanceEngine.ShouldBlockTrade(
+                            symbol,
+                            breakoutContinuationAction,
+                            rates1H,
+                            atr,
+                            tradeDecision.Momentum,
+                            currentPrice))
+                    {
+                        return (TradeAction.DoNothing, EntryModel.Nothing);
+                    }
+                    if (!_m15Service.IsTradeAllowed(SYMBOL, breakoutContinuationAction, EntryModel.BreakoutContinuation, tradeDecision.Momentum, out var reason))
+                    {
+                        return (TradeAction.DoNothing, EntryModel.Nothing);
+                    }
+                    TradingEventBus.M15SnapshotUpdate(new M15Snapshot()
+                    {
+                        Message = "M15 Confirmed",
+                        Symbol = symbol,
+                    });
+                    TradingEventBus.Decision(new DecisionEvent
+                    {
+                        Symbol = ctx.Symbol,
+                        Action = breakoutContinuationAction.ToString(),
+                        Category = DecisionCategory.Sniper.ToString(),
+                        Reason = $"Breakout Continuation {breakoutContinuationAction.ToString()}",
+                        Message = $"Breakout Continuation {breakoutContinuationAction.ToString()}",
+                        Momentum = tradeDecision.Momentum,
+                        EarlyMomentum = false,
+                        EmaCompressed = false,
+                        Regime = DecisionCategory.Continuation.ToString(),
+                        Time = DateTime.UtcNow
+                    });
+
+                    return (breakoutContinuationAction, EntryModel.Continuation);
+                }
+
+                if (CompressionBreakoutEngine.ShouldEnterLive(
+                    SYMBOL,
+                    rates1H,
+                    atr,
+                    emaFast,
+                    emaSlow,
+                    tradeDecision.Momentum,
+                    bid,
+                    ask,
+                    out TradeAction liveBreakoutAction))
+                {
+                    engine = "CompressionLiveBreakoutEngine";
+
+                    if (SupportResistanceEngine.ShouldBlockTrade(
+                            symbol,
+                            liveBreakoutAction,
+                            rates1H,
+                            atr,
+                            tradeDecision.Momentum,
+                            currentPrice))
+                    {
+                        return (TradeAction.DoNothing, EntryModel.Nothing);
+                    }
+                    if (!_m15Service.IsTradeAllowed(SYMBOL, liveBreakoutAction, EntryModel.CompressionBreakoutContinuation, tradeDecision.Momentum, out var reason))
+                    {
+                        return (TradeAction.DoNothing, EntryModel.Nothing);
+                    }
+                    TradingEventBus.M15SnapshotUpdate(new M15Snapshot()
+                    {
+                        Message = "M15 Confirmed",
+                        Symbol = symbol,
+                    });
+                    TradingEventBus.Decision(new DecisionEvent
+                    {
+                        Symbol = ctx.Symbol,
+                        Action = liveBreakoutAction.ToString(),
+                        Category = DecisionCategory.Sniper.ToString(),
+                        Reason = $"Breakout Continuation {liveBreakoutAction.ToString()}",
+                        Message = $"Breakout Continuation {liveBreakoutAction.ToString()}",
+                        Momentum = tradeDecision.Momentum,
+                        EarlyMomentum = false,
+                        EmaCompressed = false,
+                        Regime = DecisionCategory.Continuation.ToString(),
+                        Time = DateTime.UtcNow
+                    });
+
+                    return (liveBreakoutAction, EntryModel.PullbackContinuation);
+                }
+
+                if (CompressionBreakoutEngine.ShouldEnter(
+                    SYMBOL,
+                    rates1H,
+                    atr,
+                    emaFast,
+                    emaSlow,
+                    tradeDecision.Momentum,
+                    out var compressionAction))
+                {
+                    engine = "CompressionBreakoutEngine";
+
+                    if (SupportResistanceEngine.ShouldBlockTrade(
+                            symbol,
+                            compressionAction,
+                            rates1H,
+                            atr,
+                            tradeDecision.Momentum,
+                            currentPrice))
+                    {
+                        return (TradeAction.DoNothing, EntryModel.Nothing);
+                    }
+                    if (!_m15Service.IsTradeAllowed(SYMBOL, compressionAction, EntryModel.CompressionBreakoutContinuation, tradeDecision.Momentum, out var reason))
+                    {
+                        return (TradeAction.DoNothing, EntryModel.Nothing);
+                    }
+                    TradingEventBus.M15SnapshotUpdate(new M15Snapshot()
+                    {
+                        Message = "M15 Confirmed",
+                        Symbol = symbol,
+                    });
+                    TradingEventBus.Decision(new DecisionEvent
+                    {
+                        Symbol = ctx.Symbol,
+                        Action = compressionAction.ToString(),
+                        Category = DecisionCategory.Sniper.ToString(),
+                        Reason = $"Breakout Continuation {compressionAction.ToString()}",
+                        Message = $"Breakout Continuation {compressionAction.ToString()}",
+                        Momentum = tradeDecision.Momentum,
+                        EarlyMomentum = false,
+                        EmaCompressed = false,
+                        Regime = DecisionCategory.Continuation.ToString(),
+                        Time = DateTime.UtcNow
+                    });
+
+                    return (compressionAction, EntryModel.PullbackContinuation);
+                }
                 // 5) Trend Ride Continuation (live, no M15 confirm)
                 if (TrendRideContinuationEngine.ShouldEnter(
                 symbol,
@@ -1686,10 +1848,10 @@ namespace MetaTrader.Services
                     return (trendRideAction, EntryModel.TrendRideContinuation);
                 }
             }
-            
+
             engine = "None";
             return (TradeAction.DoNothing, EntryModel.Nothing);
-            
+
         }
 
         private class BreakoutProfile
@@ -1832,7 +1994,7 @@ namespace MetaTrader.Services
 
             double point = _client.SymbolInfoDouble(SYMBOL, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_POINT);
             double atr = CalculateATR(rates1H, 14);
-            
+
             var sltp = SlTpProfileEngine.GetSlTp(SYMBOL, atr, point);
 
             int stopLossPoints = sltp.StopLossPoints;
@@ -1921,8 +2083,8 @@ namespace MetaTrader.Services
 
             LogFile.Write($"Pre Order values. Side={side}, Volume={finalLot}, Entry={price}, SL={sl}, TP={tp}");
             Console.WriteLine($"Pre Order values. Side={side}, Volume={finalLot}, Entry={price}, SL={sl}, TP={tp}");
-            
-            
+
+
             if (_client.OrderSend(request, out MqlTradeResult result) && result != null)
             {
                 TradeServiceEngine.closingTrade = false;
@@ -1967,7 +2129,7 @@ namespace MetaTrader.Services
                     Model = entry,
                     EntryCandleTime = rates1H[^1].time,
                     CandlesSinceEntry = 0,
-                    
+
                     IsProven = false
                 };
                 openTrades.Add(tracked);
@@ -1984,7 +2146,7 @@ namespace MetaTrader.Services
             }
 
         }
-        
+
 
         static DateTime lastH1CandleTime = DateTime.MinValue;
         private static DateTime _lastWeeklyPrintDate = DateTime.MinValue;
@@ -2072,7 +2234,7 @@ namespace MetaTrader.Services
             //  ATR, mid price, EMA
             // ----------------------------------------------------------
             double midPrice = (bid + ask) / 2.0;
-            
+
             double atrPoints = atrRaw * 10.0;
 
             var bullishOB = SMCEngine.DetectBullishOB(rates1H, atrRaw);
@@ -2141,7 +2303,7 @@ namespace MetaTrader.Services
                 atrRaw
             );
 
-           
+
 
             if (last.time != lastH1CandleTime)
             {
@@ -2153,7 +2315,7 @@ namespace MetaTrader.Services
                 LogFile.Write("🕯 New H1 candle → entry lock reset");
             }
 
-            
+
             TradeDecision tradeDecision = new TradeDecision
             {
                 Action = TradeAction.Hold,
@@ -2161,7 +2323,7 @@ namespace MetaTrader.Services
                 H4Weak = h4Weak,
                 H4Momentum = momentum.Hybrid,
                 H4Reversal = h4Reversal
-               
+
             };
 
             if (!momentum.Strong)
@@ -2195,7 +2357,7 @@ namespace MetaTrader.Services
                     Time = DateTime.UtcNow
                 });
 
-                return (tradeDecision, emaCompressed);
+                //return (tradeDecision, emaCompressed);
 
             }
 
@@ -2278,18 +2440,18 @@ namespace MetaTrader.Services
                 });
 
                 TradingEventBus.Decision(new DecisionEvent
-                 {
-                        Symbol = SYMBOL,
-                        Action = TradeAction.Standby.ToString(),
-                        Category = DecisionCategory.Exhaustion.ToString(),
-                        Reason = $"🔥 Inst. Bullish Exhaustion detectedn",
-                        Message = $"🔥 Inst. Bullish Exhaustion detected",
-                        Momentum = momentum.Hybrid,
-                        EarlyMomentum = false,
-                        EmaCompressed = false,
-                        Regime = MarketRegime.Exhaustion.ToString(),
-                        Time = DateTime.UtcNow
-                 });
+                {
+                    Symbol = SYMBOL,
+                    Action = TradeAction.Standby.ToString(),
+                    Category = DecisionCategory.Exhaustion.ToString(),
+                    Reason = $"🔥 Inst. Bullish Exhaustion detectedn",
+                    Message = $"🔥 Inst. Bullish Exhaustion detected",
+                    Momentum = momentum.Hybrid,
+                    EarlyMomentum = false,
+                    EmaCompressed = false,
+                    Regime = MarketRegime.Exhaustion.ToString(),
+                    Time = DateTime.UtcNow
+                });
 
                 tradeDecision.Action =
                       TradeAction.DynamicBullishExhaustion;
@@ -2313,18 +2475,18 @@ namespace MetaTrader.Services
                 });
 
                 TradingEventBus.Decision(new DecisionEvent
-               {
-                        Symbol = SYMBOL,
-                        Action = TradeAction.Standby.ToString(),
-                        Category = DecisionCategory.Exhaustion.ToString(),
-                        Reason = $"🔥 Inst. Bearish Exhaustion detected",
-                        Message = $"🔥 Inst. Bearish Exhaustion detected",
-                        Momentum = momentum.Hybrid,
-                        EarlyMomentum = false,
-                        EmaCompressed = false,
-                        Regime = MarketRegime.Exhaustion.ToString(),
-                        Time = DateTime.UtcNow
-               });
+                {
+                    Symbol = SYMBOL,
+                    Action = TradeAction.Standby.ToString(),
+                    Category = DecisionCategory.Exhaustion.ToString(),
+                    Reason = $"🔥 Inst. Bearish Exhaustion detected",
+                    Message = $"🔥 Inst. Bearish Exhaustion detected",
+                    Momentum = momentum.Hybrid,
+                    EarlyMomentum = false,
+                    EmaCompressed = false,
+                    Regime = MarketRegime.Exhaustion.ToString(),
+                    Time = DateTime.UtcNow
+                });
 
                 tradeDecision.Action =
                        TradeAction.DynamicBearishExhaustion;
@@ -2344,7 +2506,7 @@ namespace MetaTrader.Services
             if (isChoppyTrend)
             {
 
-                
+
                 TradingEventBus.State(new BotStateUpdate
                 {
                     state = ctx.State.ToString(),
@@ -2382,7 +2544,7 @@ namespace MetaTrader.Services
             }
 
 
-            
+
             // Impulse override (only if not reversing)
             if (impulseCandle && !h4Reversal)
             {
@@ -2547,7 +2709,7 @@ namespace MetaTrader.Services
                 Action = TradeAction.Standby, // <-- neutral
                 LotMultiplier = lotMultiplier,
                 H4Weak = h4Weak,
-                H4Momentum =momentum.Hybrid,
+                H4Momentum = momentum.Hybrid,
                 H4Reversal = h4Reversal,
                 Momentum = momentum.Hybrid,
             }, emaCompressed);
@@ -2587,6 +2749,7 @@ namespace MetaTrader.Services
         public enum EntryModel
         {
             Sniper,
+            CompressionBreakoutContinuation,
             Continuation,
             BreakoutContinuation,
             TrendRide,
@@ -2647,11 +2810,11 @@ namespace MetaTrader.Services
 
         public int CandlesSinceEntry { get; set; }
 
-        static void ManageOpenTrades(double midPrice, 
-            double bid, 
-            double ask, 
-            TradingPairsDto tradingPairsDto, 
-            MqlRates[] rates1Hr, SymbolContext ctx , MomentumResult momentumResult, bool? isBuy = null)
+        static void ManageOpenTrades(double midPrice,
+            double bid,
+            double ask,
+            TradingPairsDto tradingPairsDto,
+            MqlRates[] rates1Hr, SymbolContext ctx, MomentumResult momentumResult, bool? isBuy = null)
         {
             bool isCrypto =
                 SYMBOL.Contains("BTC") ||
@@ -2705,7 +2868,7 @@ namespace MetaTrader.Services
             List<long> mt5Tickets = GetAllOpenPositionTickets();
             LogFile.Write($"MT5 tickets: [{string.Join(",", mt5Tickets)}] | tracked: [{string.Join(",", openTrades.Select(x => x.Ticket))}]");
 
-           
+
 
             long ticket = mt5Tickets.Select(s => s).SingleOrDefault();
 
@@ -2734,7 +2897,7 @@ namespace MetaTrader.Services
 
             if (openTrades.Count == 0 && mt5Tickets.Count > 0)
             {
-               
+
                 var tr = new TrackedTrade()
                 {
                     Ticket = (ulong)ticket, // ✅ IMPORTANT
@@ -2795,7 +2958,7 @@ namespace MetaTrader.Services
             // 2. Detect broker-side closures (SL/TP)
             foreach (var tracked in openTrades.ToList())
             {
-                
+
                 bool selected = _client.PositionSelectByTicket(tracked.Ticket);
 
                 if (!selected)
@@ -2833,7 +2996,7 @@ namespace MetaTrader.Services
                 }
             }
 
-            
+
             // Iterate over copy of list, because we may remove items
 
             foreach (var t in openTrades.ToList())
@@ -2900,7 +3063,7 @@ namespace MetaTrader.Services
                 }
                 _client.PositionSelectByTicket(t.Ticket);
                 profitUsd = _client.PositionGetDouble(ENUM_POSITION_PROPERTY_DOUBLE.POSITION_PROFIT);
-                
+
                 BreakEvenAndTightenEngine.Manage(
                 SYMBOL,
                 _client,
@@ -2908,8 +3071,8 @@ namespace MetaTrader.Services
                 t.EntryPrice,
                 isBuy == true ? bid : ask,
                 t.StopLoss,
-                atr,
-                isBuy == true 
+                profitUsd,
+                isBuy == true
                     ? TradeAction.EnterBuy
                     : TradeAction.EnterSell
                 );
@@ -2925,12 +3088,12 @@ namespace MetaTrader.Services
                     emaSlow1H,
                     ctx.CurrentMomentum,
                     ctx.PreviousMomentum, momentumResult))
-                 {
-                            TradeServiceEngine.closingTrade = true;
-                            LogFile.Write($"[{SYMBOL}] ❌ Trade closed by TradeManagementEngine");
-                            return;
-                 }
-                 LogFile.Write($"[{SYMBOL}] TradeManagementEngine evaluated for trade {t.Ticket}.");    
+                {
+                    TradeServiceEngine.closingTrade = true;
+                    LogFile.Write($"[{SYMBOL}] ❌ Trade closed by TradeManagementEngine");
+                    return;
+                }
+                LogFile.Write($"[{SYMBOL}] TradeManagementEngine evaluated for trade {t.Ticket}.");
 
                 if (!openTrades.Any(x => x.Ticket == t.Ticket))
                     continue; // trade closed by HybridExit
@@ -2965,7 +3128,7 @@ namespace MetaTrader.Services
                         TradeServiceEngine.closingTrade = true;
 
                         // Execute actual close here
-                      
+
                         continue;
                     }
                 }
@@ -3039,7 +3202,7 @@ namespace MetaTrader.Services
             }
             else
             {
-                
+
                 double newSL = mid + trail;
                 LogFile.Write(
                  $"🔁 TRAILING SL UPDATE | ticket={t.Ticket} | oldSL={t.StopLoss} → newSL={newSL} | price={mid}"
@@ -3051,7 +3214,7 @@ namespace MetaTrader.Services
                 }
             }
 
-           
+
         }
         public static List<long> GetAllOpenPositionTickets()
         {
@@ -3146,7 +3309,7 @@ namespace MetaTrader.Services
                 CloseManualOpenPositions();
             }
 
-            
+
             double midPrice = (ask + bid) / 2;
             // With this, since TradeSide is a non-nullable enum:
             if (!Enum.IsDefined(typeof(TradeSide), side)) return;
@@ -3297,7 +3460,7 @@ namespace MetaTrader.Services
     TradingPairsDto tradingPairsDto
 )
         {
-            
+
             if (emaFast == null || emaSlow == null || emaFast.Length < 3 || emaSlow.Length < 3)
                 return TradeAction.Hold;
 

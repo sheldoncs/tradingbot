@@ -249,6 +249,15 @@
             return 4.8; // Crypto
         }
 
+        private static double GetBreakoutMomentumThreshold(string symbol)
+        {
+            if (symbol.Contains("XAU")) return 1.6;
+            if (symbol.Contains("US100")) return 1.8;
+            if (symbol.Length == 6 && symbol.EndsWith("USD")) return 1.3; // FX
+
+            return 1.5; // Crypto
+        }
+
         // =====================================
         // 🎯 MASTER FILTER
         // =====================================
@@ -321,10 +330,45 @@
                 return true;
             }
 
+            if (model == EntryModel.CompressionBreakoutContinuation)
+            {
+                double requiredMomentum = GetBreakoutMomentumThreshold(symbol);
+
+                if (!s.IsImpulsive && momentum < requiredMomentum)
+                {
+                    reason = "Breakout continuation momentum weak";
+                    return false;
+                }
+            }
+
+            if (model == EntryModel.BreakoutContinuation)
+            {
+                if (!isAligned)
+                {
+                    reason = "M15 not aligned";
+                    return false;
+                }
+
+                if (isChoppy)
+                {
+                    reason = "M15 choppy";
+                    return false;
+                }
+
+                if (!s.IsImpulsive && momentum < GetBreakoutMomentumThreshold(symbol))
+                {
+                    reason = "Breakout continuation momentum weak";
+                    return false;
+                }
+
+                return true;
+            }
+
             // =====================================
             // 🟡 CONTINUATION (UPDATED)
             // =====================================
-            if (model == EntryModel.Continuation)
+            if (model == EntryModel.Continuation || 
+                model == EntryModel.TrendRideContinuation)
             {
                 // 🔥 allow strong impulse continuation
                 if (s.IsImpulsive && momentum < 5.0)
