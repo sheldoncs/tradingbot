@@ -330,7 +330,56 @@
                 return true;
             }
 
-            if (model == EntryModel.CompressionBreakoutContinuation)
+            if (model == EntryModel.PullbackContinuation)
+            {
+                // 1️⃣ Avoid dead / weak market
+                if (momentum < 0.8)
+                {
+                    reason = "M15: pullback momentum too weak";
+                    return false;
+                }
+
+                // 2️⃣ Avoid strong impulse AGAINST trade
+                if (s.IsImpulsive && momentum < GetMomentumThreshold(symbol))
+                {
+                    reason = "M15: strong impulse not suitable for pullback";
+                    return false;
+                }
+
+                // 3️⃣ Do NOT require full alignment (pullbacks often misalign briefly)
+                // But block strong disagreement
+                bool strongOpposition =
+                    (direction == TradeAction.Bullish && s.Bearish && momentum < 1.1) ||
+                    (direction == TradeAction.Bearish && s.Bullish && momentum < 1.1);
+
+                if (strongOpposition)
+                {
+                    reason = "M15: opposing direction";
+                    return false;
+                }
+
+                // 4️⃣ Allow early structure (do NOT require full separation)
+                bool minimalStructure =
+                    Math.Abs(s.EmaFast - s.EmaSlow) >= s.Atr * (profile.EmaSeparationAtr * 0.3);
+
+                if (!minimalStructure)
+                {
+                    reason = "M15: no structure";
+                    return false;
+                }
+
+                // 5️⃣ Avoid chop
+                if (isChoppy)
+                {
+                    reason = "M15: choppy";
+                    return false;
+                }
+
+                // ✅ Allow pullback continuation
+                return true;
+            }
+
+            if (model == EntryModel.BreakoutContinuation)
             {
                 double requiredMomentum = GetBreakoutMomentumThreshold(symbol);
 
@@ -341,23 +390,21 @@
                 }
             }
 
-            if (model == EntryModel.BreakoutContinuation)
+            // 🔥 COMPRESSION BREAKOUT logic
+            if (model == EntryModel.CompressionBreakoutContinuation)
             {
+                double requiredMomentum = GetBreakoutMomentumThreshold(symbol) * 0.8;
+
+                if (momentum < requiredMomentum)
+                {
+                    reason = "Compression breakout momentum weak";
+                    return false;
+                }
+
+                // optional
                 if (!isAligned)
                 {
                     reason = "M15 not aligned";
-                    return false;
-                }
-
-                if (isChoppy)
-                {
-                    reason = "M15 choppy";
-                    return false;
-                }
-
-                if (!s.IsImpulsive && momentum < GetBreakoutMomentumThreshold(symbol))
-                {
-                    reason = "Breakout continuation momentum weak";
                     return false;
                 }
 

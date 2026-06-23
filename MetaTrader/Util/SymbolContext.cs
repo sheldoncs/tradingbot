@@ -10,6 +10,17 @@ namespace MetaTrader.Util
 {
     public class SymbolContext
     {
+        public bool NearSupport { get; set; }
+        public bool NearResistance { get; set; }
+        public bool IsBreakingSupport { get; set; }
+        public bool IsBreakingResistance { get; set; }
+        // Optional but VERY useful
+        public double SupportLevel { get; set; }
+        public double ResistanceLevel { get; set; }
+
+        public int SupportTouches { get; set; }
+        public int ResistanceTouches { get; set; }
+
         public double CurrentMomentum { get; set; }
         public double PreviousMomentum { get; set; }
         public bool InRecoveryMode { get; set; }

@@ -64,13 +64,8 @@ namespace MetaTrader.Services
             double ema9 = emaFast[^1];
             double ema21 = emaSlow[^1];
 
-            bool trendUp =
-                ema9 > ema21 &&
-                emaFast[^1] > emaFast[^2];
-
-            bool trendDown =
-                ema9 < ema21 &&
-                emaFast[^1] < emaFast[^2];
+            bool trendUp = ema9 > ema21 && emaFast[^1] > emaFast[^2];
+            bool trendDown = ema9 < ema21 && emaFast[^1] < emaFast[^2];
 
             if (!trendUp && !trendDown)
             {
@@ -83,20 +78,12 @@ namespace MetaTrader.Services
             if (emaSpreadAtr < profile.MinEmaSpreadAtr)
             {
                 ResetState(s);
-                LogFile.Write(
-                    $"[{symbol}] BreakoutContinuation blocked: EMA spread too small | " +
-                    $"spreadAtr={emaSpreadAtr:F2}, need>={profile.MinEmaSpreadAtr:F2}"
-                );
                 return false;
             }
 
             if (Math.Abs(momentum) < profile.MinMomentum)
             {
                 ResetState(s);
-                LogFile.Write(
-                    $"[{symbol}] BreakoutContinuation blocked: momentum too weak | " +
-                    $"momentum={momentum:F2}, need>={profile.MinMomentum:F2}"
-                );
                 return false;
             }
 
@@ -116,45 +103,38 @@ namespace MetaTrader.Services
             double liveBuyPrice = ask;
             double liveSellPrice = bid;
 
-            bool liveBullBreak =
-                trendUp &&
-                liveBuyPrice > recentHigh + buffer;
-
-            bool liveBearBreak =
-                trendDown &&
-                liveSellPrice < recentLow - buffer;
+            bool liveBullBreak = trendUp && liveBuyPrice > recentHigh + buffer;
+            bool liveBearBreak = trendDown && liveSellPrice < recentLow - buffer;
 
             double distBuyFromEma9Atr = Math.Abs(liveBuyPrice - ema9) / atr;
-            double distBuyFromEma21Atr = Math.Abs(liveBuyPrice - ema21) / atr;
-
             double distSellFromEma9Atr = Math.Abs(liveSellPrice - ema9) / atr;
-            double distSellFromEma21Atr = Math.Abs(liveSellPrice - ema21) / atr;
-
-            bool buyTooExtended =
-                distBuyFromEma9Atr > profile.MaxDistanceFromEma9Atr ||
-                distBuyFromEma21Atr > profile.MaxDistanceFromEma21Atr;
-
-            bool sellTooExtended =
-                distSellFromEma9Atr > profile.MaxDistanceFromEma9Atr ||
-                distSellFromEma21Atr > profile.MaxDistanceFromEma21Atr;
 
             // ============================
-            // LIVE BULLISH BREAKOUT CONTINUATION
+            // BUY LOGIC (IMPROVED)
             // ============================
-            if (liveBullBreak && !buyTooExtended)
+            if (liveBullBreak)
             {
+                double breakoutDistance = (liveBuyPrice - recentHigh) / atr;
+
+                // 🔥 Block late entries
+                if (distBuyFromEma9Atr > 1.2)
+                {
+                    ResetState(s);
+                    return false;
+                }
+
+                // 🔥 Block chase entries
+                if (breakoutDistance > 0.6)
+                {
+                    ResetState(s);
+                    return false;
+                }
+
                 if (!state.BullBreakDetected)
                 {
                     state.BullBreakDetected = true;
                     state.BearBreakDetected = false;
                     state.FirstBreakTimeUtc = DateTime.UtcNow;
-
-                    LogFile.Write(
-                        $"[{symbol}] BreakoutContinuation BUY detected — confirming hold | " +
-                        $"ask={ask:F5}, recentHigh={recentHigh:F5}, " +
-                        $"momentum={momentum:F2}, hold={profile.HoldSeconds}s"
-                    );
-
                     return false;
                 }
 
@@ -163,16 +143,15 @@ namespace MetaTrader.Services
 
                 if (heldFor >= profile.HoldSeconds)
                 {
+                    // 🔥 Ensure continuation
+                    if (liveBuyPrice < ema9)
+                    {
+                        ResetState(s);
+                        return false;
+                    }
+
                     action = TradeAction.EnterBuy;
                     ResetState(s);
-
-                    LogFile.Write(
-                        $"[{symbol}] ✅ LIVE BreakoutContinuation BUY CONFIRMED | " +
-                        $"ask={ask:F5}, recentHigh={recentHigh:F5}, " +
-                        $"heldFor={heldFor:F1}s, momentum={momentum:F2}, " +
-                        $"distEMA9Atr={distBuyFromEma9Atr:F2}, distEMA21Atr={distBuyFromEma21Atr:F2}"
-                    );
-
                     return true;
                 }
 
@@ -180,22 +159,31 @@ namespace MetaTrader.Services
             }
 
             // ============================
-            // LIVE BEARISH BREAKOUT CONTINUATION
+            // SELL LOGIC (IMPROVED)
             // ============================
-            if (liveBearBreak && !sellTooExtended)
+            if (liveBearBreak)
             {
+                double breakoutDistance = (recentLow - liveSellPrice) / atr;
+
+                // 🔥 Block late entries
+                if (distSellFromEma9Atr > 1.2)
+                {
+                    ResetState(s);
+                    return false;
+                }
+
+                // 🔥 Block chase entries
+                if (breakoutDistance > 0.6)
+                {
+                    ResetState(s);
+                    return false;
+                }
+
                 if (!state.BearBreakDetected)
                 {
                     state.BearBreakDetected = true;
                     state.BullBreakDetected = false;
                     state.FirstBreakTimeUtc = DateTime.UtcNow;
-
-                    LogFile.Write(
-                        $"[{symbol}] BreakoutContinuation SELL detected — confirming hold | " +
-                        $"bid={bid:F5}, recentLow={recentLow:F5}, " +
-                        $"momentum={momentum:F2}, hold={profile.HoldSeconds}s"
-                    );
-
                     return false;
                 }
 
@@ -204,42 +192,19 @@ namespace MetaTrader.Services
 
                 if (heldFor >= profile.HoldSeconds)
                 {
+                    // 🔥 Ensure continuation
+                    if (liveSellPrice > ema9)
+                    {
+                        ResetState(s);
+                        return false;
+                    }
+
                     action = TradeAction.EnterSell;
                     ResetState(s);
-
-                    LogFile.Write(
-                        $"[{symbol}] ✅ LIVE BreakoutContinuation SELL CONFIRMED | " +
-                        $"bid={bid:F5}, recentLow={recentLow:F5}, " +
-                        $"heldFor={heldFor:F1}s, momentum={momentum:F2}, " +
-                        $"distEMA9Atr={distSellFromEma9Atr:F2}, distEMA21Atr={distSellFromEma21Atr:F2}"
-                    );
-
                     return true;
                 }
 
                 return false;
-            }
-
-            if (state.BullBreakDetected &&
-                liveBuyPrice <= recentHigh)
-            {
-                LogFile.Write(
-                    $"[{symbol}] BreakoutContinuation BUY reset: price fell back below breakout | " +
-                    $"ask={ask:F5}, recentHigh={recentHigh:F5}"
-                );
-
-                ResetState(s);
-            }
-
-            if (state.BearBreakDetected &&
-                liveSellPrice >= recentLow)
-            {
-                LogFile.Write(
-                    $"[{symbol}] BreakoutContinuation SELL reset: price returned above breakdown | " +
-                    $"bid={bid:F5}, recentLow={recentLow:F5}"
-                );
-
-                ResetState(s);
             }
 
             return false;
@@ -247,9 +212,7 @@ namespace MetaTrader.Services
 
         private static Profile GetProfile(string symbol)
         {
-            string s = NormalizeSymbol(symbol);
-
-            if (IsGold(s))
+            if (IsGold(symbol))
             {
                 return new Profile
                 {
@@ -263,7 +226,7 @@ namespace MetaTrader.Services
                 };
             }
 
-            if (IsCrypto(s))
+            if (IsCrypto(symbol))
             {
                 return new Profile
                 {
@@ -277,7 +240,6 @@ namespace MetaTrader.Services
                 };
             }
 
-            // FX
             return new Profile
             {
                 StructureLookback = 5,
@@ -314,10 +276,7 @@ namespace MetaTrader.Services
 
         private static bool IsGold(string symbol)
         {
-            return symbol.Contains("XAU") ||
-                   symbol.Contains("XAG") ||
-                   symbol.Contains("GOLD") ||
-                   symbol.Contains("SILVER");
+            return symbol.Contains("XAU") || symbol.Contains("XAG");
         }
 
         private static bool IsCrypto(string symbol)
@@ -327,11 +286,7 @@ namespace MetaTrader.Services
                    symbol.Contains("SOL") ||
                    symbol.Contains("BNB") ||
                    symbol.Contains("XRP") ||
-                   symbol.Contains("ADA") ||
-                   symbol.Contains("AVAX") ||
-                   symbol.Contains("LINK") ||
-                   symbol.Contains("LTC") ||
-                   symbol.Contains("DOGE");
+                   symbol.Contains("ADA");
         }
     }
 }

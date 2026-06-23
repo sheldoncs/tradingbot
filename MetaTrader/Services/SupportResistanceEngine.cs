@@ -46,7 +46,6 @@ namespace MetaTrader.Services
             if (IsFx(symbol)) return 0.50;
             if (IsIndex(symbol)) return 0.55;
             if (IsCrypto(symbol)) return 0.45;
-
             return 0.50;
         }
 
@@ -56,38 +55,7 @@ namespace MetaTrader.Services
             if (IsFx(symbol)) return 0.35;
             if (IsIndex(symbol)) return 0.40;
             if (IsCrypto(symbol)) return 0.40;
-
             return 0.40;
-        }
-
-        private static double GetBreakoutRangeFactor(string symbol)
-        {
-            if (IsGold(symbol)) return 1.35;
-            if (IsFx(symbol)) return 1.25;
-            if (IsIndex(symbol)) return 1.20;
-            if (IsCrypto(symbol)) return 1.10;
-
-            return 1.20;
-        }
-
-        private static double GetBreakoutBodyRatio(string symbol)
-        {
-            if (IsGold(symbol)) return 0.60;
-            if (IsFx(symbol)) return 0.58;
-            if (IsIndex(symbol)) return 0.56;
-            if (IsCrypto(symbol)) return 0.54;
-
-            return 0.58;
-        }
-
-        private static double GetBreakClearanceAtr(string symbol)
-        {
-            if (IsGold(symbol)) return 0.15;
-            if (IsFx(symbol)) return 0.08;
-            if (IsIndex(symbol)) return 0.10;
-            if (IsCrypto(symbol)) return 0.10;
-
-            return 0.10;
         }
 
         private static double GetMomentumThreshold(string symbol)
@@ -96,7 +64,6 @@ namespace MetaTrader.Services
             if (IsFx(symbol)) return 1.10;
             if (IsIndex(symbol)) return 1.15;
             if (IsCrypto(symbol)) return 1.20;
-
             return 1.20;
         }
 
@@ -110,20 +77,13 @@ namespace MetaTrader.Services
 
             for (int i = 2; i < Lookback + 2 && i < rates.Length; i++)
             {
-                if (rates[^i].high > highest)
-                    highest = rates[^i].high;
-
-                if (rates[^i].low < lowest)
-                    lowest = rates[^i].low;
+                highest = Math.Max(highest, rates[^i].high);
+                lowest = Math.Min(lowest, rates[^i].low);
             }
 
             return (highest, lowest);
         }
 
-        // --------------------------------
-        // SHELF / CLUSTER DETECTION
-        // Finds repeated reactions around support/resistance
-        // --------------------------------
         private static SrLevel GetSupportShelf(string symbol, MqlRates[] rates, double atr)
         {
             double cluster = atr * GetLevelClusterAtr(symbol);
@@ -138,13 +98,8 @@ namespace MetaTrader.Services
 
                 for (int j = 2; j < Lookback + 2 && j < rates.Length; j++)
                 {
-                    bool lowTouched =
-                        Math.Abs(rates[^j].low - candidate) <= cluster;
-
-                    bool bodyTouched =
-                        Math.Abs(Math.Min(rates[^j].open, rates[^j].close) - candidate) <= cluster;
-
-                    if (lowTouched || bodyTouched)
+                    if (Math.Abs(rates[^j].low - candidate) <= cluster ||
+                        Math.Abs(Math.Min(rates[^j].open, rates[^j].close) - candidate) <= cluster)
                         touches++;
                 }
 
@@ -177,13 +132,8 @@ namespace MetaTrader.Services
 
                 for (int j = 2; j < Lookback + 2 && j < rates.Length; j++)
                 {
-                    bool highTouched =
-                        Math.Abs(rates[^j].high - candidate) <= cluster;
-
-                    bool bodyTouched =
-                        Math.Abs(Math.Max(rates[^j].open, rates[^j].close) - candidate) <= cluster;
-
-                    if (highTouched || bodyTouched)
+                    if (Math.Abs(rates[^j].high - candidate) <= cluster ||
+                        Math.Abs(Math.Max(rates[^j].open, rates[^j].close) - candidate) <= cluster)
                         touches++;
                 }
 
@@ -202,115 +152,8 @@ namespace MetaTrader.Services
             };
         }
 
-        public static bool IsNearResistance(
-            string symbol,
-            MqlRates[] rates,
-            double atr,
-            double currentPrice)
-        {
-            var (highest, _) = GetLevels(rates);
-            var shelf = GetResistanceShelf(symbol, rates, atr);
-
-            double buffer = atr * GetBufferFactor(symbol);
-
-            bool nearHighest = currentPrice >= highest - buffer;
-            bool nearShelf = shelf.Valid && currentPrice >= shelf.Price - buffer;
-
-            return nearHighest || nearShelf;
-        }
-
-        public static bool IsNearSupport(
-            string symbol,
-            MqlRates[] rates,
-            double atr,
-            double currentPrice)
-        {
-            var (_, lowest) = GetLevels(rates);
-            var shelf = GetSupportShelf(symbol, rates, atr);
-
-            double buffer = atr * GetBufferFactor(symbol);
-
-            bool nearLowest = currentPrice <= lowest + buffer;
-            bool nearShelf = shelf.Valid && currentPrice <= shelf.Price + buffer;
-
-            return nearLowest || nearShelf;
-        }
-
         // --------------------------------
-        // BREAKOUT LOGIC
-        // --------------------------------
-        private static bool IsStrongBreakout(
-            string symbol,
-            MqlRates[] rates,
-            double atr,
-            double momentum)
-        {
-            var c0 = rates[^1];
-
-            double range = c0.high - c0.low;
-            if (range <= 0) return false;
-
-            double body = Math.Abs(c0.close - c0.open);
-            double ratio = body / range;
-
-            bool strongCandle =
-                range > atr * GetBreakoutRangeFactor(symbol) &&
-                ratio > GetBreakoutBodyRatio(symbol);
-
-            bool strongMomentum =
-                Math.Abs(momentum) >= GetMomentumThreshold(symbol);
-
-            return strongCandle && strongMomentum;
-        }
-
-        private static bool IsBreakingSupport(
-            string symbol,
-            MqlRates[] rates,
-            double support,
-            double atr,
-            double momentum)
-        {
-            var c0 = rates[^1];
-
-            double clearance = atr * GetBreakClearanceAtr(symbol);
-
-            bool closeBelow =
-                c0.close < support - clearance;
-
-            bool bearishCandle =
-                c0.close < c0.open;
-
-            bool strongMomentum =
-                Math.Abs(momentum) >= GetMomentumThreshold(symbol);
-
-            return closeBelow && bearishCandle && strongMomentum;
-        }
-
-        private static bool IsBreakingResistance(
-            string symbol,
-            MqlRates[] rates,
-            double resistance,
-            double atr,
-            double momentum)
-        {
-            var c0 = rates[^1];
-
-            double clearance = atr * GetBreakClearanceAtr(symbol);
-
-            bool closeAbove =
-                c0.close > resistance + clearance;
-
-            bool bullishCandle =
-                c0.close > c0.open;
-
-            bool strongMomentum =
-                Math.Abs(momentum) >= GetMomentumThreshold(symbol);
-
-            return closeAbove && bullishCandle && strongMomentum;
-        }
-
-        // --------------------------------
-        // MAIN BLOCK LOGIC
+        // MAIN BLOCK LOGIC (UPDATED)
         // --------------------------------
         public static bool ShouldBlockTrade(
             string symbol,
@@ -326,55 +169,66 @@ namespace MetaTrader.Services
             symbol = symbol.ToUpperInvariant();
 
             var (highest, lowest) = GetLevels(rates);
-
             var supportShelf = GetSupportShelf(symbol, rates, atr);
             var resistanceShelf = GetResistanceShelf(symbol, rates, atr);
 
-            double activeSupport =
-                supportShelf.Valid ? supportShelf.Price : lowest;
+            double activeSupport = supportShelf.Valid ? supportShelf.Price : lowest;
+            double activeResistance = resistanceShelf.Valid ? resistanceShelf.Price : highest;
 
-            double activeResistance =
-                resistanceShelf.Valid ? resistanceShelf.Price : highest;
+            // --------------------------------
+            // 🔥 SPACE CALCULATION
+            // --------------------------------
+            double distToResistance = Math.Abs(activeResistance - currentPrice) / atr;
+            double distToSupport = Math.Abs(currentPrice - activeSupport) / atr;
 
-            double buffer = atr * GetBufferFactor(symbol);
+            double minSpace =
+                IsCrypto(symbol) ? 0.6 :
+                IsGold(symbol) ? 0.5 :
+                IsIndex(symbol) ? 0.5 :
+                0.4;
 
-            bool nearResistance =
-                currentPrice >= activeResistance - buffer;
+            // --------------------------------
+            // 🔥 EMA PROXIMITY (NO CHASING)
+            // --------------------------------
+            double emaApprox = rates[^1].close; // replace with EMA9 if available
+            double distFromEma = Math.Abs(currentPrice - emaApprox) / atr;
 
-            bool nearSupport =
-                currentPrice <= activeSupport + buffer;
+            double maxEmaDistance =
+                IsCrypto(symbol) ? 1.2 :
+                IsGold(symbol) ? 1.0 :
+                IsIndex(symbol) ? 1.0 :
+                0.8;
 
+            // --------------------------------
+            // 🔥 STRONG BREAKOUT CONFIRMATION
+            // --------------------------------
             bool strongBreakout =
-                IsStrongBreakout(symbol, rates, atr, momentum);
+                Math.Abs(momentum) >= GetMomentumThreshold(symbol);
 
-            bool breakingResistance =
-                IsBreakingResistance(symbol, rates, activeResistance, atr, momentum);
-
-            bool breakingSupport =
-                IsBreakingSupport(symbol, rates, activeSupport, atr, momentum);
+            bool confirmedBreakout =
+                strongBreakout &&
+                (action == TradeAction.EnterBuy
+                    ? rates[^1].close > activeResistance + atr * 0.2
+                    : rates[^1].close < activeSupport - atr * 0.2);
 
             // --------------------------------
             // BUY LOGIC
             // --------------------------------
             if (action == TradeAction.EnterBuy)
             {
-                if (nearResistance && !breakingResistance && !strongBreakout)
+                if (distToResistance < minSpace && !confirmedBreakout)
                 {
-                    LogFile.Write(
-                        $"[{symbol}] ❌ Buy blocked: holding resistance | " +
-                        $"res={activeResistance:F5}, current={currentPrice:F5}, " +
-                        $"touches={resistanceShelf.Touches}, momentum={momentum:F2}"
-                    );
-
+                    LogFile.Write($"[{symbol}] ❌ Buy blocked: no space above | distATR={distToResistance:F2}");
                     return true;
                 }
 
-                LogFile.Write(
-                    $"[{symbol}] ✅ Buy allowed | " +
-                    $"res={activeResistance:F5}, current={currentPrice:F5}, " +
-                    $"nearResistance={nearResistance}, breaking={breakingResistance}, " +
-                    $"strongBreakout={strongBreakout}, momentum={momentum:F2}"
-                );
+                if (distFromEma > maxEmaDistance)
+                {
+                    LogFile.Write($"[{symbol}] ❌ Buy blocked: too far from EMA | distATR={distFromEma:F2}");
+                    return true;
+                }
+
+                LogFile.Write($"[{symbol}] ✅ Buy allowed | space={distToResistance:F2}, emaDist={distFromEma:F2}");
             }
 
             // --------------------------------
@@ -382,23 +236,19 @@ namespace MetaTrader.Services
             // --------------------------------
             if (action == TradeAction.EnterSell)
             {
-                if (nearSupport && !breakingSupport && !strongBreakout)
+                if (distToSupport < minSpace && !confirmedBreakout)
                 {
-                    LogFile.Write(
-                        $"[{symbol}] ❌ Sell blocked: holding support | " +
-                        $"sup={activeSupport:F5}, current={currentPrice:F5}, " +
-                        $"touches={supportShelf.Touches}, momentum={momentum:F2}"
-                    );
-
+                    LogFile.Write($"[{symbol}] ❌ Sell blocked: no space below | distATR={distToSupport:F2}");
                     return true;
                 }
 
-                LogFile.Write(
-                    $"[{symbol}] ✅ Sell allowed | " +
-                    $"sup={activeSupport:F5}, current={currentPrice:F5}, " +
-                    $"nearSupport={nearSupport}, breaking={breakingSupport}, " +
-                    $"strongBreakout={strongBreakout}, momentum={momentum:F2}"
-                );
+                if (distFromEma > maxEmaDistance)
+                {
+                    LogFile.Write($"[{symbol}] ❌ Sell blocked: too far from EMA | distATR={distFromEma:F2}");
+                    return true;
+                }
+
+                LogFile.Write($"[{symbol}] ✅ Sell allowed | space={distToSupport:F2}, emaDist={distFromEma:F2}");
             }
 
             return false;
