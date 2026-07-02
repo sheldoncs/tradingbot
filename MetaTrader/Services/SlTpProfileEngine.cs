@@ -13,23 +13,27 @@
             Unknown
         }
 
+        // 🔥 NEW
+        public enum TradeType
+        {
+            Breakout,
+            Continuation,
+            None
+        }
+
         public class SlTpProfile
         {
             public bool UseAtrBased { get; set; }
 
-            // Fixed mode
             public int FixedStopLossPoints { get; set; }
             public int FixedTakeProfitPoints { get; set; }
 
-            // ATR mode
             public double StopLossAtrMultiplier { get; set; }
             public double TakeProfitAtrMultiplier { get; set; }
 
-            // Optional minimum floors
             public int MinStopLossPoints { get; set; }
             public int MinTakeProfitPoints { get; set; }
 
-            // Optional maximum caps
             public int MaxStopLossPoints { get; set; }
             public int MaxTakeProfitPoints { get; set; }
         }
@@ -111,7 +115,8 @@
             public static SlTpResult GetSlTp(
                 string symbol,
                 double atrPrice,
-                double pointSize)
+                double pointSize,
+                TradeType tradeType) // 🔥 NEW PARAM
             {
                 var assetClass = DetectAssetClass(symbol);
                 var profile = GetProfile(assetClass);
@@ -125,10 +130,42 @@
                 int slPoints;
                 int tpPoints;
 
+                // 🔥 ADJUST MULTIPLIERS BASED ON TRADE TYPE
+                double slMultiplier = profile.StopLossAtrMultiplier;
+                double tpMultiplier = profile.TakeProfitAtrMultiplier;
+
+                if (tradeType == TradeType.Continuation)
+                {   
+                    double continuationFactor =
+                    IsGold(symbol) ? 1.4 :
+                    IsFx(symbol) ? 1.2 :
+                    IsIndex(symbol) ? 1.5 :
+                    IsCrypto(symbol) ? 1.7 :
+                    1.3;
+
+                    slMultiplier *= continuationFactor;
+                    tpMultiplier *= 1.2;
+                }
+
+                if (tradeType == TradeType.Breakout)
+                {
+                    double earlyFactor =
+                        IsGold(symbol) ? 1.2 :
+                        IsFx(symbol) ? 1.1 :
+                        IsIndex(symbol) ? 1.25 :
+                        IsCrypto(symbol) ? 1.3 :
+                        1.15;
+
+                    slMultiplier *= earlyFactor;
+
+                    // let winners run a bit more
+                    tpMultiplier *= 1.1;
+                }
+
                 if (profile.UseAtrBased)
                 {
-                    double slPriceDistance = atrPrice * profile.StopLossAtrMultiplier;
-                    double tpPriceDistance = atrPrice * profile.TakeProfitAtrMultiplier;
+                    double slPriceDistance = atrPrice * slMultiplier;
+                    double tpPriceDistance = atrPrice * tpMultiplier;
 
                     slPoints = (int)Math.Round(slPriceDistance / pointSize);
                     tpPoints = (int)Math.Round(tpPriceDistance / pointSize);
@@ -165,17 +202,10 @@
 
                 symbol = symbol.ToUpperInvariant();
 
-                if (IsGold(symbol))
-                    return AssetClass.Gold;
-
-                if (IsCrypto(symbol))
-                    return AssetClass.Crypto;
-
-                if (IsIndex(symbol))
-                    return AssetClass.Index;
-
-                if (IsFx(symbol))
-                    return AssetClass.Fx;
+                if (IsGold(symbol)) return AssetClass.Gold;
+                if (IsCrypto(symbol)) return AssetClass.Crypto;
+                if (IsIndex(symbol)) return AssetClass.Index;
+                if (IsFx(symbol)) return AssetClass.Fx;
 
                 return AssetClass.Unknown;
             }
@@ -192,17 +222,10 @@
                 };
             }
 
-            // -----------------------------
-            // HELPERS
-            // -----------------------------
             private static int ApplyFloorAndCap(int value, int min, int max)
             {
-                if (min > 0 && value < min)
-                    value = min;
-
-                if (max > 0 && value > max)
-                    value = max;
-
+                if (min > 0 && value < min) value = min;
+                if (max > 0 && value > max) value = max;
                 return value;
             }
 
@@ -239,14 +262,10 @@
 
             private static bool IsFx(string symbol)
             {
-                // Basic FX detection for common 6-char pairs like EURUSD, GBPUSD, USDJPY
                 if (symbol.Length < 6)
                     return false;
 
-                string[] ccy =
-                {
-                "USD","EUR","GBP","JPY","AUD","NZD","CAD","CHF"
-            };
+                string[] ccy = { "USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF" };
 
                 foreach (var baseCcy in ccy)
                 {
@@ -263,5 +282,5 @@
                 return false;
             }
         }
+      }
     }
-}

@@ -125,11 +125,12 @@ namespace MetaTrader.Services
 
                 double compressionRangeAtr = (compressionHigh - compressionLow) / atr;
 
-                if (compressionRangeAtr > profile.MaxCompressionRangeAtr)
+                // 🔥 NEW: TRUE COMPRESSION CHECK
+                if (!IsTrueCompression(rates, lookback, atr))
                 {
                     LogFile.Write(
-                        $"[{symbol}] CompressionBreakout blocked: range not compressed | " +
-                        $"rangeAtr={compressionRangeAtr:F2}, max={profile.MaxCompressionRangeAtr:F2}"
+                        $"[{symbol}] CompressionBreakout blocked: not true compression | " +
+                        $"rangeAtr={compressionRangeAtr:F2}"
                     );
                     return false;
                 }
@@ -230,6 +231,43 @@ namespace MetaTrader.Services
                 LogFile.Write($"[{symbol}] CompressionBreakout error: {ex.Message}");
                 return false;
             }
+        }
+
+        // 🔥 ADD THIS NEW HELPER
+        private static bool IsTrueCompression(MqlRates[] rates, int lookback, double atr)
+        {
+            double totalRange = 0;
+            double maxRange = 0;
+            double minRange = double.MaxValue;
+
+            int bullish = 0;
+            int bearish = 0;
+
+            for (int i = 2; i <= lookback + 1; i++)
+            {
+                var c = rates[^i];
+                double r = c.high - c.low;
+
+                totalRange += r;
+                maxRange = Math.Max(maxRange, r);
+                minRange = Math.Min(minRange, r);
+
+                if (c.close > c.open) bullish++;
+                else if (c.close < c.open) bearish++;
+            }
+
+            double avgRange = totalRange / lookback;
+
+            bool tight = avgRange < atr * 0.75;
+            bool consistent = (maxRange - minRange) < atr * 0.5;
+
+            // 🔥 NEW: kill chop (random direction)
+            int diff = Math.Abs(bullish - bearish);
+
+            bool directionalAgreement = diff >= 2;
+            // at least slight bias, not 50/50 noise
+
+            return tight && consistent && directionalAgreement;
         }
 
         private class LiveBreakState

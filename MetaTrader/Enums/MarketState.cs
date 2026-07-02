@@ -11,7 +11,10 @@
         Armed,
         Tradable,
         FailedExpansion,
-        LateExpansion
+        LateExpansion,
+        Trend,
+        Chop,
+        EarlyBreakout
     }
 
 }

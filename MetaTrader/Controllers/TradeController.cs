@@ -154,40 +154,6 @@ namespace MetaTrader.Controllers
 
         }
 
-        [HttpGet("activelock")]
-        public IActionResult TestActiveLock()
-        {
-           
-            if (GlobalTradeManager.HasActiveLock(_provider) == true)
-            {
-                LogFile.Write("Global trade lock active (provider) — skipping new entries");
-                
-            }
-            else
-            {
-                LogFile.Write("Acquiring global trade lock for provider...");
-                GlobalTradeManager.TryAcquireTradeLock(_provider);
-            }
-
-
-            return Ok(GlobalTradeManager.HasActiveLock(_provider));
-          
-        }
-
-        [HttpGet("relaselock")]
-        public IActionResult TestReleaseLock()
-        {
-
-            if (GlobalTradeManager.HasActiveLock(_provider) == true)
-            {
-                LogFile.Write("Global trade lock active (provider) — skipping new entries");
-                GlobalTradeManager.ReleaseTradeLock(_provider);
-            }
-            
-            return Ok(GlobalTradeManager.HasActiveLock(_provider));
-
-        }
-
         [HttpPost("connect/{connectionId}")]
         public async Task<IActionResult> connect(String connectionId, CancellationToken cancellationToken)
         {

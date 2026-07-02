@@ -105,44 +105,42 @@ namespace MetaTrader.Services.Helper
             string s = symbol?.ToUpperInvariant() ?? "";
 
             // GOLD / METALS
-            if (s.Contains("XAU") || s.Contains("XAG") || s.Contains("GOLD") || s.Contains("SILVER"))
-                return 6.00;
+            if (s.Contains("XAU") || s.Contains("XAG"))
+                return 12.0; // 🔥 was 8
 
-            // BNB gets more room because of shakeouts
+            // BNB
             if (s.Contains("BNB"))
-                return 8.00;
+                return 10.0;
 
-            // SOL is sharper and should be cut faster
+            // SOL (still volatile but smaller)
             if (s.Contains("SOL"))
-                return 3.00;
+                return 5.0;
 
-            // ETH moderate room
+            // ETH
             if (s.Contains("ETH"))
-                return 5.00;
+                return 7.0;
 
-            // BTC needs room, but still controlled
+            // BTC
             if (s.Contains("BTC"))
-                return 8.00;
+                return 12.0;
 
-            // FX majors
+            // FX
             if (s.Contains("EURUSD") ||
                 s.Contains("GBPUSD") ||
                 s.Contains("USDJPY") ||
                 s.Contains("EURJPY") ||
                 s.Contains("USDCAD") ||
                 s.Contains("AUDUSD"))
-                return 3.00;
+                return 5.0; // was 3
 
-            // Indices / CFDs
+            // Indices
             if (s.Contains("US100") ||
                 s.Contains("NAS") ||
-                s.Contains("USTEC") ||
                 s.Contains("US30") ||
-                s.Contains("SPX") ||
-                s.Contains("US500"))
-                return 5.00;
+                s.Contains("SPX"))
+                return 8.0; // was 5
 
-            return 4.00;
+            return 6.0;
         }
     }
 }

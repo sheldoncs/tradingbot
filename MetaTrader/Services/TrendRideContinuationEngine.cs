@@ -13,7 +13,7 @@ namespace MetaTrader.Services
     /*Specific for Gold*/
     public static class TrendRideContinuationEngine
     {
-        public static double PullbackAtrFactor = 0.7;
+        public static double PullbackAtrFactor = 0.85;
         public static double MaxPullbackAtr = 1.5;
         public static double BodyStrength = 0.40;
 

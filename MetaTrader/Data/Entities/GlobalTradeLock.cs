@@ -8,6 +8,7 @@ namespace MetaTrader.Data.Entities
         [Key]
         public int Id { get; set; }
         public bool IsLocked { get; set; }
+        public int IsLockedCntr { get; set; }
         public DateTime? LockedAt { get; set; }
     }
 }
