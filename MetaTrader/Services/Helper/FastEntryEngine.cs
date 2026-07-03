@@ -3,6 +3,8 @@ using MetaTrader.Enums;
 using MetaTrader.Services.MetaTrader.Services;
 using MetaTrader.Util;
 using MtApi5;
+using System;
+using System.Linq;
 using static MetaTrader.Services.TradeServiceEngine;
 
 namespace MetaTrader.Services.Helper
@@ -17,8 +19,10 @@ namespace MetaTrader.Services.Helper
             double[] emaSlow,
             double momentum,
             double bid,
-            double ask, M15ConfirmationService _m15Service, out TradeType tradeType)
+            double ask, M15ConfirmationService _m15Service, out TradeType tradeType, out bool isImpulse)
         {
+            isImpulse = false;
+            _m15Service.Update(symbol);
             tradeType = TradeType.None;
             // =========================
             // 1️⃣ Basic safety checks
@@ -28,13 +32,26 @@ namespace MetaTrader.Services.Helper
             
             if (atr <= 0)
                 return (TradeAction.DoNothing, EntryModel.Nothing);
-            
+
             // =========================
             // 2️⃣ Momentum gate (soft filter)
             // =========================
-            if (momentum < 1.0)
+            // 🔥 allow impulse to bypass weak momentum
+            bool allowImpulseBypass = false;
+
+            var c0 = rates[^1];
+
+            // quick live impulse check
+            double liveMove = Math.Abs(bid - c0.open);
+            double bodyAtr = liveMove / atr;
+
+            if (bodyAtr > 0.8)   // early impulse threshold
             {
-                // 🔥 only block VERY weak markets
+                allowImpulseBypass = true;
+            }
+
+            if (momentum < 1.0 && !allowImpulseBypass)
+            {
                 tradeType = TradeType.None;
                 return (TradeAction.DoNothing, EntryModel.Nothing);
             }
@@ -182,7 +199,64 @@ namespace MetaTrader.Services.Helper
                     return (breakoutAction, EntryModel.BreakoutContinuation);
                 }
             }
-            
+
+            // =============================
+            // ⚡ IMPULSE ENTRY (NEW)
+            // =============================
+            double ema9 = emaFast[^1];
+            double ema21 = emaSlow[^1];
+            // 🔥 Compute recent structure (reuse your logic if you already have this)
+            double recentHigh = rates.Skip(rates.Length - 10).Max(r => r.high);
+            double recentLow = rates.Skip(rates.Length - 10).Min(r => r.low);
+
+            if (ImpulseEntryEngine.TryEnter(
+                    symbol,
+                    c0,
+                    atr,
+                    ema9,
+                    ema21,
+                    recentHigh,
+                    recentLow, bid, ask,
+                    out var impulseAction))
+            {
+                tradeType = TradeType.Breakout;
+
+                double executionPrice =
+                    impulseAction == TradeAction.EnterBuy ? ask : bid;
+
+                if (SupportResistanceEngine.ShouldBlockTrade(
+                        symbol,
+                        impulseAction,
+                        rates,
+                        atr,
+                        momentum,
+                        executionPrice))
+                {
+                    LogFile.Write("Blocked: impulse into SR");
+                    return (TradeAction.DoNothing, EntryModel.Nothing);
+                }
+
+                // 🔥 M15 softer for impulse
+                if (!_m15Service.IsTradeAllowed(
+                        symbol,
+                        impulseAction,
+                        EntryModel.BreakoutContinuation,
+                        momentum,
+                        out var reason))
+                {
+                    if (momentum < 1.2) // slightly higher threshold for impulse override
+                    {
+                        LogFile.Write($"Impulse blocked by M15: {reason}");
+                        return (TradeAction.DoNothing, EntryModel.Nothing);
+                    }
+
+                    LogFile.Write("⚡ M15 overridden (impulse)");
+                }
+
+                isImpulse = true;
+                return (impulseAction, EntryModel.BreakoutContinuation);
+            }
+
             return (TradeAction.DoNothing, EntryModel.Nothing);
         }
     }

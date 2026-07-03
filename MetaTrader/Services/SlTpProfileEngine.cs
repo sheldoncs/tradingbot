@@ -60,14 +60,14 @@
             private static readonly SlTpProfile GoldProfile = new SlTpProfile
             {
                 UseAtrBased = true,
-                StopLossAtrMultiplier = 1.2,
-                TakeProfitAtrMultiplier = 2.0,
-                MinStopLossPoints = 250,
-                MinTakeProfitPoints = 400,
-                MaxStopLossPoints = 1200,
-                MaxTakeProfitPoints = 2500,
-                FixedStopLossPoints = 500,
-                FixedTakeProfitPoints = 800
+                StopLossAtrMultiplier = 1.4,
+                TakeProfitAtrMultiplier = 2.2,
+                MinStopLossPoints = 500,
+                MinTakeProfitPoints = 800,
+                MaxStopLossPoints = 2000,   // was 1200
+                MaxTakeProfitPoints = 3500, // was 2500
+                FixedStopLossPoints = 800,
+                FixedTakeProfitPoints = 1600
             };
 
             private static readonly SlTpProfile FxProfile = new SlTpProfile
@@ -137,7 +137,7 @@
                 if (tradeType == TradeType.Continuation)
                 {   
                     double continuationFactor =
-                    IsGold(symbol) ? 1.4 :
+                    IsGold(symbol) ? 1.7 :
                     IsFx(symbol) ? 1.2 :
                     IsIndex(symbol) ? 1.5 :
                     IsCrypto(symbol) ? 1.7 :
@@ -150,7 +150,7 @@
                 if (tradeType == TradeType.Breakout)
                 {
                     double earlyFactor =
-                        IsGold(symbol) ? 1.2 :
+                        IsGold(symbol) ? 1.5 :
                         IsFx(symbol) ? 1.1 :
                         IsIndex(symbol) ? 1.25 :
                         IsCrypto(symbol) ? 1.3 :

@@ -474,6 +474,120 @@ namespace MetaTrader.Services
 
         }
 
+        private static bool HasValidPullbackForSymbol(
+        string symbol,
+        MqlRates[] rates,
+        double[] emaFast,
+        double[] emaSlow,
+        double atr,
+        TradeAction tradeAction)
+        {
+            if (rates == null || rates.Length < 5 ||
+                emaFast == null || emaSlow == null ||
+                emaFast.Length < 5 || emaSlow.Length < 5 ||
+                atr <= 0)
+                return false;
+
+            string s = symbol.ToUpperInvariant();
+
+            var c0 = rates[^1];
+            var c1 = rates[^2];
+
+            double ema9 = emaFast[^1];
+            double ema21 = emaSlow[^1];
+
+            double distToEma9 = Math.Abs(c0.close - ema9) / atr;
+            double distToEma21 = Math.Abs(c0.close - ema21) / atr;
+
+            bool touchedEma9 = c0.low <= ema9 && c0.high >= ema9;
+            bool touchedEma21 = c0.low <= ema21 && c0.high >= ema21;
+
+            double ema9Tolerance =
+                IsGold(s) ? 0.35 :
+                IsCrypto(s) ? 0.55 :
+                IsIndex(s) ? 0.50 :
+                IsFx(s) ? 0.40 :
+                0.45;
+
+            double ema21Tolerance =
+                IsGold(s) ? 0.65 :
+                IsCrypto(s) ? 0.90 :
+                IsIndex(s) ? 0.85 :
+                IsFx(s) ? 0.70 :
+                0.75;
+
+            bool nearEma =
+                touchedEma9 ||
+                touchedEma21 ||
+                distToEma9 <= ema9Tolerance ||
+                distToEma21 <= ema21Tolerance;
+
+            bool pullbackDirection =
+                tradeAction == TradeAction.EnterBuy
+                    ? c0.close < c1.close   // buy trend: price pulled down
+                    : c0.close > c1.close;  // sell trend: price pulled up
+
+            return nearEma && pullbackDirection;
+        }
+
+        private static bool IsGold(string symbol)
+        {
+            return symbol.Contains("XAU") || symbol.Contains("XAG");
+        }
+
+        private static bool IsCrypto(string symbol)
+        {
+            return symbol.Contains("BTC") ||
+                   symbol.Contains("ETH") ||
+                   symbol.Contains("SOL") ||
+                   symbol.Contains("BNB") ||
+                   symbol.Contains("XRP") ||
+                   symbol.Contains("ADA");
+        }
+
+        private static bool IsIndex(string symbol)
+        {
+            return symbol.Contains("US100") ||
+                   symbol.Contains("NAS") ||
+                   symbol.Contains("US30") ||
+                   symbol.Contains("SPX");
+        }
+
+        private static bool IsFx(string symbol)
+        {
+            return !IsGold(symbol) && !IsCrypto(symbol) && !IsIndex(symbol);
+        }
+        private static bool IsDistanceFromEmaFavorable(
+            MqlRates[] rates,
+            double[] emaFast,
+            double[] emaSlow,
+            double atr,
+            TradeAction tradeAction)
+        {
+            var c0 = rates[^1];
+
+            double ema9 = emaFast[^1];
+            double ema21 = emaSlow[^1];
+
+            double distToEma9 = Math.Abs(c0.close - ema9) / atr;
+            double distToEma21 = Math.Abs(c0.close - ema21) / atr;
+
+            if (tradeAction == TradeAction.EnterBuy)
+            {
+                // Buy: price should have pulled back toward the EMA from above.
+                return c0.close >= ema9 &&
+                       (distToEma9 <= 0.45 || distToEma21 <= 0.75);
+            }
+            else if (tradeAction == TradeAction.EnterSell)
+            {
+                // Sell: price should have pulled back toward the EMA from below.
+                return c0.close <= ema9 &&
+                       (distToEma9 <= 0.45 || distToEma21 <= 0.75);
+            }
+            return true;
+        }
+
+        
         private async void generalCloseTrade(double bid, double ask, SymbolContext ctx)
         {
 
@@ -510,7 +624,14 @@ namespace MetaTrader.Services
 
             closedTrades.Add(trade);
 
-            tradingEngine = "";
+            if (ctx.IsImpulse == true)
+            {
+                ctx.ImpulseTradeWon = true;
+                ctx.LastImpulseWinTime = DateTime.UtcNow;
+                ctx.ImpulseConsumed = true;
+            }
+
+           tradingEngine = "";
             tradeBegun = false;
             _orderInProgress = false;
             _fastOrderInProgress = false;
@@ -813,6 +934,40 @@ namespace MetaTrader.Services
         private static readonly Dictionary<string, DateTime> _entryLockCandle = new();
         private static readonly HashSet<string> _orderInProgressSet = new();
 
+        private bool isGoodImpulseLocation(SymbolContext ctx, TradeAction tradeAction)
+        {
+            _client.CopyRates(SYMBOL, ENUM_TIMEFRAMES.PERIOD_H1, 1, BarsToFetch, out var rates1H);
+            var emaFast = CalculateEMA(rates1H, 9);
+            var emaSlow = CalculateEMA(rates1H, 21);
+            double atr = CalculateATR(rates1H, 14);
+
+           
+            // NEW
+            if (ctx.ImpulseConsumed)
+            {
+                bool validPullback = HasValidPullbackForSymbol(
+                    ctx.Symbol,
+                    rates,
+                    emaFast,
+                    emaSlow,
+                    atr,
+                    tradeAction
+                );
+
+                if (validPullback)
+                {
+                    ctx.ImpulseConsumed = false;
+                    LogFile.Write($"[{ctx.Symbol}] Impulse reset - distance from EMA favorable again.");
+                }
+                else
+                {
+                    LogFile.Write($"[{ctx.Symbol}] Impulse blocked - already won and still extended.");
+                    return false;
+                }
+            }
+
+            return true;
+        }
         public async Task RunParallelStrategy(CancellationToken ct)
         {
             // =========================================================
@@ -1134,7 +1289,7 @@ namespace MetaTrader.Services
                     emaSlow1H,
                     earlyMomentum.Hybrid, // ✅ FIXED
                     bid,
-                    ask,_m15Service, out var tradeType
+                    ask,_m15Service, out var tradeType, out var isImpulse
                 );
 
                 if (fastAction == TradeAction.EnterBuy || fastAction == TradeAction.EnterSell)
@@ -1189,6 +1344,20 @@ namespace MetaTrader.Services
 
                         _lastOrderCandleTime = currentCandleTime;
                         _client.CopyRates(SYMBOL, ENUM_TIMEFRAMES.PERIOD_H1, 1, BarsToFetch, out var openTrade1H);
+
+                        ctx.IsImpulse = isImpulse;
+                        if (isImpulse) { 
+                            if (isGoodImpulseLocation(ctx, fastAction))
+                            {
+                                LogFile.Write($"⚡ FAST ENGINE: impulse location favorable for {fastAction} on {SYMBOL}");
+                            }
+                            else
+                            {
+                                LogFile.Write($"⚡ FAST ENGINE: impulse location NOT favorable for {fastAction} on {SYMBOL}");
+                                return;
+                            }
+                        }
+
                         await OpenTrade(
                             fastAction == TradeAction.EnterBuy ? TradeSide.Buy : TradeSide.Sell,
                             fastAction == TradeAction.EnterBuy ? ask : bid,

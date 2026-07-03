@@ -10,6 +10,10 @@ namespace MetaTrader.Util
 {
     public class SymbolContext
     {
+        public bool ImpulseTradeWon { get; set; }
+        public bool IsImpulse { get; set; }
+        public DateTime LastImpulseWinTime { get; set; }
+        public bool ImpulseConsumed { get; set; }   
         public bool NearSupport { get; set; }
         public bool NearResistance { get; set; }
         public bool IsBreakingSupport { get; set; }

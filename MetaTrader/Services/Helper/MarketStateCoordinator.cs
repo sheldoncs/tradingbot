@@ -660,7 +660,7 @@ namespace MetaTrader.Services.Helper
             MarketUniverse universe = GetUniverse(symbol);
 
             double maxFreshDistance =
-                universe == MarketUniverse.Metals ? 1.25 :
+                universe == MarketUniverse.Metals ? 1.35 :
                 universe == MarketUniverse.Crypto ? 1.45 :
                 universe == MarketUniverse.FX ? 1.10 :
                 1.20;
