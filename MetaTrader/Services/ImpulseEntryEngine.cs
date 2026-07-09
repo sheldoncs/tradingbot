@@ -44,6 +44,33 @@ namespace MetaTrader.Services
             double distFromEmaBuy = Math.Abs(livePriceBuy - ema9) / atr;
             double distFromEmaSell = Math.Abs(livePriceSell - ema9) / atr;
 
+            // =============================
+            // 🔥 ANTI-CHASE + DYNAMIC LOGIC
+            // =============================
+            double moveFromHigh = (recentHigh - bid) / atr;
+            double moveFromLow = (ask - recentLow) / atr;
+
+            double baseMaxImpulseChase =
+                IsGold(symbol) ? 1.5 :
+                IsIndex(symbol) ? 1.7 :
+                IsFx(symbol) ? 1.2 :
+                1.6;
+
+            // 🔥 Strength per side
+            double strengthBuy = bodyAtrBuy;
+            double strengthSell = bodyAtrSell;
+
+            double maxImpulseChaseBuy = baseMaxImpulseChase +
+                (strengthBuy > 1.5 ? 0.4 :
+                 strengthBuy > 1.2 ? 0.2 : 0.0);
+
+            double maxImpulseChaseSell = baseMaxImpulseChase +
+                (strengthSell > 1.5 ? 0.4 :
+                 strengthSell > 1.2 ? 0.2 : 0.0);
+
+            // =============================
+            // ⚙️ THRESHOLDS
+            // =============================
             double bodyThreshold = GetBodyThreshold(symbol);
             double maxDistance = GetMaxDistance(symbol);
             double counterTrendBoost = GetCounterTrendBoost(symbol);
@@ -57,11 +84,73 @@ namespace MetaTrader.Services
             double sellRequiredBody =
                 overallBearish ? bodyThreshold : bodyThreshold + counterTrendBoost;
 
+
+            // =============================
+            // 🔥 EARLY IMPULSE (NEW)
+            // =============================
+
+            double distToBreakout = (recentHigh - livePriceBuy) / atr;
+            double distToBreakdown = (livePriceSell - recentLow) / atr;
+
+            double earlyDistLimit =
+                IsCrypto(symbol) ? 0.4 :
+                IsIndex(symbol) ? 0.6 :
+                IsGold(symbol) ? 0.5 :
+                0.5;
+
+            double earlyBodyRequirement =
+                IsCrypto(symbol) ? 0.7 :
+                IsIndex(symbol) ? 0.5 :
+                IsGold(symbol) ? 0.6 :
+                0.5;
+
+            bool earlyImpulseBuy =
+                bodyAtrBuy > earlyBodyRequirement &&
+                livePriceBuy > ema9 &&
+                distFromEmaBuy < maxDistance &&
+                distToBreakout > 0 &&
+                distToBreakout < earlyDistLimit;
+
+            if (earlyImpulseBuy)
+            {
+                action = TradeAction.EnterBuy;
+
+                LogFile.Write(
+                    $"[{symbol}] ⚡ EARLY IMPULSE BUY | " +
+                    $"distToBreakout={distToBreakout:F2}, bodyAtr={bodyAtrBuy:F2}"
+                );
+
+                return true;
+            }
+
+            bool earlyImpulseSell =
+                bodyAtrSell > earlyBodyRequirement &&
+                livePriceSell < ema9 &&
+                distFromEmaSell < maxDistance &&
+                distToBreakdown > 0 &&
+                distToBreakdown < earlyDistLimit;
+
+            if (earlyImpulseSell)
+            {
+                action = TradeAction.EnterSell;
+
+                LogFile.Write(
+                    $"[{symbol}] ⚡ EARLY IMPULSE SELL | " +
+                    $"distToBreakdown={distToBreakdown:F2}, bodyAtr={bodyAtrSell:F2}"
+                );
+
+                return true;
+            }
+
+            // =============================
+            // ⚡ IMPULSE BUY
+            // =============================
             bool impulseBuy =
                 bodyAtrBuy > buyRequiredBody &&
                 livePriceBuy > recentHigh &&
                 livePriceBuy > ema9 &&
-                distFromEmaBuy < maxDistance;
+                distFromEmaBuy < maxDistance &&
+                moveFromLow <= maxImpulseChaseBuy;
 
             if (impulseBuy)
             {
@@ -70,19 +159,22 @@ namespace MetaTrader.Services
                 LogFile.Write(
                     $"[{symbol}] ⚡ IMPULSE BUY | " +
                     $"bodyAtr={bodyAtrBuy:F2}, required={buyRequiredBody:F2}, " +
-                    $"live={bodyAtrLiveBuy:F2}, closed={bodyAtrClosed:F2}, " +
-                    $"distEma={distFromEmaBuy:F2}, trendAligned={overallBullish}, " +
-                    $"ema9={ema9:F2}, ema21={ema21:F2}"
+                    $"maxChase={maxImpulseChaseBuy:F2}, moveATR={moveFromLow:F2}, " +
+                    $"distEma={distFromEmaBuy:F2}, trendAligned={overallBullish}"
                 );
 
                 return true;
             }
 
+            // =============================
+            // 🔻 IMPULSE SELL
+            // =============================
             bool impulseSell =
                 bodyAtrSell > sellRequiredBody &&
                 livePriceSell < recentLow &&
                 livePriceSell < ema9 &&
-                distFromEmaSell < maxDistance;
+                distFromEmaSell < maxDistance &&
+                moveFromHigh <= maxImpulseChaseSell;
 
             if (impulseSell)
             {
@@ -91,9 +183,8 @@ namespace MetaTrader.Services
                 LogFile.Write(
                     $"[{symbol}] ⚡ IMPULSE SELL | " +
                     $"bodyAtr={bodyAtrSell:F2}, required={sellRequiredBody:F2}, " +
-                    $"live={bodyAtrLiveSell:F2}, closed={bodyAtrClosed:F2}, " +
-                    $"distEma={distFromEmaSell:F2}, trendAligned={overallBearish}, " +
-                    $"ema9={ema9:F2}, ema21={ema21:F2}"
+                    $"maxChase={maxImpulseChaseSell:F2}, moveATR={moveFromHigh:F2}, " +
+                    $"distEma={distFromEmaSell:F2}, trendAligned={overallBearish}"
                 );
 
                 return true;

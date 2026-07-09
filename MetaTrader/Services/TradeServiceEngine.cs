@@ -593,7 +593,7 @@ namespace MetaTrader.Services
 
             if (!HasAnyOpenPositionBySymbol(ctx.Symbol))
                 GlobalTradeManager.ReleaseTradeLock(_provider);
-
+            barsSinceEntry = 0;
             tradeProfit(ctx.Symbol);
             if (globalEntryModel == EntryModel.TrendRideContinuation) TradeTrackingService.RemoveTrade(openTrades.Select(t => t).FirstOrDefault().Ticket);
             foreach (var engine in engineTrades)
@@ -1163,6 +1163,9 @@ namespace MetaTrader.Services
                     }
                 }
 
+                bid = _client.SymbolInfoDouble(ctx.Symbol, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_BID);
+                ask = _client.SymbolInfoDouble(ctx.Symbol, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_ASK);
+                double mid = (bid + ask) / 2.0;
                 ManageOpenTrades(
                     mid,
                     bid,
@@ -3060,6 +3063,7 @@ namespace MetaTrader.Services
 
         public int CandlesSinceEntry { get; set; }
 
+        private static int barsSinceEntry = 0;
         static void ManageOpenTrades(double midPrice,
             double bid,
             double ask,
@@ -3073,6 +3077,52 @@ namespace MetaTrader.Services
                 SYMBOL.Contains("SOL") ||
                 SYMBOL.Contains("ADA") ||
                 SYMBOL.Contains("XRP");
+
+            if (isBuy != null)
+            {
+                TrackedTrade t = openTrades.FirstOrDefault();
+
+                if (t != null)
+                {
+                    // =============================
+                    // 🔥 COUNT CLOSED CANDLES
+                    // =============================
+                    if (rates[^1].time > t.EntryCandleTime)
+                    {
+                        t.CandlesSinceEntry++; // ✅ increment ONCE
+                        t.EntryCandleTime = rates[^1].time;
+                    }
+
+                    int barsSinceEntry = t.CandlesSinceEntry;
+
+                    double atrRaw = CalculateATR(rates, 14);
+
+                    // =============================
+                    // 🔥 CORRECT PRICES
+                    // =============================
+                    double entryPrice = t.EntryPrice; // ✅ MUST store this when opening trade
+
+                    double currentPrice =
+                        isBuy == true ? bid : ask; // ✅ correct for exit
+
+                    // =============================
+                    // 🔥 STALL EXIT
+                    // =============================
+                    if (StallExitEngine.ShouldExit(
+                        ctx.Symbol,
+                        isBuy == true ? TradeAction.EnterBuy : TradeAction.EnterSell,
+                        rates,
+                        entryPrice,
+                        currentPrice,
+                        atrRaw,
+                        barsSinceEntry,
+                        out var reason))
+                    {
+                        LogFile.Write($"[{ctx.Symbol}] {reason}");
+                        TradeServiceEngine.closingTrade = true;
+                    }
+                }
+            }
             // --------------------------------------------------------------
             // 🚫 FTMO NEWS BLACKOUT — NO TRADE MANAGEMENT
             // --------------------------------------------------------------

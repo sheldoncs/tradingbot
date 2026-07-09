@@ -83,12 +83,20 @@ namespace MetaTrader.Services
 
             double bodyAtrCheck = Math.Abs(c0.close - c0.open) / atr;
 
+            bool strongImpulse = bodyAtrCheck >= 0.7;
+            bool mediumImpulse = bodyAtrCheck >= 0.4;
+
             // 🔥 Allow strong breakout candles to bypass momentum filter (GOLD ONLY)
             bool allowMomentumBypass =
                 IsGold(symbol) &&
                 bodyAtrCheck > 1.1;   // 🔥 captures your 1.19 case
 
-            if (Math.Abs(momentum) < profile.MinMomentum && !allowMomentumBypass)
+            bool allowWeakMomentumForEarly =
+             mediumImpulse && bodyAtrCheck < 0.7; // pre-breakout zone
+
+            if (!allowWeakMomentumForEarly &&
+                Math.Abs(momentum) < profile.MinMomentum &&
+                !allowMomentumBypass)
             {
                 ResetState(s);
 
@@ -119,16 +127,20 @@ namespace MetaTrader.Services
             double body = Math.Abs(c0.close - c0.open);
             double range = c0.high - c0.low;
             double bodyRatio = range > 0 ? body / range : 0;
+            double bodyAtr = Math.Abs(c0.close - c0.open) / atr;
 
             bool strongBullBody =
                 c0.close > c0.open &&
                 body >= atr * 0.35 &&
-                bodyRatio >= 0.45;
+                bodyRatio >= 0.45 &&
+                bodyAtr > 0.6;   // 🔥 NEW
 
+            
             bool strongBearBody =
                 c0.close < c0.open &&
                 body >= atr * 0.35 &&
-                bodyRatio >= 0.45;
+                bodyRatio >= 0.45 &&
+                bodyAtr > 0.6;   // 🔥 NEW FILTER (CRITICAL)
 
             // ============================
             // NORMAL STRUCTURE BREAKOUT
@@ -194,6 +206,72 @@ namespace MetaTrader.Services
             double distBuyFromEma21Atr = Math.Abs(liveBuyPrice - ema21) / atr;
             double distSellFromEma21Atr = Math.Abs(liveSellPrice - ema21) / atr;
 
+
+            // ============================
+            // 🔥 PRE-BREAKOUT ENTRY (NEW)
+            // ============================
+            double maxPreBreakoutDist =
+                IsCrypto(symbol) ? 0.4 :   // tighter for crypto
+                IsIndex(symbol) ? 0.6 :
+                IsGold(symbol) ? 0.5 :
+                0.5;
+
+            double maxEmaDist =
+                IsCrypto(symbol) ? 0.6 :   // tighter
+                IsIndex(symbol) ? 0.8 :
+                IsGold(symbol) ? 0.7 :
+                0.7;
+
+            double minBodyAtr =
+                IsCrypto(symbol) ? 0.7 :   // stronger momentum required
+                IsIndex(symbol) ? 0.5 :
+                IsGold(symbol) ? 0.6 :
+                0.5;
+
+            double distToBreakoutAtr = (recentHigh - liveBuyPrice) / atr;
+            double distToBreakdownAtr = (liveSellPrice - recentLow) / atr;
+
+            // 🔵 BUY
+            bool preBreakoutBuy =
+                trendUp &&
+                liveBuyPrice > ema9 &&
+                liveBuyPrice > ema21 &&
+                distToBreakoutAtr > 0 &&
+                distToBreakoutAtr < maxPreBreakoutDist &&
+                bodyAtrCheck > minBodyAtr &&
+                distBuyFromEma9Atr < maxEmaDist;
+
+            if (preBreakoutBuy)
+            {
+                action = TradeAction.EnterBuy;
+
+                LogFile.Write(
+                    $"[{symbol}] ⚡ PRE-BREAKOUT BUY | dist={distToBreakoutAtr:F2}, bodyAtr={bodyAtrCheck:F2}"
+                );
+
+                return true;
+            }
+
+            // 🔴 SELL
+            bool preBreakoutSell =
+                trendDown &&
+                liveSellPrice < ema9 &&
+                liveSellPrice < ema21 &&
+                distToBreakdownAtr > 0 &&
+                distToBreakdownAtr < maxPreBreakoutDist &&
+                bodyAtrCheck > minBodyAtr &&
+                distSellFromEma9Atr < maxEmaDist;
+
+            if (preBreakoutSell)
+            {
+                action = TradeAction.EnterSell;
+
+                LogFile.Write(
+                    $"[{symbol}] ⚡ PRE-BREAKOUT SELL | dist={distToBreakdownAtr:F2}, bodyAtr={bodyAtrCheck:F2}"
+                );
+
+                return true;
+            }
             // ============================
             // BUY LOGIC
             // ============================
@@ -205,11 +283,11 @@ namespace MetaTrader.Services
 
                 // 🔥 DYNAMIC MAX MOVE PER ASSET
                 double maxMoveAtr =
-                    IsGold(symbol) ? 1.6 :
-                    IsFx(symbol) ? 1.3 :
-                    IsIndex(symbol) ? 1.7 :
-                    IsCrypto(symbol) ? 2.2 :
-                    1.5;
+                IsGold(symbol) ? 1.5 :   // was 1.6
+                IsFx(symbol) ? 1.2 :
+                IsIndex(symbol) ? 1.5 :  // was 1.7
+                IsCrypto(symbol) ? 2.0 :
+                1.4;
 
                 // 🔥 BLOCK LATE MOVE
                 double moveFromRecentLowAtr = (liveBuyPrice - recentLow) / atr;
@@ -470,19 +548,6 @@ namespace MetaTrader.Services
                     action = TradeAction.EnterSell;
 
                     LogFile.Write($"[{symbol}] ⚡ ULTRA MOMENTUM SELL");
-
-                    return true;
-                }
-
-                // 🔥 INSTANT ENTRY FOR EARLY BREAKOUT
-                if (liveBearEscape)
-                {
-                    action = TradeAction.EnterSell;
-                    ResetState(s);
-
-                    LogFile.Write(
-                        $"[{s}] ⚡ INSTANT SELL (early breakout) | price={liveSellPrice:F5}"
-                    );
 
                     return true;
                 }

@@ -113,7 +113,7 @@ namespace MetaTrader.Services
             try
             {
                 TradeState state = await _stateStore.LoadAsync();
-                LogFile.Write($"Autotrade state...{state.AutoTrade}");
+                LogFile.Write($"Autotrade state...{state.AutoTrade} Connection Service = {ConnectionService.HasAny()}");
 
                 if (ConnectionService.HasAny() && state.AutoTrade == false)
                 {

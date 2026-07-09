@@ -131,14 +131,33 @@ namespace MetaTrader.Services.Helper
                 strongBearBody;
 
             // 🔥 FINAL FILTERED LOGIC
-            bool isTrueEarlyBreak =
+            // 🔥 STRONG MOMENTUM OVERRIDE
+            double bodyAtr = body / atr;
+
+            bool strongMomentumBreak =
+                (earlyBreakUp || earlyBreakDown) &&
+                bodyAtr > 1.2; // 🔥 key threshold
+
+            // 🔥 NORMAL BREAK
+            bool normalBreak =
                 (earlyBreakUp || earlyBreakDown) &&
                 emaSpreadAtr < maxSpread;
 
-            bool isValidEscape =
+            // 🔥 FINAL
+            bool isTrueEarlyBreak =
+                strongMomentumBreak || normalBreak;
+
+            bool strongEscape =
+             (bullishEscape || bearishEscape) &&
+             bodyAtr > 1.2;
+
+            bool normalEscape =
                 (bullishEscape || bearishEscape) &&
                 emaSpreadAtr > minSpread &&
                 emaSpreadAtr < maxSpread;
+
+            bool isValidEscape =
+                strongEscape || normalEscape;
 
             if (isTrueEarlyBreak || isValidEscape)
             {

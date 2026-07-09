@@ -357,20 +357,53 @@ namespace MetaTrader.Services
                 return false;
             }
 
+            // =============================
+            // 🔥 REJECTION + CONTINUATION LOGIC
+            // =============================
+
             bool bullishRejection = IsBullishRejection(current, zone.ZoneLow, zone.ZoneHigh, atr, profile);
             bool bearishRejection = IsBearishRejection(current, zone.ZoneLow, zone.ZoneHigh, atr, profile);
+
+            // 🔥 NEW: SOFT CONTINUATION DETECTION
+            double body = Math.Abs(current.close - current.open);
+            double range = current.high - current.low;
+            double bodyAtr = body / atr;
+            double bodyRatio = range > 0 ? body / range : 0;
+
+            // 🔥 continuation conditions
+            bool bearishContinuation =
+                trendDown &&
+                !zone.IsBullish &&
+                returnedToBearZone &&
+                current.close < current.open &&        // bearish candle
+                bodyAtr > 0.35 &&                     // not weak
+                bodyRatio > 0.40 &&                   // decent body
+                current.close < (zone.ZoneLow + zone.ZoneHigh) / 2.0; // below mid
+
+            bool bullishContinuation =
+                trendUp &&
+                zone.IsBullish &&
+                returnedToBullZone &&
+                current.close > current.open &&
+                bodyAtr > 0.35 &&
+                bodyRatio > 0.40 &&
+                current.close > (zone.ZoneLow + zone.ZoneHigh) / 2.0;
+
+            // =============================
+            // 🔥 FINAL ENTRY CONDITIONS
+            // =============================
 
             bool buy =
                 trendUp &&
                 zone.IsBullish &&
                 returnedToBullZone &&
-                bullishRejection;
+                (bullishRejection || bullishContinuation);
 
             bool sell =
                 trendDown &&
                 !zone.IsBullish &&
                 returnedToBearZone &&
-                bearishRejection;
+                (bearishRejection || bearishContinuation);
 
             if (buy)
             {
