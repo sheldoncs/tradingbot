@@ -12,17 +12,27 @@ namespace MetaTrader.Services.Helper
             if (t == null)
                 return false;
 
-            // Track peak profit
+            // --------------------------------------------------
+            // 🔥 1. TRACK PEAK PROFIT
+            // --------------------------------------------------
             t.MaxProfitUsd = Math.Max(t.MaxProfitUsd, t.ProfitUsd);
 
             var profile = GetProfile(t.Symbol);
 
-            // Do not activate until trade has reached minimum profit
+            // --------------------------------------------------
+            // 🧠 2. ONLY ACTIVATE AFTER REAL PROFIT
+            // --------------------------------------------------
             if (t.MaxProfitUsd < profile.ActivationProfitUsd)
                 return false;
 
+            // --------------------------------------------------
+            // 🔥 3. CALCULATE FLOOR
+            // --------------------------------------------------
             double profitFloor = t.MaxProfitUsd - profile.AllowedGivebackUsd;
 
+            // --------------------------------------------------
+            // 🛑 4. EXIT CONDITION
+            // --------------------------------------------------
             if (t.ProfitUsd <= profitFloor)
             {
                 LogFile.Write(
@@ -48,7 +58,10 @@ namespace MetaTrader.Services.Helper
         {
             string s = symbol?.ToUpperInvariant() ?? "";
 
-            if (s.Contains("XAUUSD") || s.Contains("XAUEUR"))
+            // --------------------------------------------------
+            // 🟡 GOLD (slightly smarter)
+            // --------------------------------------------------
+            if (s.Contains("XAU") || s.Contains("XAG"))
             {
                 return new Profile
                 {
@@ -57,7 +70,10 @@ namespace MetaTrader.Services.Helper
                 };
             }
 
-            if (s.Contains("ETHUSD") || s.Contains("BTCUSD"))
+            // --------------------------------------------------
+            // 🟣 MAJOR CRYPTO
+            // --------------------------------------------------
+            if (s.Contains("ETH") || s.Contains("BTC"))
             {
                 return new Profile
                 {
@@ -66,7 +82,10 @@ namespace MetaTrader.Services.Helper
                 };
             }
 
-            if (s.Contains("SOLUSD") || s.Contains("BNBUSD"))
+            // --------------------------------------------------
+            // 🔵 MID CRYPTO
+            // --------------------------------------------------
+            if (s.Contains("SOL") || s.Contains("BNB"))
             {
                 return new Profile
                 {
@@ -75,7 +94,10 @@ namespace MetaTrader.Services.Helper
                 };
             }
 
-            if (s.Contains("XRPUSD") || s.Contains("ADAUSD"))
+            // --------------------------------------------------
+            // 🟢 SMALL CRYPTO
+            // --------------------------------------------------
+            if (s.Contains("XRP") || s.Contains("ADA"))
             {
                 return new Profile
                 {
@@ -84,6 +106,9 @@ namespace MetaTrader.Services.Helper
                 };
             }
 
+            // --------------------------------------------------
+            // 📊 INDICES
+            // --------------------------------------------------
             if (s.Contains("US100") || s.Contains("NAS"))
             {
                 return new Profile
@@ -93,7 +118,9 @@ namespace MetaTrader.Services.Helper
                 };
             }
 
-            // FX
+            // --------------------------------------------------
+            // 💱 FX
+            // --------------------------------------------------
             if (s.Contains("EURUSD") ||
                 s.Contains("GBPUSD") ||
                 s.Contains("USDJPY") ||
@@ -108,6 +135,9 @@ namespace MetaTrader.Services.Helper
                 };
             }
 
+            // --------------------------------------------------
+            // DEFAULT
+            // --------------------------------------------------
             return new Profile
             {
                 ActivationProfitUsd = 5.00,

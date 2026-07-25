@@ -10,40 +10,42 @@ namespace MetaTrader.Util
         /// </summary>
         public static bool IsTradingWindow(DateTime now)
         {
-           
             var day = now.DayOfWeek;
             var time = now.TimeOfDay;
 
-      
-            // ❌ Stop all trading at 5 PM Monday–Thursday
-            if ((day == DayOfWeek.Monday ||
-                 day == DayOfWeek.Tuesday ||
-                 day == DayOfWeek.Wednesday ||
-                 day == DayOfWeek.Thursday)
-                && time >= TimeSpan.FromHours(17) && time < TimeSpan.FromHours(18)) // between 17 = 5 PM and 18 = 6PM
-            {
+            // --------------------------------------------------
+            // ❌ SATURDAY: No trading
+            // --------------------------------------------------
+            if (day == DayOfWeek.Saturday)
                 return false;
-            }
 
-            // Monday: only after 02:00
-            //if (day == DayOfWeek.Monday)
-              //  return time >= TimeSpan.FromHours(2) && time < TimeSpan.FromHours(24);
+            // --------------------------------------------------
+            // ❌ SUNDAY: Only trade AFTER 6PM AST
+            // --------------------------------------------------
+            if (day == DayOfWeek.Sunday)
+                return time >= TimeSpan.FromHours(18);
 
-            // Tuesday, Wednesday, Thursday: full 24 hours
-            if (day == DayOfWeek.Monday || 
-                day == DayOfWeek.Tuesday ||
-                day == DayOfWeek.Wednesday ||
-                day == DayOfWeek.Thursday || 
-                day == DayOfWeek.Friday)
-                return true;
-
-            // Friday: only until 12:00 (midday)
+            // --------------------------------------------------
+            // ❌ FRIDAY: Stop completely after 12PM AST
+            // --------------------------------------------------
             if (day == DayOfWeek.Friday)
                 return time < TimeSpan.FromHours(12);
 
-            // Saturday & Sunday: no trading
+            // --------------------------------------------------
+            // ❌ MONDAY–THURSDAY: Block 2PM–6PM AST
+            // --------------------------------------------------
+            if (day == DayOfWeek.Monday ||
+                day == DayOfWeek.Tuesday ||
+                day == DayOfWeek.Wednesday ||
+                day == DayOfWeek.Thursday)
+            {
+                if (time >= TimeSpan.FromHours(14) && time < TimeSpan.FromHours(18))
+                    return false;
+
+                return true;
+            }
+
             return true;
-           
         }
 
         /// <summary>

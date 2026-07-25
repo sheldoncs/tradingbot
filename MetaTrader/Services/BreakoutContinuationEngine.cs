@@ -231,6 +231,14 @@ namespace MetaTrader.Services
             double distToBreakoutAtr = (recentHigh - liveBuyPrice) / atr;
             double distToBreakdownAtr = (liveSellPrice - recentLow) / atr;
 
+
+            double minMomentum =
+                IsCrypto(symbol) ? 4.0 :
+                IsIndex(symbol) ? 5.0 :
+                IsGold(symbol) ? 3.5 :
+                3.0;
+
+            bool strongMomentum = momentum >= minMomentum;
             // 🔵 BUY
             bool preBreakoutBuy =
                 trendUp &&
@@ -239,10 +247,20 @@ namespace MetaTrader.Services
                 distToBreakoutAtr > 0 &&
                 distToBreakoutAtr < maxPreBreakoutDist &&
                 bodyAtrCheck > minBodyAtr &&
-                distBuyFromEma9Atr < maxEmaDist;
+                distBuyFromEma9Atr < maxEmaDist &&
+                strongMomentum; // 🔥 NEW;;
 
             if (preBreakoutBuy)
             {
+                bool allowPreBreakout =
+                strongMomentum &&
+                bodyAtrCheck > 1.0;
+
+                if (!allowPreBreakout)
+                {
+                    LogFile.Write("❌ Blocked: weak pre-breakout BUY conditions");
+                    return false;
+                }
                 action = TradeAction.EnterBuy;
 
                 LogFile.Write(
@@ -260,10 +278,20 @@ namespace MetaTrader.Services
                 distToBreakdownAtr > 0 &&
                 distToBreakdownAtr < maxPreBreakoutDist &&
                 bodyAtrCheck > minBodyAtr &&
-                distSellFromEma9Atr < maxEmaDist;
+                distSellFromEma9Atr < maxEmaDist &&
+                strongMomentum; // 🔥 NEW;;
 
             if (preBreakoutSell)
             {
+                bool allowPreBreakout =
+                strongMomentum &&
+                bodyAtrCheck > 1.0;
+
+                if (!allowPreBreakout)
+                {
+                    LogFile.Write("❌ Blocked: weak pre-breakout SELL conditions");
+                    return false;
+                }
                 action = TradeAction.EnterSell;
 
                 LogFile.Write(
@@ -292,15 +320,31 @@ namespace MetaTrader.Services
                 // 🔥 BLOCK LATE MOVE
                 double moveFromRecentLowAtr = (liveBuyPrice - recentLow) / atr;
 
-                if (moveFromRecentLowAtr > maxMoveAtr)
+                double emaDist = Math.Abs(liveBuyPrice - ema9) / atr;
+
+                bool trendContinuation =
+                    Math.Abs(momentum) > 4 &&
+                    bodyAtrCheck > 0.5 &&
+                    emaDist > 0.15;
+
+                bool lateImpulseContinuation =
+                    bodyAtrCheck > 1.0 &&
+                    Math.Abs(momentum) > 6;
+
+                bool allowExtendedMove =
+                    strongImpulse ||
+                    trendContinuation ||
+                    lateImpulseContinuation;
+
+                if (moveFromRecentLowAtr > maxMoveAtr && !allowExtendedMove)
                 {
                     ResetState(s);
 
                     LogFile.Write(
-                        $"[{s}] BUY blocked: move already extended | moveATR={moveFromRecentLowAtr:F2}, max={maxMoveAtr:F2}"
+                        $"[{s}] ❌ BUY blocked: extended move | moveATR={moveFromRecentLowAtr:F2}, max={maxMoveAtr:F2}"
                     );
 
-                    WaitingForPullback[symbol] = true; // 🔥 ADD THIS
+                    WaitingForPullback[symbol] = true;
 
                     return false;
                 }
@@ -468,12 +512,29 @@ namespace MetaTrader.Services
                 // 🔥 BLOCK LATE MOVE
                 double moveFromRecentHighAtr = (recentHigh - liveSellPrice) / atr;
 
-                if (moveFromRecentHighAtr > maxMoveAtr)
+                double emaDist = Math.Abs(liveSellPrice - ema9) / atr;
+
+                bool trendContinuation =
+                    Math.Abs(momentum) > 4 &&
+                    bodyAtrCheck > 0.5 &&
+                    emaDist > 0.15;
+
+                bool lateImpulseContinuation =
+                    bodyAtrCheck > 1.0 &&
+                    Math.Abs(momentum) > 6;
+
+                // 🔥 USE EXISTING strongImpulse (DO NOT REDECLARE)
+                bool allowExtendedMove =
+                    strongImpulse ||            // already defined above
+                    trendContinuation ||
+                    lateImpulseContinuation;
+
+                if (moveFromRecentHighAtr > maxMoveAtr && !allowExtendedMove)
                 {
                     ResetState(s);
 
                     LogFile.Write(
-                        $"[{s}] SELL blocked: move already extended | moveATR={moveFromRecentHighAtr:F2}, max={maxMoveAtr:F2}"
+                        $"[{s}] ❌ SELL blocked: extended move | moveATR={moveFromRecentHighAtr:F2}, max={maxMoveAtr:F2}"
                     );
 
                     WaitingForPullback[symbol] = true;
