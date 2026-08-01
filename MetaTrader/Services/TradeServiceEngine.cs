@@ -3199,7 +3199,7 @@ namespace MetaTrader.Services
                 }
 
 
-                DollarProfitProtectionEngine.Manage(t, midPrice, ModifyTrade, out bool isClosingTrade);
+                DollarProfitProtectionEngine.Manage(t, midPrice, ModifyTrade, atr, ctx, out bool isClosingTrade);
                 if (isClosingTrade)
                 {
                     TradeServiceEngine.closingTrade = true;

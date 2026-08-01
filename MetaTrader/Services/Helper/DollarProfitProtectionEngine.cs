@@ -10,6 +10,8 @@ namespace MetaTrader.Services.Helper
             TrackedTrade t,
             double midPrice,
             Action<TrackedTrade> modifyTrade,
+            double atr,
+            SymbolContext ctx,
             out bool isClosingTrade
         )
         {
@@ -23,10 +25,13 @@ namespace MetaTrader.Services.Helper
             // --------------------------------------------------
             // 🧠 NEW: STRONG TRADE DETECTION
             // --------------------------------------------------
-            bool isStrongTrade =
-                t.MaxProfitUsd >= 10 &&   // already proven
-                t.ProfitUsd > 7;          // still holding gains
+            //bool isStrongTrade =
+            //    t.MaxProfitUsd >= 10 &&   // already proven
+            //    t.ProfitUsd > 7;          // still holding gains
 
+            bool isStrongTrade =
+                t.LastCandleBodyUsd > atr * 1.2 &&
+                ctx.CurrentMomentum > 1.8;
             // --------------------------------------------------
             // 🛑 2. GIVEBACK PROTECTION (🔥 PRIORITY FIRST)
             // --------------------------------------------------
@@ -109,9 +114,14 @@ namespace MetaTrader.Services.Helper
             {
                 double trailDistance =
                     isStrongTrade
-                        ? (IsGold(t.Symbol) ? 7 : 6)  // 🔥 wider trail
+                        ? (IsGold(t.Symbol) ? 8 : 6)  // 🔥 wider trail
                         : 5;
-
+                /*
+                         double trailDistance =
+            isStrongTrade
+                ? (IsGold ? 7 : 6)
+                : 5;
+                 */
                 double trailBase =
                     t.Side == TradeSide.Buy
                         ? t.EntryPrice + t.MaxProfitUsd

@@ -24,9 +24,20 @@ namespace MetaTrader.Services.Helper
             // --------------------------------------------------
             // 🧠 TREND PROTECTION (🔥 NEW - CRITICAL)
             // --------------------------------------------------
+
+            double body = Math.Abs(c0.close - c0.open);
+            double bodyAtr = atr > 0 ? body / atr : 0;
+
             bool strongTrend =
-                (t.Side == TradeSide.Sell && ema9 < ema21) ||
-                (t.Side == TradeSide.Buy && ema9 > ema21);
+                (t.Side == TradeSide.Sell && ema9 < ema21 && currentMomentum > 1.5) ||
+                (t.Side == TradeSide.Buy && ema9 > ema21 && currentMomentum > 1.5);
+
+            // 🔥 PROTECT STRONG TRADES
+            if (strongTrend && t.ProfitUsd > 2)
+            {
+                LogFile.Write($"🛡 Strong trend → skip weak-exit logic {t.Ticket}");
+                return false;
+            }
 
             bool smallCandle =
                 Math.Abs(c0.close - c0.open) < atr * 0.5;
@@ -38,15 +49,22 @@ namespace MetaTrader.Services.Helper
             }
 
             // --------------------------------------------------
+            // 🔴 CONFIRMED WEAKNESS (🔥 NEW)
+            // --------------------------------------------------
+            bool confirmedWeakness =
+                (t.Side == TradeSide.Sell && c0.close > c0.open && c1.close > c1.open) ||
+                (t.Side == TradeSide.Buy && c0.close < c0.open && c1.close < c1.open);
+
+            // --------------------------------------------------
             // 🔴 1. NO FOLLOW-THROUGH
             // --------------------------------------------------
             bool noFollowThrough =
-                moveFromEntry < atr * 0.5 &&   // 🔥 use ATR instead of fixed 3
+                moveFromEntry < atr * 0.5 &&
                 currentMomentum < previousMomentum;
 
-            if (noFollowThrough && t.ProfitUsd < 3)
+            if (noFollowThrough && confirmedWeakness && t.ProfitUsd < 3)
             {
-                LogFile.Write($"⚠️ Weak trade (no follow-through) → EXIT {t.Ticket}");
+                LogFile.Write($"⚠️ Weak trade (confirmed no follow-through) → EXIT {t.Ticket}");
                 return true;
             }
 
@@ -58,14 +76,14 @@ namespace MetaTrader.Services.Helper
                     ? c0.close > ema9
                     : c0.close < ema9;
 
-            if (emaFailure && t.ProfitUsd < 5)
+            if (emaFailure && confirmedWeakness && t.ProfitUsd < 5)
             {
-                LogFile.Write($"⚠️ EMA failure → EXIT {t.Ticket}");
+                LogFile.Write($"⚠️ EMA failure (confirmed) → EXIT {t.Ticket}");
                 return true;
             }
 
             // --------------------------------------------------
-            // 🔴 3. DOUBLE COUNTER CANDLES
+            // 🔴 3. DOUBLE COUNTER CANDLES (UNCHANGED)
             // --------------------------------------------------
             bool twoOppositeCandles =
                 (t.Side == TradeSide.Sell &&
@@ -89,9 +107,9 @@ namespace MetaTrader.Services.Helper
                 previousMomentum > 2 &&
                 currentMomentum < 1;
 
-            if (momentumCollapse && t.ProfitUsd < 5)
+            if (momentumCollapse && confirmedWeakness && t.ProfitUsd < 5)
             {
-                LogFile.Write($"⚠️ Momentum collapse → EXIT {t.Ticket}");
+                LogFile.Write($"⚠️ Momentum collapse (confirmed) → EXIT {t.Ticket}");
                 return true;
             }
 

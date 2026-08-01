@@ -66,7 +66,7 @@ namespace MetaTrader.Services.Helper
                 return new Profile
                 {
                     ActivationProfitUsd = 8.00,
-                    AllowedGivebackUsd = 4.00
+                    AllowedGivebackUsd = 5.00
                 };
             }
 
