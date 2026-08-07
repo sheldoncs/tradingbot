@@ -84,7 +84,6 @@ namespace MetaTrader.Services
             double sellRequiredBody =
                 overallBearish ? bodyThreshold : bodyThreshold + counterTrendBoost;
 
-
             // =============================
             // 🔥 EARLY IMPULSE (NEW)
             // =============================
@@ -104,9 +103,17 @@ namespace MetaTrader.Services
                 IsGold(symbol) ? 0.6 :
                 0.5;
 
+            double minEmaDistance =
+                IsGold(symbol) ? 0.20 :
+                IsCrypto(symbol) ? 0.18 :
+                IsIndex(symbol) ? 0.15 :
+                                  0.10;   // FX
+
+
             bool earlyImpulseBuy =
                 bodyAtrBuy > earlyBodyRequirement &&
                 livePriceBuy > ema9 &&
+                distFromEmaBuy > minEmaDistance &&          // 🔥 NEW
                 distFromEmaBuy < maxDistance &&
                 distToBreakout > 0 &&
                 distToBreakout < earlyDistLimit;
@@ -126,6 +133,7 @@ namespace MetaTrader.Services
             bool earlyImpulseSell =
                 bodyAtrSell > earlyBodyRequirement &&
                 livePriceSell < ema9 &&
+                distFromEmaSell > minEmaDistance &&
                 distFromEmaSell < maxDistance &&
                 distToBreakdown > 0 &&
                 distToBreakdown < earlyDistLimit;

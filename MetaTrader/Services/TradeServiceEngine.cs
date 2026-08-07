@@ -1364,70 +1364,7 @@ namespace MetaTrader.Services
                         return;
                     }
                     LogFile.Write($"⚡ FAST ENGINE: {fastAction} detected on {SYMBOL} with model {fastModel} IN progress ${_fastOrderInProgress}");
-                    //if (!_fastOrderInProgress)
-                    //{
-                    //    _fastOrderInProgress = true;
-
-                    //    LogFile.Write($"⚡ FAST ENGINE TRIGGERED: {fastAction} {SYMBOL}");
-
-                    //    if (!GlobalTradeManager.TryAcquireTradeLock(_provider))
-                    //    {
-                    //        LogFile.Write("❌ FAST ENGINE failed to acquire lock");
-                    //        return;
-                    //    }
-
-                    //    var fastTradeDecision = new TradeDecision
-                    //    {
-                    //        Momentum = earlyMomentum.Hybrid,
-                    //        // set only what OpenTrade actually uses
-                    //    };
-
-
-                    //    _client.CopyRates(SYMBOL, ENUM_TIMEFRAMES.PERIOD_H1, 1, BarsToFetch, out var openTrade1H);
-
-                    //    ctx.IsImpulse = isImpulse;
-
-                    //    if (isImpulse) {
-
-                    //       LogFile.Write($"⚡ FAST ENGINE: impulse detected for {isGoodImpulseLocation}");
-                    //        if (isGoodImpulseLocation(ctx, fastAction, openTrade1H))
-                    //        {
-                    //            LogFile.Write($"⚡ FAST ENGINE: impulse location favorable for {fastAction} on {SYMBOL}");
-                    //        }
-                    //        else
-                    //        {
-                    //            LogFile.Write($"⚡ FAST ENGINE: impulse location NOT favorable for {fastAction} on {SYMBOL}");
-                    //            GlobalTradeManager.ReleaseTradeLock(_provider);
-                    //            _fastOrderInProgress = false;
-                    //            return;
-                    //        }
-                    //    }
-
-                    //    double dailyPnL = await _profitEngine.GetDailyProfit();
-                    //    LogFile.Write($"⚡ FAST ENGINE: dailyPnL={dailyPnL:F2} for {SYMBOL}");
-                    //    if (!HardRiskGuardEngine.CanEnter(dailyPnL))
-                    //        return;
-
-                    //    await OpenTrade(
-                    //        fastAction == TradeAction.EnterBuy ? TradeSide.Buy : TradeSide.Sell,
-                    //        fastAction == TradeAction.EnterBuy ? ask : bid,
-                    //        LotSizingMode.Fixed,
-                    //        fastModel,
-                    //        openTrade1H,
-                    //        fastTradeDecision,
-                    //        transition, tradeType
-                    //    );
-                    //    if (isImpulse) ctx.ImpulseConsumed = true; // mark as consumed if impulse trade
-                    //    _lastOrderCandleTime = currentCandleTime;
-
-                    //    await _notificationService.sendNotification(
-                    //            $"{fastAction.ToString()} - {fastModel.ToString()} — entry approved - {SYMBOL}",
-                    //            _configuration["CHAT_ID"],
-                    //            _configuration["BOT_TOKEN"]
-                    //        );
-                    //    return; // 🔥 STOP — do not continue to state engine
-                    //}
-
+                    
                     if (!_fastOrderInProgress)
                     {
                         LogFile.Write($"⚡ FAST ENGINE TRIGGERED: {fastAction} {SYMBOL}");
@@ -1458,13 +1395,25 @@ namespace MetaTrader.Services
                             }
                         }
 
+                        // 🔥 ONLY SET HERE
+                        _fastOrderInProgress = true;
+
+                        // --------------------------------------------------
+                        // 🚫 LAST DEFENCE AGAINST DUPLICATE ENTRIES
+                        // --------------------------------------------------
+                        if (HasAnyOpenPositionBySymbol(SYMBOL))
+                        {
+                            LogFile.Write($"⛔ Trade already exists for {SYMBOL}");
+                            _orderInProgress = false;
+                            _fastOrderInProgress = false;
+                            GlobalTradeManager.ReleaseTradeLock(_provider);
+                            return;
+                        }
+
                         double dailyPnL = await _profitEngine.GetDailyProfit();
 
                         if (!HardRiskGuardEngine.CanEnter(dailyPnL))
                             return;
-
-                        // 🔥 ONLY SET HERE
-                        _fastOrderInProgress = true;
 
                         await OpenTrade(
                             fastAction == TradeAction.EnterBuy ? TradeSide.Buy : TradeSide.Sell,
@@ -1475,6 +1424,17 @@ namespace MetaTrader.Services
                             fastTradeDecision,
                             transition, tradeType
                         );
+
+                        // ------------------------------------
+                        // Wait until MT5 confirms the position
+                        // ------------------------------------
+                        for (int i = 0; i < 20; i++)
+                        {
+                            if (HasAnyOpenPositionBySymbol(SYMBOL))
+                                break;
+
+                            await Task.Delay(100);
+                        }
 
                         await _notificationService.sendNotification(
                                 $"{fastAction.ToString()} - {fastModel.ToString()} — entry approved - {SYMBOL}",
@@ -1639,6 +1599,18 @@ namespace MetaTrader.Services
                             MetaTrader.Services.TradeType tradeType = model == EntryModel.TrendRideContinuation || model == EntryModel.BreakoutContinuation || model == EntryModel.CompressionBreakoutContinuation
                                                                 ? MetaTrader.Services.TradeType.Continuation : MetaTrader.Services.TradeType.None;
 
+                            // --------------------------------------------------
+                            // 🚫 LAST DEFENCE AGAINST DUPLICATE ENTRIES
+                            // --------------------------------------------------
+                            if (HasAnyOpenPositionBySymbol(SYMBOL))
+                            {
+                                LogFile.Write($"⛔ Trade already exists for {SYMBOL}");
+                                _orderInProgress = false;
+                                _fastOrderInProgress = false;
+                                GlobalTradeManager.ReleaseTradeLock(_provider);
+                                return;
+                            }
+
                             double dailyPnL = await _profitEngine.GetDailyProfit();
                             if (!HardRiskGuardEngine.CanEnter(dailyPnL))
                                 return;
@@ -1648,6 +1620,16 @@ namespace MetaTrader.Services
                                 action == TradeAction.EnterBuy ? ask : bid,
                                 LotSizingMode.Fixed, entry, rates1H, tradeDecision, transition, tradeType );
 
+                            // ------------------------------------
+                            // Wait until MT5 confirms the position
+                            // ------------------------------------
+                            for (int i = 0; i < 20; i++)
+                            {
+                                if (HasAnyOpenPositionBySymbol(SYMBOL))
+                                    break;
+
+                                await Task.Delay(100);
+                            }
                             // ✅ RESET STRUCTURE HERE
                             ResetStructuralState(ctx);
 
@@ -3202,6 +3184,7 @@ namespace MetaTrader.Services
                 DollarProfitProtectionEngine.Manage(t, midPrice, ModifyTrade, atr, ctx, out bool isClosingTrade);
                 if (isClosingTrade)
                 {
+                    LogFile.Write("EXIT ENGINE = DollarProtect");
                     TradeServiceEngine.closingTrade = true;
                     continue;
                 }
