@@ -8,54 +8,253 @@ namespace MetaTrader.Services.Helper
     public static class GoldBreakEvenLock
     {
         private static readonly HashSet<ulong> LockedTickets = new();
+
         public static void Apply(
             TrackedTrade t,
-            double mid,
-            double atr, Action<TrackedTrade> ModifyTrade)
+            double bid,
+            double ask,
+            double atr,
+            Action<TrackedTrade> ModifyTrade)
         {
-            if (t == null || atr <= 0)
+            if (t == null)
                 return;
 
-            if (!t.Symbol.Contains("XAU") && !t.Symbol.Contains("GOLD"))
+            if (atr <= 0)
                 return;
+
+            if (ModifyTrade == null)
+                return;
+
+            string symbol =
+                t.Symbol?.ToUpperInvariant() ?? "";
+
+            if (!symbol.Contains("XAU") &&
+                !symbol.Contains("GOLD"))
+            {
+                return;
+            }
+
+
+            // ==================================================
+            // 1. ATR SANITY CHECK
+            //
+            // Gold H1 ATR should not realistically be a few
+            // cents. If something is wrong with the ATR feed,
+            // do NOT modify the trade.
+            // ==================================================
+
+            if (atr < 0.50)
+            {
+                LogFile.Write(
+                    $"[{t.Symbol}] ⚠️ GOLD BE LOCK skipped: suspicious ATR | " +
+                    $"ATR={atr:F5} | ticket={t.Ticket}"
+                );
+
+                return;
+            }
+
+
+            // ==================================================
+            // 2. CURRENT EXECUTABLE PRICE
+            //
+            // BUY closes at Bid.
+            // SELL closes at Ask.
+            // ==================================================
+
+            double currentPrice =
+                t.Side == TradeSide.Buy
+                    ? bid
+                    : ask;
+
+
+            // ==================================================
+            // 3. FAVORABLE MOVE FROM ENTRY
+            // ==================================================
 
             double favorableMove =
                 t.Side == TradeSide.Sell
-                    ? t.EntryPrice - mid
-                    : mid - t.EntryPrice;
+                    ? t.EntryPrice - currentPrice
+                    : currentPrice - t.EntryPrice;
 
-            double moveAtr = favorableMove / atr;
 
-            // Wait until gold has moved at least 0.60 ATR in profit
-            if (moveAtr < 0.60)
+            // Trade is not yet in profit.
+            if (favorableMove <= 0)
                 return;
 
-            // Lock a tiny profit beyond entry, not too close to current price
-            double lockProfit = atr * 0.08;
 
-            double newSL =
+            double moveAtr =
+                favorableMove / atr;
+
+
+            // ==================================================
+            // 4. WAIT FOR MEANINGFUL PROFIT
+            //
+            // Do not tighten Gold too early.
+            // ==================================================
+
+            const double MIN_MOVE_ATR = 0.60;
+
+            if (moveAtr < MIN_MOVE_ATR)
+                return;
+
+
+            // ==================================================
+            // 5. PROPOSE A SMALL PROFIT LOCK
+            //
+            // Lock only a small amount beyond entry so the
+            // trade still has breathing room.
+            // ==================================================
+
+            double lockDistance =
+                atr * 0.08;
+
+
+            double proposedSL =
                 t.Side == TradeSide.Buy
-                    ? t.EntryPrice + lockProfit
-                    : t.EntryPrice - lockProfit;
+                    ? t.EntryPrice + lockDistance
+                    : t.EntryPrice - lockDistance;
 
-            if (t.Side == TradeSide.Buy && newSL > t.StopLoss)
+
+            // ==================================================
+            // 6. SAFETY DISTANCE FROM CURRENT PRICE
+            //
+            // BUY:
+            // SL must be BELOW Bid.
+            //
+            // SELL:
+            // SL must be ABOVE Ask.
+            //
+            // We keep an ATR-based safety buffer so MT5 does
+            // not reject the stop as invalid / too close.
+            // ==================================================
+
+            double minimumStopDistance =
+                atr * 0.10;
+
+
+            double validSL;
+
+
+            if (t.Side == TradeSide.Buy)
             {
-                LogFile.Write(
-                    $"🔒 GOLD BE LOCK BUY | ticket={t.Ticket} | oldSL={t.StopLoss:F5} → newSL={newSL:F5} | moveATR={moveAtr:F2}"
-                );
+                double highestValidSL =
+                    bid - minimumStopDistance;
 
-                t.StopLoss = newSL;
-                ModifyTrade(t);
+
+                validSL =
+                    Math.Min(
+                        proposedSL,
+                        highestValidSL
+                    );
+
+
+                // Still not a valid profitable lock.
+                if (validSL <= t.EntryPrice)
+                {
+                    LogFile.Write(
+                        $"[{t.Symbol}] GOLD BE LOCK BUY hold: " +
+                        $"not enough room to place profitable SL | " +
+                        $"entry={t.EntryPrice:F5} | " +
+                        $"bid={bid:F5} | " +
+                        $"proposedSL={proposedSL:F5} | " +
+                        $"validSL={validSL:F5}"
+                    );
+
+                    return;
+                }
+
+
+                // Never move a BUY stop backwards.
+                if (t.StopLoss != 0 &&
+                    validSL <= t.StopLoss)
+                {
+                    return;
+                }
+            }
+            else
+            {
+                double lowestValidSL =
+                    ask + minimumStopDistance;
+
+
+                validSL =
+                    Math.Max(
+                        proposedSL,
+                        lowestValidSL
+                    );
+
+
+                // Still not a valid profitable lock.
+                if (validSL >= t.EntryPrice)
+                {
+                    LogFile.Write(
+                        $"[{t.Symbol}] GOLD BE LOCK SELL hold: " +
+                        $"not enough room to place profitable SL | " +
+                        $"entry={t.EntryPrice:F5} | " +
+                        $"ask={ask:F5} | " +
+                        $"proposedSL={proposedSL:F5} | " +
+                        $"validSL={validSL:F5}"
+                    );
+
+                    return;
+                }
+
+
+                // Never move a SELL stop backwards.
+                if (t.StopLoss != 0 &&
+                    validSL >= t.StopLoss)
+                {
+                    return;
+                }
             }
 
-            if (t.Side == TradeSide.Sell && newSL < t.StopLoss)
-            {
-                LogFile.Write(
-                    $"🔒 GOLD BE LOCK SELL | ticket={t.Ticket} | oldSL={t.StopLoss:F5} → newSL={newSL:F5} | moveATR={moveAtr:F2}"
-                );
 
-                t.StopLoss = newSL;
+            // ==================================================
+            // 7. APPLY MODIFICATION
+            // ==================================================
+
+            double oldSL =
+                t.StopLoss;
+
+
+            t.StopLoss =
+                validSL;
+
+
+            LogFile.Write(
+                $"[{t.Symbol}] 🔒 GOLD BE LOCK | " +
+                $"ticket={t.Ticket} | " +
+                $"side={t.Side} | " +
+                $"oldSL={oldSL:F5} → newSL={validSL:F5} | " +
+                $"entry={t.EntryPrice:F5} | " +
+                $"bid={bid:F5} | " +
+                $"ask={ask:F5} | " +
+                $"ATR={atr:F5} | " +
+                $"favorableMove={favorableMove:F2} | " +
+                $"moveATR={moveAtr:F2}"
+            );
+
+
+            try
+            {
                 ModifyTrade(t);
+
+                LockedTickets.Add(
+                    t.Ticket
+                );
+            }
+            catch (Exception ex)
+            {
+                // Restore the old SL in memory if broker update fails.
+                t.StopLoss =
+                    oldSL;
+
+                LogFile.Write(
+                    $"[{t.Symbol}] ❌ GOLD BE LOCK modification failed | " +
+                    $"ticket={t.Ticket} | " +
+                    $"attemptedSL={validSL:F5} | " +
+                    $"error={ex.Message}"
+                );
             }
         }
     }

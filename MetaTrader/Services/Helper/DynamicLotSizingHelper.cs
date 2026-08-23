@@ -130,7 +130,7 @@ namespace MetaTrader.Services.Helper
                 VolatilityFactor = 0.90,
                 HighVolatilityCut = 0.70,
                 LowVolatilityBoost = 1.00,
-                MaxLot = 0.06,
+                MaxLot = 0.01,
                 ContractSize = 1
             },
 

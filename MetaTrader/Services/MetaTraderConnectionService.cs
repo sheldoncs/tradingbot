@@ -234,6 +234,18 @@ namespace MetaTrader.Services
         private void Client_OnTradeTransaction(object sender, Mt5TradeTransactionEventArgs e)
         {
             LogFile.Write("Trade update received.");
+
+            try
+            {
+                LogFile.Write(
+                 $"TRADE TRANSACTION | {e}");
+                _tradeService.CheckRecentlyClosedPositions();
+            }
+            catch (Exception ex)
+            {
+                LogFile.Write(
+                    $"Error checking closed positions: {ex.Message}");
+            }
         }
 
 

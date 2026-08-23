@@ -24,6 +24,11 @@ namespace MetaTrader.Services.Helper
                 _initialized = true;
                 _startEquity = currentEquity;
                 _peakEquity = currentEquity;
+
+                LogFile.Write(
+                    $"✅ EquityGiveback initialized | " +
+                    $"startEquity={_startEquity:F2}, peakEquity={_peakEquity:F2}"
+                );
             }
         }
 
@@ -46,40 +51,67 @@ namespace MetaTrader.Services.Helper
 
                 var profile = GetProfile(accountMode);
 
+                // --------------------------------------------------
+                // 📈 TRACK PEAK EQUITY
+                // --------------------------------------------------
                 if (currentEquity > _peakEquity)
                     _peakEquity = currentEquity;
 
-                double profitFromStart = _peakEquity - _startEquity;
-                double drawdownFromStart = _startEquity - currentEquity;
-                double givebackFromPeak = _peakEquity - currentEquity;
+                double profitFromStart =
+                    _peakEquity - _startEquity;
 
+                double drawdownFromStart =
+                    _startEquity - currentEquity;
+
+                double givebackFromPeak =
+                    _peakEquity - currentEquity;
+
+                // --------------------------------------------------
+                // 🛑 1. HARD DAILY LOSS PROTECTION
+                // --------------------------------------------------
                 if (drawdownFromStart >= profile.HardDailyLossUsd)
                 {
                     LogFile.Write(
-                        $"🛑 EQUITY HARD LOSS EXIT | equity={currentEquity:F2}, " +
-                        $"start={_startEquity:F2}, loss={drawdownFromStart:F2}, " +
+                        $"🛑 EQUITY HARD LOSS EXIT | " +
+                        $"equity={currentEquity:F2}, " +
+                        $"start={_startEquity:F2}, " +
+                        $"peak={_peakEquity:F2}, " +
+                        $"loss={drawdownFromStart:F2}, " +
                         $"maxLoss={profile.HardDailyLossUsd:F2}"
                     );
 
                     return true;
                 }
 
+                // --------------------------------------------------
+                // ⏳ 2. GIVEBACK NOT YET ACTIVATED
+                // --------------------------------------------------
                 if (profitFromStart < profile.ActivationProfitUsd)
                 {
                     LogFile.Write(
-                        $"EquityGiveback hold: not activated | equity={currentEquity:F2}, " +
-                        $"peak={_peakEquity:F2}, profitFromStart={profitFromStart:F2}, " +
+                        $"EquityGiveback hold: not activated | " +
+                        $"equity={currentEquity:F2}, " +
+                        $"start={_startEquity:F2}, " +
+                        $"peak={_peakEquity:F2}, " +
+                        $"profitFromStart={profitFromStart:F2}, " +
                         $"need={profile.ActivationProfitUsd:F2}"
                     );
 
                     return false;
                 }
 
+                // --------------------------------------------------
+                // 🔒 3. PROFIT GIVEBACK PROTECTION
+                // --------------------------------------------------
                 if (givebackFromPeak >= profile.AllowedGivebackUsd)
                 {
                     LogFile.Write(
-                        $"🛑 EQUITY GIVEBACK EXIT | equity={currentEquity:F2}, " +
-                        $"peak={_peakEquity:F2}, giveback={givebackFromPeak:F2}, " +
+                        $"🛑 EQUITY GIVEBACK EXIT | " +
+                        $"equity={currentEquity:F2}, " +
+                        $"start={_startEquity:F2}, " +
+                        $"peak={_peakEquity:F2}, " +
+                        $"profitFromStart={profitFromStart:F2}, " +
+                        $"giveback={givebackFromPeak:F2}, " +
                         $"allowed={profile.AllowedGivebackUsd:F2}"
                     );
 
@@ -92,14 +124,19 @@ namespace MetaTrader.Services.Helper
 
         private static Profile GetProfile(string accountMode)
         {
-            string mode = accountMode?.ToUpperInvariant() ?? "";
+            string mode =
+                accountMode?.ToUpperInvariant() ?? "";
 
             if (mode.Contains("FTMO10K"))
             {
                 return new Profile
                 {
                     ActivationProfitUsd = 15.00,
-                    AllowedGivebackUsd = 8.00,
+
+                    // 🔥 CHANGED FROM $8 → $10
+                    // Gives larger positions slightly more breathing room
+                    AllowedGivebackUsd = 10.00,
+
                     HardDailyLossUsd = 75.00
                 };
             }
@@ -107,7 +144,7 @@ namespace MetaTrader.Services.Helper
             return new Profile
             {
                 ActivationProfitUsd = 15.00,
-                AllowedGivebackUsd = 8.00,
+                AllowedGivebackUsd = 10.00,
                 HardDailyLossUsd = 75.00
             };
         }

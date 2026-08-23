@@ -22,18 +22,16 @@ namespace MetaTrader.Services.Helper
 
             double moveFromEntry = Math.Abs(midPrice - t.EntryPrice);
 
-
-
             // --------------------------------------------------
-            // 🧠 TREND PROTECTION
+            // 🧠 BASIC CANDLE / ATR DATA
             // --------------------------------------------------
 
             double body = Math.Abs(c0.close - c0.open);
             double bodyAtr = atr > 0 ? body / atr : 0;
 
             // --------------------------------------------------
-            // 🔥 FAILED BREAKOUT DETECTION (Improved)
-            // Works on Gold, Crypto, FX and Indices
+            // 📉 ADVERSE MOVE
+            // Positive only when price is moving against trade
             // --------------------------------------------------
 
             double adverseMove =
@@ -41,53 +39,188 @@ namespace MetaTrader.Services.Helper
                     ? t.EntryPrice - midPrice
                     : midPrice - t.EntryPrice;
 
+            double adverseAtr =
+                atr > 0
+                    ? Math.Max(0, adverseMove) / atr
+                    : 0;
+
+            //bool severeAdverseMove =
+            
+            //IsGold(t.Symbol) &&
+            //t.ProfitUsd <= -5.00 &&
+            //adverseAtr >= 0.45;
+
+            //if (severeAdverseMove)
+            //{
+            //    LogFile.Write(
+            //        $"🚨 Severe Gold adverse move → EXIT {t.Ticket} | " +
+            //        $"profit={t.ProfitUsd:F2}, adverseAtr={adverseAtr:F2}"
+            //    );
+
+            //    return true;
+            //}
+
+            // --------------------------------------------------
+            // 🔥 FAILED BREAKOUT DETECTION
+            // --------------------------------------------------
+
             bool failedBreakout =
-            (
-                t.Side == TradeSide.Buy &&
-                c0.close < t.EntryPrice &&
-                adverseMove > atr * 0.35 &&
-                currentMomentum < previousMomentum &&
-                bodyAtr > 0.7
-            )
-            ||
-            (
-                t.Side == TradeSide.Sell &&
-                c0.close > t.EntryPrice &&
-                adverseMove > atr * 0.35 &&
-                currentMomentum < previousMomentum &&
-                bodyAtr > 0.7
-            );
+                (
+                    t.Side == TradeSide.Buy &&
+                    c0.close < t.EntryPrice &&
+                    adverseAtr > 0.35 &&
+                    currentMomentum < previousMomentum &&
+                    bodyAtr > 0.70
+                )
+                ||
+                (
+                    t.Side == TradeSide.Sell &&
+                    c0.close > t.EntryPrice &&
+                    adverseAtr > 0.35 &&
+                    currentMomentum < previousMomentum &&
+                    bodyAtr > 0.70
+                );
+
+            // --------------------------------------------------
+            // 💥 VIOLENT COUNTER-REVERSAL OVERRIDE
+            // --------------------------------------------------
+
+            double counterBodyRequirement =
+                IsGold(t.Symbol) ? 0.65 :
+                IsCrypto(t.Symbol) ? 0.80 :
+                IsIndex(t.Symbol) ? 0.70 :
+                0.60; // FX
+
+            double counterAdverseRequirement =
+                IsGold(t.Symbol) ? 0.30 :
+                IsCrypto(t.Symbol) ? 0.35 :
+                IsIndex(t.Symbol) ? 0.30 :
+                0.25; // FX
+
+            bool violentCounterReversal =
+                (
+                    t.Side == TradeSide.Sell &&
+                    c0.close > c0.open &&
+                    c0.close > t.EntryPrice &&
+                    adverseAtr > counterAdverseRequirement &&
+                    bodyAtr > counterBodyRequirement
+                )
+                ||
+                (
+                    t.Side == TradeSide.Buy &&
+                    c0.close < c0.open &&
+                    c0.close < t.EntryPrice &&
+                    adverseAtr > counterAdverseRequirement &&
+                    bodyAtr > counterBodyRequirement
+                );
+
+            if (violentCounterReversal && t.ProfitUsd < 0)
+            {
+                LogFile.Write(
+                    $"💥 Violent counter reversal → EXIT {t.Ticket} | " +
+                    $"symbol={t.Symbol}, profit={t.ProfitUsd:F2}, " +
+                    $"adverseAtr={adverseAtr:F2}, " +
+                    $"bodyAtr={bodyAtr:F2}"
+                );
+
+                return true;
+            }
+
+            // --------------------------------------------------
+            // 🆕 EARLY LOSS FAILURE
+            //
+            // Prevents a steadily failing trade from reaching
+            // the $10-$12 emergency stop simply because the
+            // reversal was not violent enough.
+            // --------------------------------------------------
+
+            double earlyLossLimit =
+                IsGold(t.Symbol) ? -5.00 :
+                IsCrypto(t.Symbol) ? -4.00 :
+                IsIndex(t.Symbol) ? -4.00 :
+                -3.00; // FX
+
+            bool priceFailedEma =
+                t.Side == TradeSide.Buy
+                    ? c0.close < ema9
+                    : c0.close > ema9;
+
+            bool earlyLossFailure =
+                t.ProfitUsd <= earlyLossLimit &&
+                adverseAtr >= 0.20 &&
+                priceFailedEma;
+
+            if (earlyLossFailure)
+            {
+                LogFile.Write(
+                    $"🚨 Early loss failure → EXIT {t.Ticket} | " +
+                    $"symbol={t.Symbol}, profit={t.ProfitUsd:F2}, " +
+                    $"limit={earlyLossLimit:F2}, " +
+                    $"adverseAtr={adverseAtr:F2}, " +
+                    $"bodyAtr={bodyAtr:F2}"
+                );
+
+                return true;
+            }
+
+            // --------------------------------------------------
+            // 🧠 STRONG TREND DETECTION
+            // --------------------------------------------------
 
             double strongTrendMomentum =
                 IsCrypto(t.Symbol) ? 1.8 :
                 IsGold(t.Symbol) ? 1.6 :
                 IsIndex(t.Symbol) ? 1.5 :
-                1.4;   // FX
+                1.4; // FX
 
             bool strongTrend =
-                (t.Side == TradeSide.Sell &&
-                 ema9 < ema21 &&
-                 currentMomentum > strongTrendMomentum)
-            ||
-                (t.Side == TradeSide.Buy &&
-                 ema9 > ema21 &&
-                 currentMomentum > strongTrendMomentum);
+                (
+                    t.Side == TradeSide.Sell &&
+                    ema9 < ema21 &&
+                    currentMomentum > strongTrendMomentum
+                )
+                ||
+                (
+                    t.Side == TradeSide.Buy &&
+                    ema9 > ema21 &&
+                    currentMomentum > strongTrendMomentum
+                );
 
-            // 🔥 PROTECT STRONG TRADES
+            // --------------------------------------------------
+            // 🛡 PROTECT STRONG TRADES
+            // --------------------------------------------------
+
             if (strongTrend &&
-                 !failedBreakout &&
-                 t.ProfitUsd > -2)
+                !failedBreakout &&
+                !violentCounterReversal &&
+                !earlyLossFailure &&
+                t.ProfitUsd > -2)
             {
-                LogFile.Write($"🛡 Strong trend → skip weak-exit logic {t.Ticket}");
+                LogFile.Write(
+                    $"🛡 Strong trend → skip weak-exit logic {t.Ticket}"
+                );
+
                 return false;
             }
 
-            bool smallCandle =
-                Math.Abs(c0.close - c0.open) < atr * 0.5;
+            // --------------------------------------------------
+            // 🧠 SMALL CANDLE / TREND CONTINUATION
+            // --------------------------------------------------
 
-            if (strongTrend && smallCandle)
+            bool smallCandle =
+                body < atr * 0.50;
+
+            if (strongTrend &&
+                smallCandle &&
+                !failedBreakout &&
+                !violentCounterReversal &&
+                !earlyLossFailure &&
+                t.ProfitUsd > -2)
             {
-                LogFile.Write($"🧠 Holding trade - trend continuation {t.Ticket}");
+                LogFile.Write(
+                    $"🧠 Holding trade - trend continuation {t.Ticket}"
+                );
+
                 return false;
             }
 
@@ -96,37 +229,47 @@ namespace MetaTrader.Services.Helper
             // --------------------------------------------------
 
             bool confirmedWeakness =
-                (t.Side == TradeSide.Sell &&
-                 c0.close > c0.open &&
-                 c1.close > c1.open)
+                (
+                    t.Side == TradeSide.Sell &&
+                    c0.close > c0.open &&
+                    c1.close > c1.open
+                )
                 ||
-                (t.Side == TradeSide.Buy &&
-                 c0.close < c0.open &&
-                 c1.close < c1.open);
+                (
+                    t.Side == TradeSide.Buy &&
+                    c0.close < c0.open &&
+                    c1.close < c1.open
+                );
 
             // --------------------------------------------------
-            // 🔥 NEW - FAILED BREAKOUT DETECTION
+            // 🔥 FAILED BREAKOUT EXIT
             // --------------------------------------------------
-
 
             if (failedBreakout && t.ProfitUsd < 2)
             {
-                LogFile.Write($"⚠️ Failed breakout detected → EXIT {t.Ticket}");
+                LogFile.Write(
+                    $"⚠️ Failed breakout detected → EXIT {t.Ticket}"
+                );
+
                 return true;
             }
 
             // --------------------------------------------------
-            // 🔥 NEW - IMMEDIATE MOMENTUM FAILURE
+            // 🔥 IMMEDIATE MOMENTUM FAILURE
             // --------------------------------------------------
 
             bool immediateMomentumFailure =
                 moveFromEntry < atr * 0.25 &&
-                adverseMove > atr * 0.20 &&
+                adverseAtr > 0.20 &&
                 currentMomentum < previousMomentum * 0.75;
 
-            if (immediateMomentumFailure && t.ProfitUsd < 2)
+            if (immediateMomentumFailure &&
+                t.ProfitUsd < 2)
             {
-                LogFile.Write($"⚠️ Immediate momentum failure → EXIT {t.Ticket}");
+                LogFile.Write(
+                    $"⚠️ Immediate momentum failure → EXIT {t.Ticket}"
+                );
+
                 return true;
             }
 
@@ -135,14 +278,17 @@ namespace MetaTrader.Services.Helper
             // --------------------------------------------------
 
             bool noFollowThrough =
-                moveFromEntry < atr * 0.5 &&
+                moveFromEntry < atr * 0.50 &&
                 currentMomentum < previousMomentum;
 
             if (noFollowThrough &&
                 confirmedWeakness &&
                 t.ProfitUsd < 3)
             {
-                LogFile.Write($"⚠️ Weak trade (confirmed no follow-through) → EXIT {t.Ticket}");
+                LogFile.Write(
+                    $"⚠️ Weak trade (confirmed no follow-through) → EXIT {t.Ticket}"
+                );
+
                 return true;
             }
 
@@ -159,7 +305,10 @@ namespace MetaTrader.Services.Helper
                 confirmedWeakness &&
                 t.ProfitUsd < 5)
             {
-                LogFile.Write($"⚠️ EMA failure (confirmed) → EXIT {t.Ticket}");
+                LogFile.Write(
+                    $"⚠️ EMA failure (confirmed) → EXIT {t.Ticket}"
+                );
+
                 return true;
             }
 
@@ -168,18 +317,25 @@ namespace MetaTrader.Services.Helper
             // --------------------------------------------------
 
             bool twoOppositeCandles =
-                (t.Side == TradeSide.Sell &&
-                 c0.close > c0.open &&
-                 c1.close > c1.open)
+                (
+                    t.Side == TradeSide.Sell &&
+                    c0.close > c0.open &&
+                    c1.close > c1.open
+                )
                 ||
-                (t.Side == TradeSide.Buy &&
-                 c0.close < c0.open &&
-                 c1.close < c1.open);
+                (
+                    t.Side == TradeSide.Buy &&
+                    c0.close < c0.open &&
+                    c1.close < c1.open
+                );
 
             if (twoOppositeCandles &&
                 t.ProfitUsd < 5)
             {
-                LogFile.Write($"⚠️ Double counter candles → EXIT {t.Ticket}");
+                LogFile.Write(
+                    $"⚠️ Double counter candles → EXIT {t.Ticket}"
+                );
+
                 return true;
             }
 
@@ -195,7 +351,10 @@ namespace MetaTrader.Services.Helper
                 confirmedWeakness &&
                 t.ProfitUsd < 5)
             {
-                LogFile.Write($"⚠️ Momentum collapse (confirmed) → EXIT {t.Ticket}");
+                LogFile.Write(
+                    $"⚠️ Momentum collapse (confirmed) → EXIT {t.Ticket}"
+                );
+
                 return true;
             }
 
@@ -204,25 +363,41 @@ namespace MetaTrader.Services.Helper
 
         private static bool IsGold(string symbol)
         {
-            return symbol.Contains("XAU") || symbol.Contains("XAG");
+            string s =
+                symbol?.ToUpperInvariant() ?? "";
+
+            return
+                s.Contains("XAU") ||
+                s.Contains("XAG") ||
+                s.Contains("GOLD") ||
+                s.Contains("SILVER");
         }
 
         private static bool IsCrypto(string symbol)
         {
-            return symbol.Contains("BTC") ||
-                   symbol.Contains("ETH") ||
-                   symbol.Contains("SOL") ||
-                   symbol.Contains("BNB") ||
-                   symbol.Contains("XRP") ||
-                   symbol.Contains("ADA");
+            string s =
+                symbol?.ToUpperInvariant() ?? "";
+
+            return
+                s.Contains("BTC") ||
+                s.Contains("ETH") ||
+                s.Contains("SOL") ||
+                s.Contains("BNB") ||
+                s.Contains("XRP") ||
+                s.Contains("ADA");
         }
 
         private static bool IsIndex(string symbol)
         {
-            return symbol.Contains("US100") ||
-                   symbol.Contains("NAS") ||
-                   symbol.Contains("US30") ||
-                   symbol.Contains("SPX");
+            string s =
+                symbol?.ToUpperInvariant() ?? "";
+
+            return
+                s.Contains("US100") ||
+                s.Contains("NAS") ||
+                s.Contains("US30") ||
+                s.Contains("US500") ||
+                s.Contains("SPX");
         }
     }
 }

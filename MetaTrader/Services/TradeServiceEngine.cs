@@ -33,6 +33,7 @@ using Telegram.Bot.Types;
 using static MetaTrader.Services.ExitTrade;
 using static MetaTrader.Services.Helper.TransitionZoneEngine;
 using static MetaTrader.Services.HybridMomentumEngine;
+using static MetaTrader.Services.TradeServiceEngine;
 using static System.Collections.Specialized.BitVector32;
 using static System.Runtime.InteropServices.JavaScript.JSType;
 
@@ -267,6 +268,36 @@ namespace MetaTrader.Services
             }
         }
 
+        public void CheckRecentlyClosedPositions()
+        {
+            foreach (var item in openTrades.ToList())
+            {
+                ulong ticket = item.Ticket;
+                TrackedTrade trade = item;
+
+                bool stillOpen = _client.PositionSelectByTicket(ticket);
+
+                if (stillOpen)
+                    continue;
+
+                LogFile.Write(
+                    $"[{trade.Symbol}] Position disappeared | " +
+                    $"ticket={ticket} | checking close reason...");
+
+                CheckCloseReason(trade);
+
+                openTrades.Clear();
+            }
+        }
+
+        private void CheckCloseReason(TrackedTrade trade)
+        {
+            LogFile.Write(
+                $"[{trade.Symbol}] CLOSED | " +
+                $"ticket={trade.Ticket} | " +
+                $"OriginalSL={trade.StopLoss} | " +
+                $"OriginalTP={trade.TakeProfit}");
+        }
         public async void connect(Func<object, Task> onMessageReceived)
         {
             if (pollTimer != null)
@@ -427,6 +458,7 @@ namespace MetaTrader.Services
 
         }
 
+        private bool summaryPrinted = false;
         public async void checkTradingWindow(bool isIIS, CancellationToken ct)
         {
             DateTime now = DateTime.Now;
@@ -435,6 +467,7 @@ namespace MetaTrader.Services
 
             if (TradingWindow.IsTradingWindow(now))
             {
+                summaryPrinted = false;
                 Console.WriteLine($"[{now}] In trading window → running trading logic...");
                 LogFile.Write($"[{now}] In trading window → running trading logic...");
                 bool startTrade = await TradingWindow.RunTradingTickAsync();
@@ -446,6 +479,8 @@ namespace MetaTrader.Services
             }
             else
             {
+
+
                 // Just log and return.
                 var day = now.DayOfWeek;
                 if (day == DayOfWeek.Sunday)
@@ -457,12 +492,56 @@ namespace MetaTrader.Services
                 }
                 else
                 {
+                    await ManageOpenTradesOutsideTradingWindow();
                     LogFile.Write($"[{now}] Outside trading window. Next start");
                     Console.WriteLine($"[{now}] Outside trading window. Next start");
+                }
+
+
+                if (!summaryPrinted)
+                {
+                    _performanceAnalyzer.PrintSummary();
+                    _performanceAnalyzer.PrintDetailedSummary();
+                    summaryPrinted = true;
                 }
             }
         }
 
+        private async Task ManageOpenTradesOutsideTradingWindow()
+        {
+            // Close all open trades
+            foreach (var trade in openTrades.ToList())
+            {
+                   if (HasAnyOpenPositionBySymbol(trade.Symbol))
+                   {
+                    var bid = _client.SymbolInfoDouble(trade.Symbol, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_BID);
+                    var ask = _client.SymbolInfoDouble(trade.Symbol, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_ASK);
+                    var mid = (bid + ask) / 2.0;
+
+                    _client.CopyRates(trade.Symbol, ENUM_TIMEFRAMES.PERIOD_H1, 1, BarsToFetch, out var rates1H);
+                    var last = rates1H[^1];
+                    var prev = rates1H[^2];
+
+                    var emaFast1H = CalculateEMA(rates1H, 9);
+                    var emaSlow1H = CalculateEMA(rates1H, 21);
+                    double atrRaw = CalculateATR(rates1H, 14);
+
+                    MomentumResult momentum = HybridMomentumEngine.Calculate(last, prev, rates1H, emaFast1H, emaSlow1H, atrRaw, false);
+
+
+                    await ManageOpenTrades(
+                            mid,
+                            bid,
+                            ask,
+                            rates1H,
+                            ctx,
+                            momentum,
+                            currentSignal == "BUY" ? true :
+                            currentSignal == "SELL" ? false : null
+                        );
+                   }
+            }
+        }
         enum PositionSide { Buy, Sell, None }
 
         async void showBalances()
@@ -1033,74 +1112,12 @@ namespace MetaTrader.Services
             {
                 if (!HasAnyOpenPositionBySymbol(trackedTrade.Symbol))
                 {
-                    LogFile.Write("🔓 No open positions found on tracked symbols — releasing stale global lock");
+                    LogFile.Write($"🔓 No open positions found on tracked symbols — releasing stale global lock {trackedTrade.Symbol}");
                     await generalCloseTrade(bid, ask, ctx);
                     return;
                 }
             }
 
-            if (trackedTrade != null)
-            {
-                GoldBreakEvenLock.Apply(trackedTrade, mid, atrRaw, ModifyTrade);
-                if (LiveAdverseMoveGuard.ShouldClose(
-                    trackedTrade,
-                    trackedTrade.Symbol,
-                    bid,
-                    ask,
-                    atrRaw,
-                    rates1H,
-                    emaFast1H,
-                    emaSlow1H))
-                {
-                    await generalCloseTrade(bid, ask, ctx);
-                    return;
-                }
-            }
-
-            if (trackedTrade != null)
-            {
-
-                PerTradeEquityLossGuard.Arm(
-                    trackedTrade.Ticket,
-                    trackedTrade.Symbol,
-                    accountEquity
-                );
-
-
-                if (PerTradeEquityLossGuard.ShouldClose(trackedTrade.Ticket, trackedTrade.Symbol, accountEquity))
-                {
-                    try
-                    {
-                        LogFile.Write("DEBUG: Before generalCloseTrade");
-
-                        await generalCloseTrade(bid, ask, ctx);
-
-                        LogFile.Write("DEBUG: After generalCloseTrade");
-                    }
-                    catch (Exception ex)
-                    {
-                        LogFile.Write($"❌ generalCloseTrade crash: {ex}");
-                    }
-
-                    PerTradeEquityLossGuard.Reset(trackedTrade.Ticket);
-                    return;
-                }
-
-            }
-
-            if (trackedTrade != null)
-            {
-
-                if (EquityGivebackProtection.ShouldCloseAll(accountEquity, "FTMO10K"))
-                {
-                    LogFile.Write($"🛑 EQUITY GIVEBACK STOP: equity={accountEquity:F2} startingEquity={startingEquity:F2}");
-                    PostExitCooldown.RegisterForcedExit(SYMBOL); // 👈 memory added
-                    await generalCloseTrade(bid, ask, ctx);
-                    EquityGivebackProtection.Reset(accountEquity);
-
-                    return;
-                }
-            }
             // =========================================================
             // 🛡️ RESET TRADE
             // =========================================================
@@ -1180,23 +1197,7 @@ namespace MetaTrader.Services
                     _client.PositionGetDouble(ENUM_POSITION_PROPERTY_DOUBLE.POSITION_PROFIT);
                     TradeTrackingService.UpdateProfit(trackedTrade.Ticket, trackedTrade.ProfitUsd);
                     double currentPrice = rates1H[^1].close;
-                    var (shouldExit, reason) =
-                        TradeTrackingService.EvaluateStallExit(
-                            trackedTrade.Ticket,
-                            SYMBOL,
-                            trackedTrade.ProfitUsd,
-                            momentum.Hybrid,
-                            trackedTrade.EntryPrice,
-                            currentPrice,
-                            atrRaw,
-                            rates1H
-                        );
-
-                    if (shouldExit)
-                    {
-                        LogFile.Write($"{reason}");
-                        await generalCloseTrade(bid, ask, ctx);
-                    }
+                    
                 }
 
                 bid = _client.SymbolInfoDouble(ctx.Symbol, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_BID);
@@ -1212,28 +1213,6 @@ namespace MetaTrader.Services
                     currentSignal == "BUY" ? true :
                     currentSignal == "SELL" ? false : null
                 );
-
-                double emaCurrentFast = emaFast1H[^1];
-                if (MomentumFailureExit.ShouldForceExit(
-                    trackedTrade,
-                    trackedTrade.Symbol,
-                    trackerTradeRates1H,
-                    emaCurrentFast,
-                    atrRaw))
-                {
-                    TradeServiceEngine.closingTrade = true;
-                    LogFile.Write($"[{trackedTrade.Symbol}] Early exit: momentum failure");
-                    return;
-                }
-
-                HandleLiveEma9Exit(
-                    trackedTrade.Symbol,
-                    trackedTrade,
-                    _client,
-                    atrRaw,
-                    emaFast1H,
-                    emaSlow1H,
-                    ctx);
 
                 return;
             }
@@ -1412,9 +1391,7 @@ namespace MetaTrader.Services
 
                         double dailyPnL = await _profitEngine.GetDailyProfit();
 
-                        if (!HardRiskGuardEngine.CanEnter(dailyPnL))
-                            return;
-
+                       
                         await OpenTrade(
                             fastAction == TradeAction.EnterBuy ? TradeSide.Buy : TradeSide.Sell,
                             fastAction == TradeAction.EnterBuy ? ask : bid,
@@ -1612,8 +1589,7 @@ namespace MetaTrader.Services
                             }
 
                             double dailyPnL = await _profitEngine.GetDailyProfit();
-                            if (!HardRiskGuardEngine.CanEnter(dailyPnL))
-                                return;
+                           
 
                             await OpenTrade(
                                 action == TradeAction.EnterBuy ? TradeSide.Buy : TradeSide.Sell,
@@ -2321,122 +2297,446 @@ namespace MetaTrader.Services
             return overlapCount < lookahead * 0.8;
         }
 
-        public async Task OpenTrade(TradeSide side, double price, LotSizingMode sizingMode, 
-                                     EntryModel entry, MqlRates[] rates1H, TradeDecision tradeDecision, 
-                                      TransitionResult transition, MetaTrader.Services.TradeType tradeType)
+        private static readonly TradePerformanceAnalyzer
+                 _performanceAnalyzer =
+                   new TradePerformanceAnalyzer();
+        public async Task OpenTrade(
+            TradeSide side,
+            double price,
+            LotSizingMode sizingMode,
+            EntryModel entry,
+            MqlRates[] rates1H,
+            TradeDecision tradeDecision,
+            TransitionResult transition,
+            MetaTrader.Services.TradeType tradeType)
         {
+            // ============================================================
+            // MARKET INFORMATION
+            // ============================================================
 
-            double point = _client.SymbolInfoDouble(SYMBOL, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_POINT);
-            double atr = CalculateATR(rates1H, 14);
+            double point =
+                _client.SymbolInfoDouble(
+                    SYMBOL,
+                    ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_POINT
+                );
 
-            var sltp = SlTpProfileEngine.GetSlTp(SYMBOL, atr, point, tradeType);
+            double atr =
+                CalculateATR(
+                    rates1H,
+                    14
+                );
 
-            int stopLossPoints = sltp.StopLossPoints;
-            int takeProfitPoints = sltp.TakeProfitPoints;
 
-            var (sl, tp) = SlTpPriceBuilder.BuildPrices(
-                side,
-                price,
-                sltp
-            );
+            // ============================================================
+            // SL / TP PROFILE
+            // ============================================================
 
-            int digits = (int)_client.SymbolInfoInteger(SYMBOL, ENUM_SYMBOL_INFO_INTEGER.SYMBOL_DIGITS);
+            var sltp =
+                SlTpProfileEngine.GetSlTp(
+                    SYMBOL,
+                    atr,
+                    point,
+                    tradeType
+                );
 
-            sl = Math.Round(sl, digits);
-            tp = Math.Round(tp, digits);
+            int stopLossPoints =
+                sltp.StopLossPoints;
 
-            ENUM_ORDER_TYPE_FILLING filling = ENUM_ORDER_TYPE_FILLING.ORDER_FILLING_IOC;
+            int takeProfitPoints =
+                sltp.TakeProfitPoints;
 
-            double equity = _client.AccountInfoDouble(ENUM_ACCOUNT_INFO_DOUBLE.ACCOUNT_EQUITY);
 
-            var decision = DynamicLotSizingHelper.Calculate(
-                SYMBOL,
-                equity,
-                price,
-                (double)sl,
-                ctx.AtrPercentile,
-                tradeDecision.Momentum > 4.0
-            );
+            var (sl, tp) =
+                SlTpPriceBuilder.BuildPrices(
+                    side,
+                    price,
+                    sltp
+                );
 
+
+            int digits =
+                (int)_client.SymbolInfoInteger(
+                    SYMBOL,
+                    ENUM_SYMBOL_INFO_INTEGER.SYMBOL_DIGITS
+                );
+
+
+            sl =
+                Math.Round(
+                    sl,
+                    digits
+                );
+
+            tp =
+                Math.Round(
+                    tp,
+                    digits
+                );
+
+
+            // ============================================================
+            // FILLING MODE
+            // ============================================================
+
+            ENUM_ORDER_TYPE_FILLING filling =
+                ENUM_ORDER_TYPE_FILLING.ORDER_FILLING_IOC;
+
+
+            // ============================================================
+            // ACCOUNT EQUITY
+            // ============================================================
+
+            double equity =
+                _client.AccountInfoDouble(
+                    ENUM_ACCOUNT_INFO_DOUBLE.ACCOUNT_EQUITY
+                );
+
+
+            // ============================================================
+            // LOT SIZING
+            // ============================================================
+
+            var decision =
+                DynamicLotSizingHelper.Calculate(
+                    SYMBOL,
+                    equity,
+                    price,
+                    (double)sl,
+                    ctx.AtrPercentile,
+                    tradeDecision.Momentum > 4.0
+                );
+
+
+            // Your existing 70% reduction
             decision.Lot =
-               Math.Max(
-                   0.01,
-                   Math.Floor(
-                       ((double)decision.Lot * 0.7) * 100
-                   ) / 100);
+                Math.Max(
+                    0.01,
+                    Math.Floor(
+                        ((double)decision.Lot * 0.7) * 100
+                    ) / 100
+                );
 
-            var request = new MqlTradeRequest
-            {
-                Action = ENUM_TRADE_REQUEST_ACTIONS.TRADE_ACTION_DEAL,
-                Symbol = SYMBOL,
-                Volume = (double)decision.Lot,
-                Type = side == TradeSide.Buy ? ENUM_ORDER_TYPE.ORDER_TYPE_BUY : ENUM_ORDER_TYPE.ORDER_TYPE_SELL,
-                Price = price,
-                Sl = sl,
-                Tp = tp,
-                Deviation = 100,
-                Type_filling = filling,
-                Magic = (ulong)MAGIC_NUMBER,
-                Comment = "EMA closed-candle"
-            };
 
-            if (_client.OrderSend(request, out MqlTradeResult result) && result != null)
+            double finalLot =
+                (double)decision.Lot;
+
+
+            // ============================================================
+            // CALCULATE ACTUAL PLANNED RISK IN USD
+            //
+            // IMPORTANT:
+            // Uses FINAL LOT SIZE actually being sent to MT5.
+            // ============================================================
+
+            double tickSize =
+                _client.SymbolInfoDouble(
+                    SYMBOL,
+                    ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_TRADE_TICK_SIZE
+                );
+
+            double tickValue =
+                _client.SymbolInfoDouble(
+                    SYMBOL,
+                    ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_TRADE_TICK_VALUE
+                );
+
+
+            double stopDistance =
+                Math.Abs(
+                    price - sl
+                );
+
+
+            double riskUsd = 0;
+
+
+            if (tickSize > 0 &&
+                tickValue > 0 &&
+                stopDistance > 0)
             {
-                TradeServiceEngine.closingTrade = false;
-                ticket = result.Order;
-                //await streamMessage<string>("string", "output", $"Order placed. Side={side}, Ticket={ticket}, Volume={finalLot}, Entry={price}, SL={sl}, TP={tp}");
-                // track it locally
-                var trade = new Trade
+                double numberOfTicks =
+                    stopDistance /
+                    tickSize;
+
+
+                riskUsd =
+                    numberOfTicks *
+                    tickValue *
+                    finalLot;
+            }
+
+
+            LogFile.Write(
+                $"[{SYMBOL}] 📐 ENTRY RISK | " +
+                $"side={side} | " +
+                $"entry={price:F5} | " +
+                $"SL={sl:F5} | " +
+                $"distance={stopDistance:F5} | " +
+                $"tickSize={tickSize:F5} | " +
+                $"tickValue={tickValue:F5} | " +
+                $"lot={finalLot:F2} | " +
+                $"riskUsd={riskUsd:F2}"
+            );
+
+
+            // ============================================================
+            // TRADE REQUEST
+            // ============================================================
+
+            var request =
+                new MqlTradeRequest
                 {
-                    Ticket = ticket,
-                    Symbol = SYMBOL,
-                    Side = side.ToString(),
-                    OpenTime = DateTime.UtcNow,
-                    EntryPrice = price,
-                    Volume = (double)decision.Lot,
-                    StopLoss = sl,
-                    IsClosed = false,
-                    TakeProfit = tp,
-                    PeakOrTrough = price, // initialize peak/trough to entry price
-                    Model = entry,
-                    IsProven = false
+                    Action =
+                        ENUM_TRADE_REQUEST_ACTIONS.TRADE_ACTION_DEAL,
+
+                    Symbol =
+                        SYMBOL,
+
+                    Volume =
+                        finalLot,
+
+                    Type =
+                        side == TradeSide.Buy
+                            ? ENUM_ORDER_TYPE.ORDER_TYPE_BUY
+                            : ENUM_ORDER_TYPE.ORDER_TYPE_SELL,
+
+                    Price =
+                        price,
+
+                    Sl =
+                        sl,
+
+                    Tp =
+                        tp,
+
+                    Deviation =
+                        100,
+
+                    Type_filling =
+                        filling,
+
+                    Magic =
+                        (ulong)MAGIC_NUMBER,
+
+                    Comment =
+                        "EMA closed-candle"
                 };
 
-                var tracked = new TrackedTrade
-                {
-                    Ticket = ticket,
-                    Symbol = SYMBOL,
-                    Side = side,
-                    MaxProfitUsd = 0,
-                    ProfitUsd = 0,
-                    OpenTime = DateTime.UtcNow,
-                    EntryPrice = price,
-                    Volume = (double)decision.Lot,
-                    StopLoss = sl,
-                    IsClosed = false,
-                    TakeProfit = tp,
-                    PeakOrTrough = price, // initialize peak/trough to entry price
-                    Model = entry,
-                    EntryCandleTime = rates1H[^1].time,
-                    CandlesSinceEntry = 0,
-                    IsProven = false
-                };
-                openTrades.Add(tracked);
-                if (globalEntryModel == EntryModel.TrendRideContinuation) TradeTrackingService.RegisterTrade(ticket);
-                if (globalEntryModel == EntryModel.TrendRideContinuation) TradeTrackingService.RegisterTrade(ticket);
-                TradingEventBus.ActiveTrade(trade);
+
+            // ============================================================
+            // SEND ORDER
+            // ============================================================
+
+            if (_client.OrderSend(
+                    request,
+                    out MqlTradeResult result) &&
+                result != null)
+            {
+                // ========================================================
+                // IMPORTANT:
+                // SET TICKET BEFORE REGISTERING ANALYZER
+                // ========================================================
+
+                ticket =
+                    result.Order;
+
+
+                // ========================================================
+                // ACTUAL FILLED ENTRY PRICE
+                //
+                // If MT5 returns a valid execution price, use it.
+                // Otherwise use requested price.
+                // ========================================================
+
+                double actualEntryPrice =
+                    result.Price > 0
+                        ? result.Price
+                        : price;
+
+
+                TradeServiceEngine.closingTrade =
+                    false;
+
+
+                // ========================================================
+                // REGISTER WITH PERFORMANCE ANALYZER
+                // ========================================================
+
+                _performanceAnalyzer.RegisterTrade(
+                    ticket,
+                    SYMBOL,
+
+                    // Your parameter is named "entry"
+                    entry.ToString(),
+
+                    side == TradeSide.Buy
+                        ? "Buy"
+                        : "Sell",
+
+                    actualEntryPrice,
+
+                    atr,
+
+                    sl,
+
+                    riskUsd
+                );
+
+
+                LogFile.Write(
+                    $"[{SYMBOL}] 📊 ANALYZER TRADE REGISTERED | " +
+                    $"ticket={ticket} | " +
+                    $"model={entry} | " +
+                    $"side={side} | " +
+                    $"entry={actualEntryPrice:F5} | " +
+                    $"lot={finalLot:F2} | " +
+                    $"SL={sl:F5} | " +
+                    $"TP={tp:F5} | " +
+                    $"initialRisk=${riskUsd:F2}"
+                );
+
+
+                // ========================================================
+                // NORMAL TRADE OBJECT
+                // ========================================================
+
+                var trade =
+                    new Trade
+                    {
+                        Ticket =
+                            ticket,
+
+                        Symbol =
+                            SYMBOL,
+
+                        Side =
+                            side.ToString(),
+
+                        OpenTime =
+                            DateTime.UtcNow,
+
+                        EntryPrice =
+                            actualEntryPrice,
+
+                        Volume =
+                            finalLot,
+
+                        StopLoss =
+                            sl,
+
+                        IsClosed =
+                            false,
+
+                        TakeProfit =
+                            tp,
+
+                        PeakOrTrough =
+                            actualEntryPrice,
+
+                        Model =
+                            entry,
+
+                        IsProven =
+                            false
+                    };
+
+
+                // ========================================================
+                // TRACKED TRADE
+                // ========================================================
+
+                var tracked =
+                    new TrackedTrade
+                    {
+                        Ticket =
+                            ticket,
+
+                        Symbol =
+                            SYMBOL,
+
+                        Side =
+                            side,
+
+                        MaxProfitUsd =
+                            0,
+
+                        ProfitUsd =
+                            0,
+
+                        OpenTime =
+                            DateTime.UtcNow,
+
+                        EntryPrice =
+                            actualEntryPrice,
+
+                        Volume =
+                            finalLot,
+
+                        StopLoss =
+                            sl,
+
+                        IsClosed =
+                            false,
+
+                        TakeProfit =
+                            tp,
+
+                        PeakOrTrough =
+                            actualEntryPrice,
+
+                        Model =
+                            entry,
+
+                        EntryCandleTime =
+                            rates1H[^1].time,
+
+                        CandlesSinceEntry =
+                            0,
+
+                        IsProven =
+                            false
+                    };
+
+
+                // ========================================================
+                // ADD TO LOCAL OPEN TRADE LIST
+                // ========================================================
+
+                openTrades.Add(
+                    tracked
+                );
+
+                // ========================================================
+                // EVENT BUS
+                // ========================================================
+
+                TradingEventBus.ActiveTrade(
+                    trade
+                );
             }
             else
             {
-                await streamMessage<string>("string", "output", "OrderSend failed or returned null result.");
-                Console.WriteLine("OrderSend failed or returned null result.");
-                LogFile.Write("OrderSend failed or returned null result.");
-                await _notificationService.sendNotification($"OrderSend failed or returned null result. {result}", _configuration.GetValue<string>("CHAT_ID"), _configuration.GetValue<string>("BOT_TOKEN"));
+                await streamMessage<string>(
+                    "string",
+                    "output",
+                    "OrderSend failed or returned null result."
+                );
 
+                Console.WriteLine(
+                    "OrderSend failed or returned null result."
+                );
+
+                LogFile.Write(
+                    "OrderSend failed or returned null result."
+                );
+
+                await _notificationService.sendNotification(
+                    $"OrderSend failed or returned null result. {result}",
+                    _configuration.GetValue<string>("CHAT_ID"),
+                    _configuration.GetValue<string>("BOT_TOKEN")
+                );
             }
-
         }
-
 
         static DateTime lastH1CandleTime = DateTime.MinValue;
         private static DateTime _lastWeeklyPrintDate = DateTime.MinValue;
@@ -3101,240 +3401,365 @@ namespace MetaTrader.Services
         public int CandlesSinceEntry { get; set; }
 
         private static int barsSinceEntry = 0;
-        static async Task ManageOpenTrades(
-            double midPrice,
-            double bid,
-            double ask,
-            MqlRates[] rates1Hr,
-            SymbolContext ctx,
-            MomentumResult momentumResult,
-            bool? isBuy = null)
+
+        private static string closingTradeReason = "";
+
+        private static void RequestTradeClose(string reason)
         {
-            double atr = CalculateATR(rates1Hr, 14);
-            double[] emaFast1H = CalculateEMAUpdate(rates1Hr, 9);
-            double[] emaSlow1H = CalculateEMAUpdate(rates1Hr, 21);
+            closingTrade = true;
+            closingTradeReason = reason;
 
-            // --------------------------------------------------
-            // 🔥 1. ALWAYS SYNC OPEN TRADES FIRST
-            // --------------------------------------------------
-            List<long> mt5Tickets = GetAllOpenPositionTickets();
+            LogFile.Write(
+                $"🚨 CLOSE REQUESTED | reason={reason}"
+            );
+        }
 
-            if (openTrades.Count == 0 && mt5Tickets.Count > 0)
-            {
-                long ticket = mt5Tickets.First();
-
-                _client.PositionSelectByTicket((ulong)ticket);
-
-                openTrades.Add(new TrackedTrade
-                {
-                    Ticket = (ulong)ticket,
-                    Symbol = _client.PositionGetString(ENUM_POSITION_PROPERTY_STRING.POSITION_SYMBOL),
-                    EntryPrice = _client.PositionGetDouble(ENUM_POSITION_PROPERTY_DOUBLE.POSITION_PRICE_OPEN),
-                    StopLoss = _client.PositionGetDouble(ENUM_POSITION_PROPERTY_DOUBLE.POSITION_SL),
-                    TakeProfit = _client.PositionGetDouble(ENUM_POSITION_PROPERTY_DOUBLE.POSITION_TP),
-                    Volume = _client.PositionGetDouble(ENUM_POSITION_PROPERTY_DOUBLE.POSITION_VOLUME),
-                    Side = _client.PositionGetInteger(ENUM_POSITION_PROPERTY_INTEGER.POSITION_TYPE)
-                        == (long)ENUM_POSITION_TYPE.POSITION_TYPE_BUY
-                        ? TradeSide.Buy
-                        : TradeSide.Sell,
-                    Model = EntryModel.Unknown
-                });
-            }
-
-            double dailyProfit = await _profitEngine.GetDailyProfit();
-            double maxDailyProfit = await _profitEngine.GetMaxProfit();
-
-
-            // 🔥 THIS LINE SAVES YOU
-            HardRiskGuardEngine.Protect(openTrades, dailyProfit, out bool closingTrade);
-            if (closingTrade)
-            {
-                TradeServiceEngine.closingTrade = true;
-                return;
-            }
-
-            // --------------------------------------------------
-            // 🔥 2. LOOP THROUGH TRADES (TOP PRIORITY EXIT FIRST)
-            // --------------------------------------------------
-            foreach (var t in openTrades.ToList())
-            {
-                var c0 = rates1Hr[^1];
-                t.LastCandleBodyUsd = Math.Abs(c0.close - c0.open);
-
-                if (!_client.PositionSelectByTicket(t.Ticket))
-                    continue;
-
-                // 🔥 ALWAYS UPDATE PROFIT FIRST
-                t.ProfitUsd = _client.PositionGetDouble(ENUM_POSITION_PROPERTY_DOUBLE.POSITION_PROFIT);
-
-                if (KillWeakTradeEngine.ShouldExit(
-                    t,
-                    midPrice,
-                    emaFast1H[^1],
-                    emaSlow1H[^1],
-                    ctx.CurrentMomentum,
-                    ctx.PreviousMomentum,
-                    rates1Hr, atr))
-                {
-                    TradeServiceEngine.closingTrade = true;
-                    continue;
-                }
-
-
-                DollarProfitProtectionEngine.Manage(t, midPrice, ModifyTrade, atr, ctx, out bool isClosingTrade);
-                if (isClosingTrade)
-                {
-                    LogFile.Write("EXIT ENGINE = DollarProtect");
-                    TradeServiceEngine.closingTrade = true;
-                    continue;
-                }
-
-                // 🔥 2. ALWAYS track + protect immediately
-                TrackPeakProfit(t);
-
-                double moveAtr = Math.Abs(t.EntryPrice - midPrice) / atr;
-
-                // 🔥 dynamic late threshold
-                double lateThreshold =
-                    IsGold(t.Symbol) ? 1.2 :
-                    IsCrypto(t.Symbol) ? 1.8 :
-                    IsIndex(t.Symbol) ? 1.5 :
-                    IsFx(t.Symbol) ? 1.0 :
-                    1.5;
-
-                bool isLateTrade = moveAtr > lateThreshold;
-
-                // 🔥 profit in ATR terms
-                double profitAtr = atr > 0 ? t.ProfitUsd / atr : 0;
-
-                double minProfitAtr =
-                    IsGold(t.Symbol) ? 0.5 :
-                    IsCrypto(t.Symbol) ? 0.7 :
-                    IsIndex(t.Symbol) ? 0.6 :
-                    IsFx(t.Symbol) ? 0.4 :
-                    0.5;
-
-                if (isLateTrade)
-                {
-                    if (profitAtr >= minProfitAtr &&
-                        t.ProfitUsd <= t.MaxProfitUsd - (t.MaxProfitUsd * 0.3)) // 30% giveback
-                    {
-                        LogFile.Write($"⚡ Late trade exit [{t.Symbol}] | moveAtr={moveAtr:F2}, profitAtr={profitAtr:F2}");
-                        TradeServiceEngine.closingTrade = true;
-                        continue;
-                    }
-                }
-
-                double netPosition = dailyProfit;
-
-                // 🔥 HARD FLOOR PROTECTION
-                if (maxDailyProfit > 20)
-                {
-                    double floor = 20;
-
-                    if (netPosition <= floor)
-                    {
-                        LogFile.Write(
-                            $"🛑 HARD FLOOR EXIT | net={netPosition:F2}, floor={floor}"
-                        );
-
-                        TradeServiceEngine.closingTrade = true;
-                        continue;
-                    }
-                }
-
-
-                if (await _profitEngine.IsLocked())
-                {
-                    // 🔥 tighten aggressively
-                    double aggressiveGiveback =
-                        IsGold(t.Symbol) ? 3 :
-                        IsIndex(t.Symbol) ? 5 :
-                        IsCrypto(t.Symbol) ? 4 :
-                        2;
-
-                    double floor = t.MaxProfitUsd - aggressiveGiveback;
-
-                    if (t.ProfitUsd <= floor)
-                    {
-                        LogFile.Write($"🔒 GLOBAL LOCK EXIT | profit={t.ProfitUsd:F2} max={t.MaxProfitUsd:F2}");
-                        TradeServiceEngine.closingTrade = true;
-                        continue;
-                    }
-                }
-                // --------------------------------------------------
-                // 🛑 3. PROFIT GIVEBACK (HIGHEST PRIORITY)
-                // --------------------------------------------------
-                if (ProfitGivebackProtection.ShouldClose(t))
-                {
-                    LogFile.Write($"🛑 GIVEBACK EXIT | ticket={t.Ticket} | profit={t.ProfitUsd:F2} | max={t.MaxProfitUsd:F2}");
-                    TradeServiceEngine.closingTrade = true;
-                    return;
-                }
-
-                // --------------------------------------------------
-                // 🛑 6. FAIL FAST
-                // --------------------------------------------------
-                if (FailFastExitEngine.ShouldExit(t, ask, bid, emaFast1H, rates1Hr, rates1Hr[^1].time, atr))
-                {
-                    LogFile.Write($"❌ FAIL FAST EXIT {t.Ticket}");
-                    TradeServiceEngine.closingTrade = true;
-                    continue;
-                }
-
-                // --------------------------------------------------
-                // 🛡 7. BREAK EVEN / TIGHTEN
-                // --------------------------------------------------
-                BreakEvenAndTightenEngine.Manage(
-                    SYMBOL,
-                    _client,
-                    t.Ticket,
-                    t.EntryPrice,
-                    t.Side == TradeSide.Buy ? bid : ask,
-                    t.StopLoss,
-                    t.ProfitUsd,
-                    t.Side == TradeSide.Buy ? TradeAction.EnterBuy : TradeAction.EnterSell
+        static async Task ManageOpenTrades(
+                            double midPrice,
+                            double bid,
+                            double ask,
+                            MqlRates[] rates1Hr,
+                            SymbolContext ctx,
+                            MomentumResult momentumResult,
+                            bool? isBuy = null)
+        {
+            double atr =
+                CalculateATR(
+                    rates1Hr,
+                    14
                 );
 
-                // --------------------------------------------------
-                // 📉 9. ATR TRAILING STOP
-                // --------------------------------------------------
-                AtrTrailingStopEngine.Apply(t, midPrice, atr, ModifyTrade);
-
-                // --------------------------------------------------
-                // ⚡ 5. VELOCITY EXIT
-                // --------------------------------------------------
-                var velocity = VelocityTradeGuard.Evaluate(
-                    t,
-                    t.Side == TradeSide.Buy,
-                    bid,
-                    ask,
-                    emaFast1H,
-                    emaSlow1H,
+            double[] emaFast1H =
+                CalculateEMAUpdate(
                     rates1Hr,
-                    false,
-                    false,
-                    false,
-                    atr);
+                    9
+                );
 
-                // --------------------------------------------------
-                // 🧠 8. TRADE MANAGEMENT ENGINE
-                // --------------------------------------------------
-                if (TradeManagementEngine.ShouldExit(
-                    SYMBOL,
-                    t.Side == TradeSide.Buy ? TradeAction.EnterBuy : TradeAction.EnterSell,
+            double[] emaSlow1H =
+                CalculateEMAUpdate(
                     rates1Hr,
-                    emaFast1H,
-                    emaSlow1H,
-                    ctx.CurrentMomentum,
-                    ctx.PreviousMomentum,
-                    momentumResult))
+                    21
+                );
+
+
+            // ==================================================
+            // 1. ALWAYS SYNC OPEN TRADES FIRST
+            // ==================================================
+
+            List<long> mt5Tickets =
+                GetAllOpenPositionTickets();
+
+
+            if (openTrades.Count == 0 &&
+                mt5Tickets.Count > 0)
+            {
+                long ticket =
+                    mt5Tickets.First();
+
+
+                if (_client.PositionSelectByTicket(
+                        (ulong)ticket))
                 {
-                    LogFile.Write($"❌ TradeManagement exit {t.Ticket}");
-                    TradeServiceEngine.closingTrade = true;
-                    return;
+                    openTrades.Add(
+                        new TrackedTrade
+                        {
+                            Ticket =
+                                (ulong)ticket,
+
+                            Symbol =
+                                _client.PositionGetString(
+                                    ENUM_POSITION_PROPERTY_STRING.POSITION_SYMBOL
+                                ),
+
+                            EntryPrice =
+                                _client.PositionGetDouble(
+                                    ENUM_POSITION_PROPERTY_DOUBLE.POSITION_PRICE_OPEN
+                                ),
+
+                            StopLoss =
+                                _client.PositionGetDouble(
+                                    ENUM_POSITION_PROPERTY_DOUBLE.POSITION_SL
+                                ),
+
+                            TakeProfit =
+                                _client.PositionGetDouble(
+                                    ENUM_POSITION_PROPERTY_DOUBLE.POSITION_TP
+                                ),
+
+                            Volume =
+                                _client.PositionGetDouble(
+                                    ENUM_POSITION_PROPERTY_DOUBLE.POSITION_VOLUME
+                                ),
+
+                            Side =
+                                _client.PositionGetInteger(
+                                    ENUM_POSITION_PROPERTY_INTEGER.POSITION_TYPE
+                                )
+                                ==
+                                (long)ENUM_POSITION_TYPE.POSITION_TYPE_BUY
+
+                                    ? TradeSide.Buy
+                                    : TradeSide.Sell,
+
+                            Model =
+                                EntryModel.Unknown
+                        }
+                    );
+                }
+            }
+
+
+            // ==================================================
+            // 2. LOOP THROUGH OPEN TRADES
+            // ==================================================
+
+            foreach (var t in openTrades.ToList())
+            {
+                if (!_client.PositionSelectByTicket(
+                        t.Ticket))
+                {
+                    continue;
                 }
 
+
+                // ==================================================
+                // UPDATE CURRENT PROFIT
+                // ==================================================
+
+                t.ProfitUsd =
+                    _client.PositionGetDouble(
+                        ENUM_POSITION_PROPERTY_DOUBLE.POSITION_PROFIT
+                    );
+
+
+                // ==================================================
+                // UPDATE CURRENT MT5 SL / TP
+                //
+                // Important:
+                // keep the tracked object synchronized with broker.
+                // ==================================================
+
+                t.StopLoss =
+                    _client.PositionGetDouble(
+                        ENUM_POSITION_PROPERTY_DOUBLE.POSITION_SL
+                    );
+
+                t.TakeProfit =
+                    _client.PositionGetDouble(
+                        ENUM_POSITION_PROPERTY_DOUBLE.POSITION_TP
+                    );
+
+
+                // ==================================================
+                // CURRENT CANDLE INFORMATION
+                // ==================================================
+
+                var c0 =
+                    rates1Hr[^1];
+
+                t.LastCandleBodyUsd =
+                    Math.Abs(
+                        c0.close -
+                        c0.open
+                    );
+
+
+                // ==================================================
+                // 3. UNIFIED RISK DECISION
+                // ==================================================
+
+                var riskDecision =
+                    UnifiedRiskManagementEngine.Evaluate(
+                        t,
+                        t.Symbol,
+                        bid,
+                        ask,
+                        atr,
+                        rates1Hr,
+                        emaFast1H,
+                        emaSlow1H
+                    );
+
+                _performanceAnalyzer.UpdateTrade(
+                    t.Ticket,
+                    t.ProfitUsd,
+                    riskDecision.Stage.ToString()
+                );
+
+                LogFile.Write(
+                    $"[{t.Symbol}] Unified Risk Decision | " +
+                    $"action={riskDecision.Action} | " +
+                    $"stage={riskDecision.Stage} | " +
+                    $"profit={t.ProfitUsd:F2} | " +
+                    $"peak={t.MaxProfitUsd:F2} | " +
+                    $"reason={riskDecision.Reason}"
+                );
+
+
+                // ==================================================
+                // 4. EXECUTE ONE RISK ACTION
+                // ==================================================
+
+                switch (riskDecision.Action)
+                {
+                    // ==============================================
+                    // HOLD
+                    // ==============================================
+
+                    case UnifiedRiskManagementEngine.RiskAction.Hold:
+                    {
+                            // Nothing to do.
+                            // Let the trade continue.
+
+                            break;
+                    }
+
+
+                    // ==============================================
+                    // MOVE STOP LOSS
+                    // ==============================================
+
+                    case UnifiedRiskManagementEngine.RiskAction.MoveStopLoss:
+                    {
+                            double oldSL =
+                                t.StopLoss;
+
+
+                            double newSL =
+                                riskDecision.NewStopLoss;
+
+
+                            LogFile.Write(
+                                $"[{t.Symbol}] 🔒 Unified Risk requesting SL move | " +
+                                $"ticket={t.Ticket} | " +
+                                $"oldSL={oldSL:F5} → " +
+                                $"newSL={newSL:F5}"
+                            );
+
+
+                            try
+                            {
+                                t.StopLoss =
+                                    newSL;
+
+
+                                // ==================================================
+                                // If ModifyTrade is SYNCHRONOUS:
+                                // ==================================================
+
+                                ModifyTrade(t);
+
+
+                                // Give MT5 a very short opportunity to process
+                                // the trade transaction before continuing.
+                                await Task.Delay(50);
+
+
+                                // ==================================================
+                                // Re-read broker SL after modification
+                                // ==================================================
+
+                                if (_client.PositionSelectByTicket(
+                                        t.Ticket))
+                                {
+                                    double brokerSL =
+                                        _client.PositionGetDouble(
+                                            ENUM_POSITION_PROPERTY_DOUBLE.POSITION_SL
+                                        );
+
+
+                                    t.StopLoss =
+                                        brokerSL;
+
+
+                                    LogFile.Write(
+                                        $"[{t.Symbol}] ✅ Unified Risk SL sync | " +
+                                        $"ticket={t.Ticket} | " +
+                                        $"brokerSL={brokerSL:F5}"
+                                    );
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                t.StopLoss =
+                                    oldSL;
+
+
+                                LogFile.Write(
+                                    $"[{t.Symbol}] ❌ Unified Risk SL failed | " +
+                                    $"ticket={t.Ticket} | " +
+                                    $"attemptedSL={newSL:F5} | " +
+                                    $"error={ex.Message}"
+                                );
+                            }
+
+
+                            break;
+                    }
+
+
+                    // ==============================================
+                    // CLOSE POSITION
+                    // ==============================================
+
+                    case UnifiedRiskManagementEngine.RiskAction.Close:
+                    {
+                            LogFile.Write(
+                                $"[{t.Symbol}] 🚨 UNIFIED RISK CLOSE REQUEST | " +
+                                $"ticket={t.Ticket} | " +
+                                $"profit={t.ProfitUsd:F2} | " +
+                                $"reason={riskDecision.Reason}"
+                            );
+
+                            TradeServiceEngine.closingTrade = true;
+
+                            double exitPrice =
+                                t.Side == TradeSide.Buy
+                                    ? bid
+                                    : ask;
+
+                            double realizedProfit =
+                                t.ProfitUsd;
+
+                            // Give the other close mechanism time to process.
+                            await Task.Delay(100);
+
+                            bool stillOpen =
+                                _client.PositionSelectByTicket(
+                                    t.Ticket
+                                );
+
+                            if (!stillOpen)
+                            {
+                                LogFile.Write(
+                                    $"[{t.Symbol}] ✅ Position confirmed closed | " +
+                                    $"ticket={t.Ticket}"
+                                );
+
+                                _performanceAnalyzer.CloseTrade(
+                                    t.Ticket,
+                                    exitPrice,
+                                    realizedProfit,
+                                    riskDecision.Reason
+                                );
+
+                                openTrades.Remove(t);
+
+                                TradeServiceEngine.closingTrade = false;
+                            }
+                            else
+                            {
+                                LogFile.Write(
+                                    $"[{t.Symbol}] ⚠️ Position still open after close request | " +
+                                    $"ticket={t.Ticket}"
+                                );
+
+                                // Leave analyzer trade open.
+                            }
+
+                            break;
+                    }
+                }
             }
         }
 
@@ -3342,17 +3767,47 @@ namespace MetaTrader.Services
         {
             // 🔥 1. Track peak profit FIRST
             t.MaxProfitUsd = Math.Max(t.MaxProfitUsd, t.ProfitUsd);
-            _client.CopyRates(SYMBOL, ENUM_TIMEFRAMES.PERIOD_H1, 1, BarsToFetch, out var rates1H);
+
+            _client.CopyRates(
+                t.Symbol,
+                ENUM_TIMEFRAMES.PERIOD_H1,
+                1,
+                BarsToFetch,
+                out var rates1H
+            );
+
             double atr = CalculateATR(rates1H, 14);
 
-            // 🔥 2. HARD BREAK-EVEN (no flag needed)
-            if (t.ProfitUsd >= 6)
+            if (atr <= 0)
+                return;
+
+
+            // ==================================================
+            // 🔒 2. HARD BREAK-EVEN
+            //
+            // OLD:
+            // Activate at +$6
+            // Gold lock = 0.20 ATR
+            //
+            // NEW:
+            // Activate later at +$9
+            // Use a much smaller profit buffer
+            // so runners have room to breathe.
+            // ==================================================
+
+            double breakEvenTrigger =
+               IsGold(t.Symbol) ? 9.0 :
+               IsCrypto(t.Symbol) ? 9.0 :
+               IsIndex(t.Symbol) ? 8.0 :
+               6.0;
+
+            if (t.ProfitUsd >= breakEvenTrigger)
             {
                 double buffer =
-                    IsGold(t.Symbol) ? 0.2 * atr :
-                    IsIndex(t.Symbol) ? 0.3 * atr :
-                    IsCrypto(t.Symbol) ? 0.25 * atr :
-                    0.15 * atr;
+                    IsGold(t.Symbol) ? 0.08 * atr :
+                    IsIndex(t.Symbol) ? 0.12 * atr :
+                    IsCrypto(t.Symbol) ? 0.10 * atr :
+                    0.08 * atr;
 
                 double newSL =
                     t.Side == TradeSide.Buy
@@ -3366,27 +3821,54 @@ namespace MetaTrader.Services
 
                 if (shouldMove)
                 {
+                    double oldSL = t.StopLoss;
+
                     t.StopLoss = newSL;
+
                     ModifyTrade(t);
 
-                    LogFile.Write($"[{t.Symbol}] 🔒 BE SL (ATR) → {newSL:F2}");
+                    LogFile.Write(
+                        $"[{t.Symbol}] 🔒 BE SL (ATR) | " +
+                        $"profit={t.ProfitUsd:F2} | " +
+                        $"maxProfit={t.MaxProfitUsd:F2} | " +
+                        $"oldSL={oldSL:F2} → newSL={newSL:F2} | " +
+                        $"bufferATR={(buffer / atr):F2}"
+                    );
                 }
             }
 
-            // 🔥 3. PROFIT LOCK (based on peak, NOT current)
+
+            // ==================================================
+            // 💰 3. PROFIT LOCK
+            //
+            // Keep existing behavior.
+            // Only activates once peak profit reaches $10.
+            // ==================================================
+
             if (t.MaxProfitUsd >= 10)
             {
                 double lockProfit = 5;
 
                 if (t.ProfitUsd <= lockProfit)
                 {
-                    LogFile.Write($"[{t.Symbol}] 🛑 Profit lock exit | profit={t.ProfitUsd:F2}");
+                    LogFile.Write(
+                        $"[{t.Symbol}] 🛑 Profit lock exit | " +
+                        $"profit={t.ProfitUsd:F2} | " +
+                        $"max={t.MaxProfitUsd:F2}"
+                    );
+
                     TradeServiceEngine.closingTrade = true;
                     return;
                 }
             }
 
-            // 🔥 4. GIVEBACK PROTECTION
+
+            // ==================================================
+            // 🛡️ 4. GIVEBACK PROTECTION
+            //
+            // Keep existing behavior for now.
+            // ==================================================
+
             if (t.MaxProfitUsd >= 8)
             {
                 double allowedGiveback =
@@ -3395,13 +3877,16 @@ namespace MetaTrader.Services
                     IsCrypto(t.Symbol) ? 6 :
                     4;
 
-                double floor = t.MaxProfitUsd - allowedGiveback;
+                double floor =
+                    t.MaxProfitUsd - allowedGiveback;
 
                 if (t.ProfitUsd <= floor)
                 {
                     LogFile.Write(
                         $"[{t.Symbol}] 🛑 GIVEBACK EXIT | " +
-                        $"profit={t.ProfitUsd:F2}, max={t.MaxProfitUsd:F2}, floor={floor:F2}"
+                        $"profit={t.ProfitUsd:F2}, " +
+                        $"max={t.MaxProfitUsd:F2}, " +
+                        $"floor={floor:F2}"
                     );
 
                     TradeServiceEngine.closingTrade = true;
@@ -3545,55 +4030,157 @@ namespace MetaTrader.Services
 
             return priceDiff * trade.ContractSize * trade.Volume; //Lot Size = Volume
         }
-        public static void CloseTrade(TradeSide side, double bid, double ask)
+        public static void CloseTrade(
+    TradeSide side,
+    double bid,
+    double ask)
         {
-            if (openTrades.Count > 0)
+            // ==================================================
+            // 🔒 VALIDATE SIDE
+            // ==================================================
+
+            if (!Enum.IsDefined(typeof(TradeSide), side))
+                return;
+
+            // ==================================================
+            // 🎯 CLOSE ONLY THE REQUESTED SIDE
+            //
+            // IMPORTANT:
+            // Do NOT call CloseManualOpenPositions() here.
+            //
+            // That was closing positions before this method
+            // had determined which specific trade should close.
+            // ==================================================
+
+            var toClose = openTrades
+                .Where(t =>
+                    t.Symbol == SYMBOL &&
+                    t.Side == side &&
+                    !t.IsClosed)
+                .ToList();
+
+            if (toClose.Count == 0)
             {
-                CloseManualOpenPositions();
+                LogFile.Write(
+                    $"CloseTrade: no {side} position found on {SYMBOL}"
+                );
+
+                return;
             }
-
-
-            double midPrice = (ask + bid) / 2;
-            // With this, since TradeSide is a non-nullable enum:
-            if (!Enum.IsDefined(typeof(TradeSide), side)) return;
-
-            var toClose = openTrades.Where(t => t.Symbol == SYMBOL && t.Side == side).ToList();
 
             foreach (var t in toClose)
             {
+                // ==================================================
+                // 📊 CALCULATE CURRENT PROFIT
+                // ==================================================
+
+                double realizedProfit =
+                    GetProfitUsd(t, bid, ask);
+
+                LogFile.Write(
+                    $"Closing opposite {side} trade ticket {t.Ticket} " +
+                    $"before opening new signal | " +
+                    $"profit={realizedProfit:F2}"
+                );
+
+                Console.WriteLine(
+                    $"Closing opposite {side} trade ticket {t.Ticket} " +
+                    $"before opening new signal."
+                );
+
+                // ==================================================
+                // 🔥 SEND CLOSE REQUEST FIRST
+                //
+                // IMPORTANT:
+                // Do not mark the trade closed BEFORE requesting
+                // the actual MT5 close.
+                // ==================================================
+
+                CloseTradeByTicket(
+                    t,
+                    bid,
+                    ask
+                );
+
+                // ==================================================
+                // 🔒 UPDATE TRACKED STATE
+                //
+                // Ideally this should happen after MT5 confirms
+                // the position is actually closed.
+                //
+                // For now this preserves your existing architecture
+                // while removing the premature global close.
+                // ==================================================
+
+                t.IsClosed = true;
+
+                // ==================================================
+                // 📊 WEEKLY EXPECTANCY
+                // ==================================================
+
                 WeeklyExpectancyTracker.RecordTrade(
                     t.OpenTime,
                     DateTime.UtcNow,
                     t.Side,
-                    GetProfitUsd(t, bid, ask)
+                    realizedProfit
                 );
-                Console.WriteLine($"Closing opposite {side} trade ticket {t.Ticket} before opening new signal.");
-                LogFile.Write($"Closing opposite {side} trade ticket {t.Ticket} before opening new signal.");
 
-                t.IsClosed = true;
+                // ==================================================
+                // 📡 EVENT BUS
+                // ==================================================
+
                 var trade = new Trade
                 {
                     Ticket = t.Ticket,
-                    Symbol = SYMBOL,
+                    Symbol = t.Symbol,
                     Side = t.Side.ToString(),
-                    OpenTime = DateTime.UtcNow,
+
+                    // Use the actual tracked opening time.
+                    OpenTime = t.OpenTime,
+
                     ContractSize = t.ContractSize,
                     EntryPrice = t.EntryPrice,
                     Volume = (double)t.Volume,
                     StopLoss = (double)t.StopLoss,
-                    IsClosed = false,
                     TakeProfit = (double)t.TakeProfit,
-                    PeakOrTrough = t.EntryPrice // initialize peak/trough to entry price
+
+                    // This represents the trade we just requested
+                    // to close.
+                    IsClosed = true,
+
+                    PeakOrTrough = t.EntryPrice
                 };
+
                 TradingEventBus.ActiveTrade(trade);
 
-                CloseTradeByTicket(t, bid, ask);
+                // ==================================================
+                // 🕐 LAST REALIZED TRADE INFO
+                // ==================================================
 
-                _client.CopyRates(SYMBOL, ENUM_TIMEFRAMES.PERIOD_H1, 1, 120, out MqlRates[] rates1H);
+                _client.CopyRates(
+                    SYMBOL,
+                    ENUM_TIMEFRAMES.PERIOD_H1,
+                    1,
+                    120,
+                    out MqlRates[] rates1H
+                );
 
-                _lastRealizedProfitUsd = t.ProfitUsd;
-                _lastRealizedSide = t.Side;
-                _lastRealizedTime = rates1H[^1].time;
+                _lastRealizedProfitUsd =
+                    realizedProfit;
+
+                _lastRealizedSide =
+                    t.Side;
+
+                if (rates1H != null &&
+                    rates1H.Length > 0)
+                {
+                    _lastRealizedTime =
+                        rates1H[^1].time;
+                }
+
+                // ==================================================
+                // 🚦 TRADE ATTEMPT LIMITER
+                // ==================================================
 
                 TradeAttemptLimiter.RegisterTradeClose(
                     t.Symbol,
