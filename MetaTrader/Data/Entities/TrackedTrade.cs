@@ -25,9 +25,9 @@ namespace MetaTrader.Data.Entities
         public EntryModel Model { get; set; }
         public bool IsBreakEvenSet { get; set; }
         public DateTime EntryCandleTime { get; set; }
-        public int CandlesSinceEntry { get; set; }
-        public bool IsProven { get; set; }
         public double LastCandleBodyUsd { get; set; }
+        public int CandlesSinceEntry { get; set; }
+        public bool IsProven { get; set; }   
 
     }
 }

@@ -15,9 +15,9 @@ namespace MetaTrader.Util
         BullishBreakoutTest,
         BearishBreakoutTest,
         SupportResistanceClear,
-        Extended,
+        NoQualifyingSetupFound,
         Observation,
-        NoQualifyingSetupFound
+        Extended
     }
 
     public static class MarketRegimeEngine

@@ -7,9 +7,9 @@ namespace MetaTrader.Util
         // ---- CONFIG ----
         private static readonly HashSet<string> CryptoSymbols = new()
         {
-            "BNBUSD",
             "SOLUSD",
             "XRPUSD",
+            "BNBUSD",
             "XRPUSD",
             "ETHUSD"
         };

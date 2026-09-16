@@ -1,5 +1,6 @@
 ﻿using MetaTrader.Data.Database;
 using MetaTrader.Data.Entities;
+using MetaTrader.Util;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using MySqlConnector;

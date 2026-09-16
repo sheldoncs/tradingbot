@@ -117,9 +117,9 @@ namespace MetaTrader.Services
                 liveRange >= atr * cfg.HardRangeAtr &&
                 liveBodyRatio >= cfg.HardBodyRatio;
 
-            if (IsGold(symbol) && breach >= atr * cfg.HardBreachAtr)
+            if (IsCrypto(symbol) && hardDistance)
             {
-                reason = $"GOLD HARD EMA9 breach by live price | breach={breach:F5}";
+                reason = $"CRYPTO HARD EMA9 breach by live price | breach={breach:F5}";
                 LogFile.Write($"[{symbol}] [LiveEma9Exit] {reason}");
                 return LiveExitDecision.ExitToNextRegime;
             }
@@ -190,16 +190,16 @@ namespace MetaTrader.Services
             string s = symbol?.ToUpperInvariant() ?? "";
 
             if (IsCrypto(s))
-            {
+            {   
                 return new SymbolExitProfile
                 {
-                    SoftBreachAtr = 0.30,
-                    HardBreachAtr = 0.55,
-                    HardRangeAtr = 1.25,
-                    HardBodyRatio = 0.58,
-                    ConfirmSeconds = 45,
+                    SoftBreachAtr = s.Contains("BNB") ? 0.38 : 0.30,
+                    HardBreachAtr = s.Contains("BNB") ? 0.60 : 0.55,
+                    HardRangeAtr = s.Contains("BNB") ? 1.30 : 1.25,
+                    HardBodyRatio = s.Contains("BNB") ? 0.60 : 0.58,
+                    ConfirmSeconds = s.Contains("BNB")? 75 : 45,
                     AllowGraceIfNearEma21 = true,
-                    NearEma21Atr = 0.35,
+                    NearEma21Atr = s.Contains("BNB") ? 0.40 : 0.35,
                     ExitHardAsDisarm = false
                 };
             }
@@ -208,11 +208,11 @@ namespace MetaTrader.Services
             {
                 return new SymbolExitProfile
                 {
-                    SoftBreachAtr = 0.30,
-                    HardBreachAtr = 0.35,
+                    SoftBreachAtr = 0.25,
+                    HardBreachAtr = 0.45,
                     HardRangeAtr = 1.15,
                     HardBodyRatio = 0.60,
-                    ConfirmSeconds = 50,
+                    ConfirmSeconds = 35,
                     AllowGraceIfNearEma21 = true,
                     NearEma21Atr = 0.30,
                     ExitHardAsDisarm = false

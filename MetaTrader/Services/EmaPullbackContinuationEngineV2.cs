@@ -31,9 +31,10 @@ namespace MetaTrader.Services
             double atrPercentile,
             double[] emaFast,
             double[] emaSlow,
-            out TradeAction action)
+            SymbolContext ctx,
+            out TradeAction pullBackAction)
         {
-            action = TradeAction.Hold;
+            pullBackAction = TradeAction.Hold;
 
             if (rates == null || rates.Length < 6 ||
                 emaFast == null || emaSlow == null ||
@@ -80,32 +81,14 @@ namespace MetaTrader.Services
 
             if (bullishTrend)
             {
-                bool slopeWeak = fastSlope < atr * TrendSlopeMinFactor;
-
-                bool earlyTurn =
-                    ema9Now > ema21Now &&     // just crossed / above
-                    ema9Prev <= ema21Prev;    // was below before
-
-                if (slopeWeak && !earlyTurn)
-                {
-                    LogFile.Write($"[{symbol}] Pullback blocked: weak slope");
+                if (fastSlope < atr * TrendSlopeMinFactor)
                     return false;
-                }
             }
 
             if (bearishTrend)
             {
-                bool slopeWeak = fastSlope > -atr * TrendSlopeMinFactor;
-
-                bool earlyTurn =
-                    ema9Now < ema21Now &&
-                    ema9Prev >= ema21Prev;
-
-                if (slopeWeak && !earlyTurn)
-                {
-                    LogFile.Write($"[{symbol}] Pullback blocked: weak slope");
+                if (fastSlope > -atr * TrendSlopeMinFactor)
                     return false;
-                }
             }
 
             // --------------------------------
@@ -207,7 +190,7 @@ namespace MetaTrader.Services
                 buyBreaksPullback)
             {
                 LogFile.Write($"[{symbol}] EMA Pullback Continuation BUY");
-                action = TradeAction.EnterBuy;
+                pullBackAction = TradeAction.EnterBuy;
                 return true;
             }
 
@@ -222,7 +205,7 @@ namespace MetaTrader.Services
                 sellBreaksPullback)
             {
                 LogFile.Write($"[{symbol}] EMA Pullback Continuation SELL");
-                action = TradeAction.EnterSell;
+                pullBackAction = TradeAction.EnterSell;
                 return true;
             }
 

@@ -13,20 +13,7 @@ namespace MetaTrader.Util
         public bool ImpulseTradeWon { get; set; }
         public bool IsImpulse { get; set; }
         public DateTime LastImpulseWinTime { get; set; }
-        public bool ImpulseConsumed { get; set; }   
-        public bool NearSupport { get; set; }
-        public bool NearResistance { get; set; }
-        public bool IsBreakingSupport { get; set; }
-        public bool IsBreakingResistance { get; set; }
-        // Optional but VERY useful
-        public double SupportLevel { get; set; }
-        public double ResistanceLevel { get; set; }
-
-        public int SupportTouches { get; set; }
-        public int ResistanceTouches { get; set; }
-
-        public double CurrentMomentum { get; set; }
-        public double PreviousMomentum { get; set; }
+        public bool ImpulseConsumed { get; set; }
         public bool InRecoveryMode { get; set; }
         public DateTime LastLossCheckCandleTime { get; set; } = DateTime.MinValue;
         public DateTime RecoveryStartedUtc { get; set; }
@@ -36,6 +23,8 @@ namespace MetaTrader.Util
         public MarketPhaseLoop Phase { get; set; } = MarketPhaseLoop.Cooling;
         public DateTime? LastShockCandleTime { get; set; }
         public int CandlesSinceShock { get; set; }
+        public double CurrentMomentum { get; set; }
+        public double PreviousMomentum { get; set; }
         public DateTime LastPhaseUpdateCandleTime { get; set; }
         public string PhaseReason { get; set; } = "";
         public string Symbol { get; }
@@ -158,7 +147,7 @@ namespace MetaTrader.Util
                 Category = DecisionCategory.Cascade.ToString(),
                 Reason = $"Symbol {Symbol} disarmed",
                 Message = $"Symbol  {Symbol}  disarmed",
-                Momentum =0.00,
+                Momentum = 0.00,
                 EarlyMomentum = false,
                 EmaCompressed = false,
                 Regime = DecisionCategory.Cooldown.ToString(),

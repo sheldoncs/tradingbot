@@ -26,13 +26,13 @@ namespace chatgptbot.Util
 
         public override async Task OnConnectedAsync()
         {
-            await Groups.AddToGroupAsync(Context.ConnectionId, "test");
+            await Groups.AddToGroupAsync(Context.ConnectionId, "dashboards");
             await base.OnConnectedAsync();
         }
 
         public override async Task OnDisconnectedAsync(Exception? ex)
         {
-            await Groups.RemoveFromGroupAsync(Context.ConnectionId, "test");
+            await Groups.RemoveFromGroupAsync(Context.ConnectionId, "dashboards");
             await base.OnDisconnectedAsync(ex);
         }
 

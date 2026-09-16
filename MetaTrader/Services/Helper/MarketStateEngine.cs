@@ -20,6 +20,8 @@ namespace MetaTrader.Services.Helper
                 atr <= 0)
                 return MarketState.Chop;
 
+            symbol = symbol.ToUpperInvariant();
+
             var c0 = rates[^1];
             var c1 = rates[^2];
 
@@ -33,6 +35,18 @@ namespace MetaTrader.Services.Helper
 
             bool bullishCandle = c0.close > c0.open;
             bool bearishCandle = c0.close < c0.open;
+
+            double bodyAtr = body / atr;
+
+            // =============================
+            // 🔥 ASSET-SPECIFIC MOMENTUM
+            // =============================
+            double strongBodyThreshold =
+                IsGold(symbol) ? 1.2 :
+                IsIndex(symbol) ? 1.1 :
+                IsCrypto(symbol) ? 1.0 :
+                IsFx(symbol) ? 0.8 :
+                1.0;
 
             // =============================
             // 1️⃣ TREND DETECTION
@@ -79,7 +93,6 @@ namespace MetaTrader.Services.Helper
             double breakoutBuffer = atr * 0.05;
             double emaSpreadAtr = Math.Abs(ema9 - ema21) / atr;
 
-            // 🔥 ASSET-SPECIFIC SPREAD TUNING
             double minSpread =
                 IsGold(symbol) ? 0.05 :
                 IsFx(symbol) ? 0.05 :
@@ -88,10 +101,10 @@ namespace MetaTrader.Services.Helper
                 0.05;
 
             double maxSpread =
-                IsGold(symbol) ? 0.25 :
+                IsGold(symbol) ? 0.30 :   // 🔥 slightly relaxed
                 IsFx(symbol) ? 0.20 :
-                IsIndex(symbol) ? 0.30 :
-                IsCrypto(symbol) ? 0.35 :
+                IsIndex(symbol) ? 0.35 :
+                IsCrypto(symbol) ? 0.40 :
                 0.20;
 
             bool strongBullBody =
@@ -104,7 +117,9 @@ namespace MetaTrader.Services.Helper
                 body >= atr * 0.35 &&
                 bodyRatio >= 0.45;
 
-            // Clean breakout
+            // -----------------------------
+            // BREAKOUT CONDITIONS
+            // -----------------------------
             bool earlyBreakUp =
                 c0.close > recentHigh + breakoutBuffer &&
                 c0.close > ema9 &&
@@ -117,7 +132,9 @@ namespace MetaTrader.Services.Helper
                 c0.close < ema21 &&
                 strongBearBody;
 
-            // Escape moves
+            // -----------------------------
+            // ESCAPE CONDITIONS
+            // -----------------------------
             bool bullishEscape =
                 c0.close > c1.high &&
                 c0.close > ema9 &&
@@ -130,26 +147,24 @@ namespace MetaTrader.Services.Helper
                 c0.close < ema21 &&
                 strongBearBody;
 
-            // 🔥 FINAL FILTERED LOGIC
-            // 🔥 STRONG MOMENTUM OVERRIDE
-            double bodyAtr = body / atr;
+            // =============================
+            // 🔥 IMPROVED BREAK LOGIC
+            // =============================
 
             bool strongMomentumBreak =
                 (earlyBreakUp || earlyBreakDown) &&
-                bodyAtr > 1.2; // 🔥 key threshold
+                bodyAtr > strongBodyThreshold;
 
-            // 🔥 NORMAL BREAK
             bool normalBreak =
                 (earlyBreakUp || earlyBreakDown) &&
                 emaSpreadAtr < maxSpread;
 
-            // 🔥 FINAL
             bool isTrueEarlyBreak =
                 strongMomentumBreak || normalBreak;
 
             bool strongEscape =
-             (bullishEscape || bearishEscape) &&
-             bodyAtr > 1.2;
+                (bullishEscape || bearishEscape) &&
+                bodyAtr > strongBodyThreshold;
 
             bool normalEscape =
                 (bullishEscape || bearishEscape) &&
@@ -166,7 +181,7 @@ namespace MetaTrader.Services.Helper
                     $"earlyUp={earlyBreakUp}, earlyDown={earlyBreakDown}, " +
                     $"bullEscape={bullishEscape}, bearEscape={bearishEscape}, " +
                     $"emaSpreadAtr={emaSpreadAtr:F2}, minSpread={minSpread:F2}, maxSpread={maxSpread:F2}, " +
-                    $"bodyAtr={(body / atr):F2}, bodyRatio={bodyRatio:F2}, " +
+                    $"bodyAtr={bodyAtr:F2}, bodyRatio={bodyRatio:F2}, " +
                     $"close={c0.close:F5}, recentHigh={recentHigh:F5}, recentLow={recentLow:F5}"
                 );
 
@@ -225,7 +240,7 @@ namespace MetaTrader.Services.Helper
             LogFile.Write(
                 $"[{symbol}] MarketState = CHOP | " +
                 $"trendUp={trendUp}, trendDown={trendDown}, strongTrend={strongTrend}, " +
-                $"emaSpreadAtr={emaSpreadAtr:F2}, bodyAtr={(body / atr):F2}, bodyRatio={bodyRatio:F2}, " +
+                $"emaSpreadAtr={emaSpreadAtr:F2}, bodyAtr={bodyAtr:F2}, bodyRatio={bodyRatio:F2}, " +
                 $"close={c0.close:F5}, recentHigh={recentHigh:F5}, recentLow={recentLow:F5}"
             );
 

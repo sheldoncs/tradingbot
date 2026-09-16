@@ -46,7 +46,6 @@ namespace MetaTrader.Services
             StrongBreakBufferAtr = 0.05,
             MomentumFactor = 0.55,
             MaxSameDirectionCandles = 5,
-
             MinEmaSpreadAtr = 0.10,
             StructureBreakBufferAtr = 0.08,
             MinLiveRangeAtr = 0.45,
@@ -64,7 +63,6 @@ namespace MetaTrader.Services
             StrongBreakBufferAtr = 0.06,
             MomentumFactor = 0.55,
             MaxSameDirectionCandles = 5,
-
             MinEmaSpreadAtr = 0.12,
             StructureBreakBufferAtr = 0.10,
             MinLiveRangeAtr = 0.50,
@@ -82,7 +80,6 @@ namespace MetaTrader.Services
             StrongBreakBufferAtr = 0.05,
             MomentumFactor = 0.55,
             MaxSameDirectionCandles = 5,
-
             MinEmaSpreadAtr = 0.10,
             StructureBreakBufferAtr = 0.08,
             MinLiveRangeAtr = 0.45,
@@ -100,7 +97,6 @@ namespace MetaTrader.Services
             StrongBreakBufferAtr = 0.04,
             MomentumFactor = 0.50,
             MaxSameDirectionCandles = 5,
-
             MinEmaSpreadAtr = 0.08,
             StructureBreakBufferAtr = 0.06,
             MinLiveRangeAtr = 0.35,
@@ -126,9 +122,7 @@ namespace MetaTrader.Services
                 emaFast == null || emaSlow == null ||
                 emaFast.Length < 3 || emaSlow.Length < 3 ||
                 atr <= 0)
-            {
                 return false;
-            }
 
             var settings = GetSettings(symbol);
 
@@ -152,7 +146,6 @@ namespace MetaTrader.Services
 
             double fastSlope = ema9 - ema9Prev;
             double slowSlope = ema21 - ema21Prev;
-
             double fastSlopeAtr = fastSlope / atr;
 
             bool trendUp = ema9 > ema21 && fastSlope > 0;
@@ -214,7 +207,7 @@ namespace MetaTrader.Services
 
             if (emaCompressed && insideStructure)
             {
-                LogFile.Write($"[{symbol}] ❌ Cascade blocked: EMA compression / chop | emaSpreadAtr={emaSpreadAtr:F2}, need>={settings.MinEmaSpreadAtr:F2}, recentHigh={recentHigh:F5}, recentLow={recentLow:F5}, ask={ask:F5}, bid={bid:F5}");
+                LogFile.Write($"[{symbol}] ❌ Cascade blocked: EMA compression / chop | emaSpreadAtr={emaSpreadAtr:F2}, need>={settings.MinEmaSpreadAtr:F2}");
                 return false;
             }
 
@@ -273,7 +266,7 @@ namespace MetaTrader.Services
 
             if (!liveBreakoutQuality || !liveRangeQuality || !liveBodyQuality)
             {
-                LogFile.Write($"[{symbol}] ❌ Cascade blocked: live candle not strong enough | rangeAtr={(range0 / atr):F2}, need>={settings.BreakRangeAtr:F2}, bodyRatio={ratio0:F2}, need>={settings.BodyRatio:F2}, minRangeAtr={settings.MinLiveRangeAtr:F2}, minBody={settings.MinLiveBodyRatio:F2}");
+                LogFile.Write($"[{symbol}] ❌ Cascade blocked: live candle not strong enough | rangeAtr={(range0 / atr):F2}, need>={settings.BreakRangeAtr:F2}, bodyRatio={ratio0:F2}, need>={settings.BodyRatio:F2}");
                 return false;
             }
 
@@ -343,17 +336,20 @@ namespace MetaTrader.Services
             double distSellAtr = distanceSell / atr;
             double distBuyAtr = distanceBuy / atr;
 
-            bool isGold =
-                symbol.Contains("XAU", StringComparison.OrdinalIgnoreCase) ||
-                symbol.Contains("GOLD", StringComparison.OrdinalIgnoreCase) ||
-                symbol.Contains("XAG", StringComparison.OrdinalIgnoreCase) ||
-                symbol.Contains("SILVER", StringComparison.OrdinalIgnoreCase);
+            bool isGold = IsGold(symbol);
+            bool isCrypto = IsCrypto(symbol);
+            bool isIndex = IsIndex(symbol);
 
             int maxDirectionalCandles =
-                isGold ? 3 : settings.MaxSameDirectionCandles;
+                isGold || isCrypto || isIndex
+                    ? 3
+                    : 4;
 
             double maxLateMoveAtr =
-                isGold ? settings.LateMoveAtr * 0.82 : settings.LateMoveAtr;
+                isGold ? settings.LateMoveAtr * 0.82 :
+                isCrypto ? settings.LateMoveAtr * 0.85 :
+                isIndex ? settings.LateMoveAtr * 0.85 :
+                settings.LateMoveAtr * 0.90;
 
             bool stretchedSell = distSellAtr > maxLateMoveAtr;
             bool stretchedBuy = distBuyAtr > maxLateMoveAtr;
@@ -408,28 +404,40 @@ namespace MetaTrader.Services
                     ? body0 / body1
                     : 1.0;
 
+            double emotionalRangeThreshold =
+                isGold || isCrypto || isIndex ? 2.0 : 2.15;
+
+            double emotionalBodyThreshold =
+                isGold || isCrypto || isIndex ? 0.72 : 0.74;
+
+            double accelerationThreshold =
+                isGold || isCrypto || isIndex ? 1.6 : 1.75;
+
+            double exhaustionWickThreshold =
+                isGold || isCrypto || isIndex ? 0.35 : 0.42;
+
             bool emotionalBullishExpansion =
                 trendUp &&
-                liveRangeAtr >= (isGold ? 2.0 : 2.2) &&
-                ratio0 >= (isGold ? 0.72 : 0.75) &&
+                liveRangeAtr >= emotionalRangeThreshold &&
+                ratio0 >= emotionalBodyThreshold &&
                 distBuyAtr >= maxLateMoveAtr * 0.75;
 
             bool emotionalBearishExpansion =
                 trendDown &&
-                liveRangeAtr >= (isGold ? 2.0 : 2.2) &&
-                ratio0 >= (isGold ? 0.72 : 0.75) &&
+                liveRangeAtr >= emotionalRangeThreshold &&
+                ratio0 >= emotionalBodyThreshold &&
                 distSellAtr >= maxLateMoveAtr * 0.75;
 
             bool bullishAccelerationClimax =
                 trendUp &&
                 bullCount >= 3 &&
-                accelerationFactor >= (isGold ? 1.6 : 1.8) &&
+                accelerationFactor >= accelerationThreshold &&
                 distBuyAtr >= maxLateMoveAtr * 0.70;
 
             bool bearishAccelerationClimax =
                 trendDown &&
                 bearCount >= 3 &&
-                accelerationFactor >= (isGold ? 1.6 : 1.8) &&
+                accelerationFactor >= accelerationThreshold &&
                 distSellAtr >= maxLateMoveAtr * 0.70;
 
             double upperWick = c0.high - Math.Max(c0.open, c0.close);
@@ -440,12 +448,12 @@ namespace MetaTrader.Services
 
             bool bullishExhaustionWick =
                 trendUp &&
-                upperWickAtr >= (isGold ? 0.35 : 0.45) &&
+                upperWickAtr >= exhaustionWickThreshold &&
                 ratio0 < 0.78;
 
             bool bearishExhaustionWick =
                 trendDown &&
-                lowerWickAtr >= (isGold ? 0.35 : 0.45) &&
+                lowerWickAtr >= exhaustionWickThreshold &&
                 ratio0 < 0.78;
 
             if (emotionalBullishExpansion ||
@@ -507,39 +515,60 @@ namespace MetaTrader.Services
                 ? ""
                 : symbol.ToUpperInvariant();
 
-            if (s.Contains("XAU") ||
-                s.Contains("XAG") ||
-                s.Contains("GOLD") ||
-                s.Contains("SILVER"))
+            if (IsGold(s))
                 return GoldProfile;
 
-            if (s.Contains("BTC") ||
-                s.Contains("ETH") ||
-                s.Contains("SOL") ||
-                s.Contains("BNB") ||
-                s.Contains("XRP") ||
-                s.Contains("ADA") ||
-                s.Contains("DOGE") ||
-                s.Contains("LTC") ||
-                s.Contains("LINK") ||
-                s.Contains("AVAX"))
+            if (IsCrypto(s))
                 return CryptoProfile;
 
-            if (s.Contains("US100") ||
-                s.Contains("US100.CASH") ||
-                s.Contains("NAS") ||
-                s.Contains("NAS100") ||
-                s.Contains("USTEC") ||
-                s.Contains("US30") ||
-                s.Contains("DJ") ||
-                s.Contains("SPX") ||
-                s.Contains("US500") ||
-                s.Contains("GER") ||
-                s.Contains("DAX") ||
-                s.Contains("UK100"))
+            if (IsIndex(s))
                 return IndexProfile;
 
             return FxProfile;
+        }
+
+        private static bool IsGold(string symbol)
+        {
+            string s = symbol?.ToUpperInvariant() ?? "";
+
+            return s.Contains("XAU") ||
+                   s.Contains("XAG") ||
+                   s.Contains("GOLD") ||
+                   s.Contains("SILVER");
+        }
+
+        private static bool IsCrypto(string symbol)
+        {
+            string s = symbol?.ToUpperInvariant() ?? "";
+
+            return s.Contains("BTC") ||
+                   s.Contains("ETH") ||
+                   s.Contains("SOL") ||
+                   s.Contains("BNB") ||
+                   s.Contains("XRP") ||
+                   s.Contains("ADA") ||
+                   s.Contains("DOGE") ||
+                   s.Contains("LTC") ||
+                   s.Contains("LINK") ||
+                   s.Contains("AVAX");
+        }
+
+        private static bool IsIndex(string symbol)
+        {
+            string s = symbol?.ToUpperInvariant() ?? "";
+
+            return s.Contains("US100") ||
+                   s.Contains("US100.CASH") ||
+                   s.Contains("NAS") ||
+                   s.Contains("NAS100") ||
+                   s.Contains("USTEC") ||
+                   s.Contains("US30") ||
+                   s.Contains("DJ") ||
+                   s.Contains("SPX") ||
+                   s.Contains("US500") ||
+                   s.Contains("GER") ||
+                   s.Contains("DAX") ||
+                   s.Contains("UK100");
         }
     }
 }

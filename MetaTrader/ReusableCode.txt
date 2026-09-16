@@ -1,20 +1,21 @@
 ﻿// 🔥 GLOBAL MOMENTUM FILTER (MUST BE FIRST)
+                /*
                 if (MomentumFilterEngine.ShouldBlockTrade(
                     SYMBOL,
                     tradeDecision.Momentum,
                     ctx.AtrPercentile,
                     out double effectiveThreshold,
                     out double baseThreshold))
-                 {
+                {
                     LogFile.Write(
                         $"[{SYMBOL}] Momentum too weak {tradeDecision.Momentum:F2} < {effectiveThreshold:F2} " +
                         $"(Base={baseThreshold:F2}, ATR%={ctx.AtrPercentile:F2})");
 
                     return;
                 }
-
-
+                */
                 // 🔥 Late impulse protection (execution layer)
+                /*
                 double atrNormalized = ctx.AtrPercentile > 1.0
                 ? ctx.AtrPercentile / 100.0
                 : ctx.AtrPercentile;
@@ -26,4 +27,47 @@
                 {
                     LogFile.Write($"[{SYMBOL}] Late impulse blocked (momentum weakening)");
                     return;
+                }
+                */
+
+                if (EmaPullbackContinuationEngineV2.ShouldEnter(
+                SYMBOL,
+                rates1H,
+                atr,
+                ctx.AtrPercentile,
+                emaFast,
+                emaSlow,
+                ctx,
+                out var pullBackAction))
+                {
+                    if (SupportResistanceEngine.ShouldBlockTrade(
+                            symbol,
+                            pullBackAction,
+                            rates1H,
+                            atr,
+                            tradeDecision.Momentum,
+                            currentPrice))
+                    {
+                        return (TradeAction.DoNothing, EntryModel.Nothing);
+                    }
+                    var reason = "";
+                    if (!_m15Service.IsTradeAllowed(SYMBOL, pullBackAction, EntryModel.Continuation, tradeDecision.Momentum, out reason))
+                    {
+                        LogFile.Write($"⏸️ M15 structure not ready for pullback continuation — skipping entries and waiting for better setup for {SYMBOL}. Reason: {reason}");
+                        return (TradeAction.DoNothing, EntryModel.Nothing);
+                    }
+                    TradingEventBus.Decision(new DecisionEvent
+                    {
+                        Symbol = ctx.Symbol,
+                        Action = pullBackAction.ToString(),
+                        Category = DecisionCategory.Continuation.ToString(),
+                        Reason = $"Pullback Entry(V2) {pullBackAction.ToString()}",
+                        Message = $"Pullback Entry(V2) {pullBackAction.ToString()}",
+                        Momentum = tradeDecision.Momentum,
+                        EarlyMomentum = false,
+                        EmaCompressed = false,
+                        Regime = DecisionCategory.Continuation.ToString(),
+                        Time = DateTime.UtcNow
+                    });
+                    return (pullBackAction, EntryModel.PullbackContinuation);
                 }

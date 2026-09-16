@@ -128,7 +128,6 @@ namespace MetaTrader.Services
                     return TradeAction.Hold;
                 }
 
-                
                 // =========================
                 // TREND
                 // =========================
@@ -142,42 +141,6 @@ namespace MetaTrader.Services
                 {
                     LogFile.Write($"[SNIPER] {symbol} blocked: no EMA trend");
                     return TradeAction.Hold;
-                }
-
-                // =========================
-                // GOLD POST-SHOCK / REJECTION GUARD
-                // =========================
-                if (IsGoldSymbol(symbol))
-                {
-                    double c1Range = c1.high - c1.low;
-                    double c1Body = Math.Abs(c1.close - c1.open);
-
-                    double upperWick = c1.high - Math.Max(c1.open, c1.close);
-                    double lowerWick = Math.Min(c1.open, c1.close) - c1.low;
-
-                    bool largeShockCandle = c1Range > atr * 1.8;
-
-                    bool largeCounterWick =
-                        bearish
-                            ? lowerWick > atr * 0.75
-                            : upperWick > atr * 0.75;
-
-                    bool overlapAfterShock =
-                        c0.high <= c1.high &&
-                        c0.low >= c1.low;
-
-                    if (largeShockCandle || largeCounterWick || overlapAfterShock)
-                    {
-                        LogFile.Write(
-                            $"[SNIPER] {symbol} blocked: gold post-shock/rejection stabilization required | " +
-                            $"rangeATR={(c1Range / atr):F2}, " +
-                            $"lowerWickATR={(lowerWick / atr):F2}, " +
-                            $"upperWickATR={(upperWick / atr):F2}, " +
-                            $"overlap={overlapAfterShock}"
-                        );
-
-                        return TradeAction.Hold;
-                    }
                 }
 
                 double emaSlope = emaFastH1[^1] - emaFastH1[^2];
@@ -374,18 +337,6 @@ namespace MetaTrader.Services
         // HELPERS
         // =========================
 
-        private static bool IsGoldSymbol(string symbol)
-        {
-            if (string.IsNullOrWhiteSpace(symbol))
-                return false;
-
-            string s = symbol.ToUpperInvariant();
-
-            return s.Contains("XAU") ||
-                   s.Contains("GOLD") ||
-                   s.Contains("XAG") ||
-                   s.Contains("SILVER");
-        }
         private static bool IsImpulse(MqlRates c, double atr, TradeDirection dir)
         {
             double range = c.high - c.low;

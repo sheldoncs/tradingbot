@@ -7,6 +7,8 @@ using MtApi5;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Threading.Tasks;
 using static MetaTrader.Services.HybridMomentumEngine;
 
 namespace MetaTrader.Services.Helper
@@ -16,10 +18,11 @@ namespace MetaTrader.Services.Helper
         private readonly MtApi5Client _client;
         private readonly IEnumerable<string> _symbols;
 
-        private readonly TradeCoordinator _cryptoCoordinator;
+        private readonly TradeCoordinator _indexCoordinator;
         private readonly TradeCoordinator _metalsCoordinator;
         private readonly TradeCoordinator _fxCoordinator;
         private readonly TradeCoordinator _currencyCoordinator;
+        private readonly TradeCoordinator _cryptoCoordinator;
 
         private readonly Dictionary<string, SymbolContext> _contexts;
 
@@ -39,15 +42,15 @@ namespace MetaTrader.Services.Helper
         public MarketStateCoordinator(
             MtApi5Client client,
             IEnumerable<string> symbols,
-            TradeCoordinator cryptoCoordinator,
+            TradeCoordinator indexCoordinator,
             TradeCoordinator metalsCoordinator,
-            TradeCoordinator fxCoordinator,
+            TradeCoordinator cryptoCoordinator,
             TradeCoordinator currencyCoordinator,
             Dictionary<string, SymbolContext> contexts
         )
         {
-            _fxCoordinator = fxCoordinator;
             _cryptoCoordinator = cryptoCoordinator;
+            _indexCoordinator = indexCoordinator;
             _metalsCoordinator = metalsCoordinator;
             _currencyCoordinator = currencyCoordinator;
             _client = client;
@@ -61,10 +64,11 @@ namespace MetaTrader.Services.Helper
 
             return universe switch
             {
-                MarketUniverse.Crypto => _cryptoCoordinator,
+                MarketUniverse.Index => _indexCoordinator,
                 MarketUniverse.FX => _fxCoordinator,
                 MarketUniverse.Metals => _metalsCoordinator,
                 MarketUniverse.Currency => _currencyCoordinator,
+                MarketUniverse.Crypto => _cryptoCoordinator,
                 _ => throw new InvalidOperationException($"Unknown universe for {symbol}")
             };
         }
@@ -75,29 +79,29 @@ namespace MetaTrader.Services.Helper
         }
 
         private static readonly HashSet<string> FxSymbols = new()
-    {
-        "EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD"
-    };
+{
+    "EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD"
+};
 
         private static readonly HashSet<string> CryptoSymbols = new()
-    {
-        "SOLUSD",
-        "ETHUSD",
-        "BTCUSD",
-        "BNBUSD",
-        "XRPUSD",
-        "ADAUSD",
-        "AVAXUSD",
-        "LINKUSD",
-        "AVAUSD",
-        "LNKUSD"
-    };
+{
+    "SOLUSD",
+    "ETHUSD",
+    "BTCUSD",
+    "BNBUSD",
+    "XRPUSD",
+    "ADAUSD",
+    "AVAXUSD",
+    "LINKUSD",
+    "AVAUSD",
+    "LNKUSD"
+};
 
         private static readonly HashSet<string> GoldSymbols = new()
-    {
-        "XAUUSD",
-        "XAUEUR"
-    };
+        {
+                "XAUUSD",
+                "XAUEUR"
+        };
 
         private MarketUniverse GetUniverse(string symbol)
         {
@@ -111,6 +115,9 @@ namespace MetaTrader.Services.Helper
 
             if (GoldSymbols.Contains(baseSymbol))
                 return MarketUniverse.Currency;
+
+            if (baseSymbol.Contains("US100") || baseSymbol.Contains("NAS"))
+                return MarketUniverse.Index;
 
             return MarketUniverse.Crypto;
         }
@@ -174,15 +181,20 @@ namespace MetaTrader.Services.Helper
             var last = rates1H[^1];
             var prev = rates1H[^2];
 
-            MomentumResult momentum = HybridMomentumEngine.Calculate(
-                last,
-                prev,
-                rates1H,
-                emaFast1H,
-                emaSlow1H,
-                atrRaw,
-                true
-            );
+            double liveOpen = rates1H[^1].close;
+            double bid = _client.SymbolInfoDouble(ctx.Symbol, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_BID);
+            double ask = _client.SymbolInfoDouble(ctx.Symbol, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_ASK);
+            var momentum =
+                HybridMomentumEngine.CalculateLive(
+                    liveOpen,
+                    bid,
+                    ask,
+                    rates1H[^1],
+                    rates1H,
+                    emaFast1H,
+                    emaSlow1H,
+                    atrRaw,
+                    false);
 
             UpdateMarketState(
                 marketSymbol,
@@ -513,8 +525,21 @@ namespace MetaTrader.Services.Helper
                     $"🟢 before armed {SYMBOL} PullbackSufficient = {ctx.PullbackSufficient} | PriceAccepted={priceAccepted} ATRcool={atrCooling}"
                 );
 
+
+                bool isIndex = SYMBOL.Contains("US100") || SYMBOL.Contains("NAS");
+
+                bool indexArmOk =
+                    isIndex &&
+                    ctx.PullbackSufficient &&
+                    momentum.Strong &&
+                    momentum.Hybrid >= 0.70;
+
                 if (ctx.PullbackSufficient &&
-                    (ctx.PriceAccepted || ctx.AtrCooldown))
+                (
+                    ctx.PriceAccepted ||
+                    ctx.AtrCooldown ||
+                    indexArmOk
+                ))
                 {
                     UpdateFreshness(SYMBOL, ctx, emaFast1H, atrRaw, rates1H);
 
@@ -660,8 +685,8 @@ namespace MetaTrader.Services.Helper
             MarketUniverse universe = GetUniverse(symbol);
 
             double maxFreshDistance =
-                universe == MarketUniverse.Metals ? 1.35 :
-                universe == MarketUniverse.Crypto ? 1.45 :
+                universe == MarketUniverse.Metals ? 1.25 :
+                universe == MarketUniverse.Index ? 1.45 :
                 universe == MarketUniverse.FX ? 1.10 :
                 1.20;
 
@@ -776,6 +801,9 @@ namespace MetaTrader.Services.Helper
             if (universe == MarketUniverse.Crypto) return 5;
             if (universe == MarketUniverse.FX) return 3;
 
+            if (symbol.Contains("US100") || symbol.Contains("NAS"))
+                return 5;
+
             return 4;
         }
 
@@ -786,14 +814,53 @@ namespace MetaTrader.Services.Helper
             if (!_freshness.TryGetValue(normalized, out var f))
                 return "Freshness: unavailable";
 
-            double ageSeconds = (DateTime.UtcNow - f.LastUpdatedUtc).TotalSeconds;
+            // This is the age of the freshness SNAPSHOT, not the age of the
+            // current MarketState/candidate. UpdateFreshness() intentionally
+            // refreshes this on every scan, so this value will normally be near 0.
+            double freshnessAgeSeconds =
+                Math.Max(0, (DateTime.UtcNow - f.LastUpdatedUtc).TotalSeconds);
 
             return
                 $"Freshness: distEMA9Atr={f.DistanceFromEma9Atr:F2}, " +
                 $"expCandles={f.ExpansionCandles}, " +
                 $"late={f.IsLateExpansion}, " +
                 $"tooExtended={f.IsTooExtended}, " +
-                $"ageSec={ageSeconds:F0}";
+                $"freshnessAgeSec={freshnessAgeSeconds:F0}";
+        }
+
+        private double GetStateAgeSeconds(SymbolContext ctx)
+        {
+            if (ctx == null || ctx.StateEnteredAt == DateTime.MinValue)
+                return 0;
+
+            DateTime enteredAt = ctx.StateEnteredAt;
+            DateTime now;
+
+            // Preserve the clock basis already stored by SymbolContext.
+            // Existing logs indicate StateEnteredAt is UTC in this bot, but this
+            // also handles Local correctly and treats Unspecified as UTC to avoid
+            // mixing local/UTC clocks.
+            if (enteredAt.Kind == DateTimeKind.Local)
+            {
+                now = DateTime.Now;
+            }
+            else
+            {
+                if (enteredAt.Kind == DateTimeKind.Unspecified)
+                {
+                    enteredAt = DateTime.SpecifyKind(
+                        enteredAt,
+                        DateTimeKind.Utc
+                    );
+                }
+
+                now = DateTime.UtcNow;
+            }
+
+            return Math.Max(
+                0,
+                (now - enteredAt).TotalSeconds
+            );
         }
 
         private bool HandleArmedStateTransition(
@@ -984,12 +1051,21 @@ namespace MetaTrader.Services.Helper
                     };
                 }
 
+                double stateAgeSeconds =
+                    GetStateAgeSeconds(ctx);
+
                 Console.WriteLine(
-                    $"Candidate {ctx.Symbol}: State={ctx.State}, Score={score}, EnteredAt={ctx.StateEnteredAt:HH:mm:ss} | {GetFreshnessSummary(ctx.Symbol)}"
+                    $"Candidate {ctx.Symbol}: State={ctx.State}, Score={score}, " +
+                    $"EnteredAt={ctx.StateEnteredAt:HH:mm:ss}, " +
+                    $"stateAgeSec={stateAgeSeconds:F0} | " +
+                    $"{GetFreshnessSummary(ctx.Symbol)}"
                 );
 
                 LogFile.Write(
-                    $"Candidate {ctx.Symbol}: State={ctx.State}, Score={score}, EnteredAt={ctx.StateEnteredAt:HH:mm:ss} | {GetFreshnessSummary(ctx.Symbol)}"
+                    $"Candidate {ctx.Symbol}: State={ctx.State}, Score={score}, " +
+                    $"EnteredAt={ctx.StateEnteredAt:HH:mm:ss}, " +
+                    $"stateAgeSec={stateAgeSeconds:F0} | " +
+                    $"{GetFreshnessSummary(ctx.Symbol)}"
                 );
             }
 

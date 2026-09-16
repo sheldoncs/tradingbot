@@ -36,7 +36,7 @@ namespace MetaTrader.Services
 
                 LogFile.Write(
                     $"[{symbol}] BE/Tighten check | profit=${currentProfitUsd:F2} | " +
-                    $"BE=${profile.BreakEvenAtProfit:F2} | Lock=${profile.LockAtProfit:F2} | Trail=${profile.TrailAtProfit:F2}"
+                    $"BE=${profile.BreakEvenAtProfit:F2} | Lock=${profile.LockAtProfit:F2} | Trail=${profile.TrailAtProfit:F2} | Buffer={profile.BreakEvenBufferPrice}"
                 );
 
                 // =========================
@@ -70,6 +70,7 @@ namespace MetaTrader.Services
                     double protectedProfit = profile.LockProfitAmount;
 
                     double priceDistance = Math.Abs(currentPrice - entryPrice);
+
                     double dollarsPerPriceUnit =
                         currentProfitUsd / Math.Max(priceDistance, 0.0000001);
 
@@ -105,6 +106,7 @@ namespace MetaTrader.Services
                         return;
 
                     double priceDistance = Math.Abs(currentPrice - entryPrice);
+
                     double dollarsPerPriceUnit =
                         currentProfitUsd / Math.Max(priceDistance, 0.0000001);
 
@@ -184,12 +186,27 @@ namespace MetaTrader.Services
                 };
             }
 
-            if (s.Contains("ETH") || s.Contains("BTC"))
+            if (s.Contains("ETH"))
             {
                 return new Profile
                 {
                     BreakEvenAtProfit = 6.00,
-                    BreakEvenBufferPrice = s.Contains("BTC") ? 20.00 : 2.00,
+                    BreakEvenBufferPrice = 2.00,
+
+                    LockAtProfit = 10.00,
+                    LockProfitAmount = 3.00,
+
+                    TrailAtProfit = 15.00,
+                    TrailGiveback = 5.00
+                };
+            }
+
+            if (s.Contains("BTC"))
+            {
+                return new Profile
+                {
+                    BreakEvenAtProfit = 6.00,
+                    BreakEvenBufferPrice = 20.00,
 
                     LockAtProfit = 10.00,
                     LockProfitAmount = 3.00,
@@ -214,7 +231,6 @@ namespace MetaTrader.Services
                 };
             }
 
-            // FX default
             return new Profile
             {
                 BreakEvenAtProfit = 3.00,

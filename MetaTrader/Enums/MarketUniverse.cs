@@ -5,6 +5,7 @@
         Crypto,
         Metals,
         FX,
+        Index,
         Currency
     }
 

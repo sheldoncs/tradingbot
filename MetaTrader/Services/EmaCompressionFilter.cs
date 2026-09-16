@@ -1,11 +1,14 @@
 ﻿using MetaTrader.Util;
+using MtApi5;
 using System;
 
 namespace MetaTrader.Services
 {
     public static class EmaCompressionFilter
     {
+        const int BarsToFetch = 300;
         public static bool IsCompressed(
+            MtApi5Client _client,
             double[] emaFast,
             double[] emaSlow,
             double atr,
@@ -22,23 +25,22 @@ namespace MetaTrader.Services
             double threshold = atr * compressionFactor;
 
             bool compressed = emaDistance < threshold;
+            _client.CopyRates(symbol, ENUM_TIMEFRAMES.PERIOD_H1, 1, BarsToFetch, out MqlRates[] rates);
+            
+            double range0 = rates[^1].high - rates[^1].low;
+            double range1 = rates[^2].high - rates[^2].low;
 
-            if (compressed)
+            bool freshExpansion =
+                range1 >= atr * 0.8 &&   // breakout candle
+                range0 >= range1 * 0.8;  // continuation not collapsing
+
+            if (compressed && !freshExpansion)
             {
-                string profile =
-                    IsGold(symbol) ? "GOLD" :
-                    IsIndex(symbol) ? "INDEX" :
-                    IsCrypto(symbol) ? "CRYPTO" : "FX";
-
-                string message =
-                    $"[{symbol}] EMA compression detected ({profile}) | " +
-                    $"dist={emaDistance:F5} < thr={threshold:F5} | factor={compressionFactor:F2}";
-
-                Console.WriteLine(message);
-                LogFile.Write(message);
+                LogFile.Write($"Blocked entry due to EMA compression: {symbol}");
+                return true;
             }
 
-            return compressed;
+            return false;
         }
 
         private static double GetCompressionFactor(string symbol)

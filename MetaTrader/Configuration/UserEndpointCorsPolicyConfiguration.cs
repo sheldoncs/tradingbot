@@ -27,12 +27,12 @@ namespace TradingApplication.Configuration
                                                                          "http://localhost:4000",
                                                                          "http://localhost:8000",
                                                                          "http://localhost:7000",
-                                                                         "http://localhost:3001",
-                                                                         "http://localhost:3003",
-                                                                         "http://localhost:3004",
-                                                                         "http://localhost:44337",
-                                                                         "https://cavehillmaps.cavehill.uwi.edu",
-                                                                         "http://owl4:8080"
+                                                                         "http://localhost:7001",
+                                                                          "http://localhost:3001",
+                                                                          "http://localhost:3003",
+                                                                           "http://localhost:44337",
+                                                                           "https://cavehillmaps.cavehill.uwi.edu",
+                                                                           "http://owl4:8080"
                                                                            )
                                )
             );

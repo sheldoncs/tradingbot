@@ -10,10 +10,9 @@ using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace MetaTrader.Services
 {
-    /*Specific for Gold*/
     public static class TrendRideContinuationEngine
     {
-        public static double PullbackAtrFactor = 0.85;
+        public static double PullbackAtrFactor = 0.7;
         public static double MaxPullbackAtr = 1.5;
         public static double BodyStrength = 0.40;
 
@@ -48,29 +47,29 @@ namespace MetaTrader.Services
 
             string s = symbol.ToUpperInvariant();
 
-            bool isGold = IsGold(s);
+            bool isIndex = IsIndex(s);
 
             double minAtrPercentile =
                 IsFx(s) ? 0.30 :
-                isGold ? 0.35 :
+                IsGold(s) ? 0.35 :
                 IsCrypto(s) ? 0.40 :
-                IsIndex(s) ? 0.40 :
+                isIndex ? 0.40 :
                 0.35;
 
             double maxDistance =
-                isGold ? 1.10 :   // 🔥 tighter for gold
+                IsGold(s) ? 1.25 :
                 IsCrypto(s) ? 1.45 :
-                IsIndex(s) ? 1.15 :
+                isIndex ? 1.10 :   // 🔥 tighter for indices
                 0.95;
 
             double pullbackToSlowMax =
-                isGold ? 1.3 :   // 🔥 slightly tighter
+                IsGold(s) ? MaxPullbackAtr :
                 IsCrypto(s) ? 1.7 :
-                IsIndex(s) ? 1.6 :
+                isIndex ? 1.5 :
                 1.35;
 
             double bodyStrengthRequired =
-                isGold ? 0.60 :   // 🔥 stronger candle needed
+                IsGold(s) ? 0.50 :
                 BodyStrength;
 
             double normalizedAtrPercentile = atrPercentile > 1.0
@@ -91,16 +90,23 @@ namespace MetaTrader.Services
             if (normalizedAtrPercentile < minAtrPercentile)
                 return false;
 
-            double distanceFromEMA9 = Math.Abs(c0.close - ema9);
+            double distanceFromEMA9 = Math.Abs(c0.close - ema9) / atr;
 
-            if (distanceFromEMA9 > atr * maxDistance)
+            // 🔥 INDEX: BLOCK LATE ENTRIES
+            if (isIndex && distanceFromEMA9 > 1.2)
+            {
+                LogFile.Write($"[{symbol}] Blocked: late TrendRide (index)");
+                return false;
+            }
+
+            if (!isIndex && distanceFromEMA9 > maxDistance)
                 return false;
 
             double tolerance = atr * PullbackAtrFactor;
 
             bool validPullback =
                 Math.Abs(c1.close - ema9Prev) <= tolerance ||
-                Math.Abs(c1.close - ema9Prev) <= atr * 0.9 || // 🔥 tighter
+                Math.Abs(c1.close - ema9Prev) <= atr ||
                 (trendUp ? c1.low <= ema21Prev : c1.high >= ema21Prev);
 
             if (!validPullback)
@@ -120,40 +126,32 @@ namespace MetaTrader.Services
             bool bullishCandle = c0.close > c0.open && bodyRatio >= bodyStrengthRequired;
             bool bearishCandle = c0.close < c0.open && bodyRatio >= bodyStrengthRequired;
 
+            // 🔥 INDEX: EXHAUSTION FILTER
+            if (isIndex)
+            {
+                int strongMoves = 0;
+
+                for (int i = 1; i <= 4; i++)
+                {
+                    var c = rates[^i];
+                    double b = Math.Abs(c.close - c.open);
+                    double r = c.high - c.low;
+
+                    if (r > 0 && (b / r) > 0.6)
+                        strongMoves++;
+                }
+
+                if (strongMoves >= 3)
+                {
+                    LogFile.Write($"[{symbol}] Blocked: exhaustion move (index)");
+                    return false;
+                }
+            }
+
             double bid = _client.SymbolInfoDouble(ctx.Symbol, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_BID);
             double ask = _client.SymbolInfoDouble(ctx.Symbol, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_ASK);
 
             double executionPrice = ask;
-
-            // 🔥 GOLD: BLOCK TRADING NEAR EXTREMES
-            if (isGold)
-            {
-                int lookback = 8;
-                double recentHigh = double.MinValue;
-                double recentLow = double.MaxValue;
-
-                for (int i = 1; i <= lookback; i++)
-                {
-                    var c = rates[^i];
-                    recentHigh = Math.Max(recentHigh, c.high);
-                    recentLow = Math.Min(recentLow, c.low);
-                }
-
-                double distToHigh = Math.Abs(c0.close - recentHigh) / atr;
-                double distToLow = Math.Abs(c0.close - recentLow) / atr;
-
-                if (trendDown && distToLow < 0.8)
-                {
-                    LogFile.Write($"[{symbol}] Blocked: GOLD sell near low");
-                    return false;
-                }
-
-                if (trendUp && distToHigh < 0.8)
-                {
-                    LogFile.Write($"[{symbol}] Blocked: GOLD buy near high");
-                    return false;
-                }
-            }
 
             // =========================
             // BUY
@@ -171,7 +169,7 @@ namespace MetaTrader.Services
                     rates,
                     atr,
                     momentum,
-                    executionPrice))
+                    executionPrice, ema9))
                 {
                     return false;
                 }
@@ -195,7 +193,7 @@ namespace MetaTrader.Services
                     rates,
                     atr,
                     momentum,
-                    executionPrice))
+                    executionPrice, ema9))
                 {
                     return false;
                 }
@@ -230,9 +228,9 @@ namespace MetaTrader.Services
             double currentPrice = rates[^1].close;
 
             double minSpaceAtr =
-                IsGold(symbol) ? 0.8 :   // 🔥 increased for gold
+                IsGold(symbol) ? 0.8 :
                 IsCrypto(symbol) ? 0.7 :
-                IsIndex(symbol) ? 0.6 :
+                IsIndex(symbol) ? 0.7 :   // 🔥 slightly stricter
                 0.5;
 
             if (isBuy)

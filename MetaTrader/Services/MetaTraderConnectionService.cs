@@ -113,7 +113,7 @@ namespace MetaTrader.Services
             try
             {
                 TradeState state = await _stateStore.LoadAsync();
-                LogFile.Write($"Autotrade state...{state.AutoTrade} Connection Service = {ConnectionService.HasAny()}");
+                LogFile.Write($"Autotrade state...{state.AutoTrade}");
 
                 if (ConnectionService.HasAny() && state.AutoTrade == false)
                 {
@@ -125,37 +125,37 @@ namespace MetaTrader.Services
 
                     TradingEventBus.OnState += async (stateUpdate) =>
                     {
-                            await _chatHub.Clients.Group("test").SendAsync("onStateUpdate", stateUpdate);
+                            await _chatHub.Clients.Group("dashboards").SendAsync("onStateUpdate", stateUpdate);
                     };
 
                     TradingEventBus.onM15Snapshot += async (m15Snapshot) =>
                     {
-                            await _chatHub.Clients.Group("test").SendAsync("onM15Snapshot", m15Snapshot);
+                            await _chatHub.Clients.Group("dashboards").SendAsync("onM15Snapshot", m15Snapshot);
                     };
 
                     TradingEventBus.onSniper += async (sniperaction) =>
                     {
-                            await _chatHub.Clients.Group("test").SendAsync("onSniperUpdate", sniperaction);
+                            await _chatHub.Clients.Group("dashboards").SendAsync("onSniperUpdate", sniperaction);
                     };
 
                     TradingEventBus.OnTrade += async (trade) =>
                     {
-                            await _chatHub.Clients.Group("test").SendAsync("onTradeAction", trade);
+                            await _chatHub.Clients.Group("dashboards").SendAsync("onTradeAction", trade);
                     };
 
                     TradingEventBus.OnDecision += async (decision) =>
                     {
-                            await _chatHub.Clients.Group("test").SendAsync("onDecisionAction", decision);
+                            await _chatHub.Clients.Group("dashboards").SendAsync("onDecisionAction", decision);
                     };
 
                     TradingEventBus.onPerformanceContext += async (performanceContext) =>
                     {
-                            await _chatHub.Clients.Group("test").SendAsync("onPerformanceContext", performanceContext);
+                            await _chatHub.Clients.Group("dashboards").SendAsync("onPerformanceContext", performanceContext);
                     };
 
                     TradingEventBus.onMarketPhaseLoop += async (marketPhase) =>
                     {
-                            await _chatHub.Clients.Group("test").SendAsync("onMarketPhaseUpdate", marketPhase);
+                            await _chatHub.Clients.Group("dashboards").SendAsync("onMarketPhaseUpdate", marketPhase);
                     };
 
                     await _tradeService.openConnection(
@@ -163,7 +163,7 @@ namespace MetaTrader.Services
                         {
                             try
                             {   
-                                       await _chatHub.Clients.Group("test")
+                                       await _chatHub.Clients.Group("dashboards")
                                             .SendAsync("BuySellIndicator", chunk);
                             }
                             catch (Exception ex)
@@ -238,7 +238,7 @@ namespace MetaTrader.Services
             try
             {
                 LogFile.Write(
-                 $"TRADE TRANSACTION | {e}");
+            $"TRADE TRANSACTION | {e}");
                 _tradeService.CheckRecentlyClosedPositions();
             }
             catch (Exception ex)

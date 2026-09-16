@@ -4,13 +4,12 @@
     {
         Hold,
         TightenStop,
+        CoolingOff,
         CloseTrade,
         OpenTrade,
         EnterSell,
         EnterBuy,
         ResistanceSupport,
-        Bullish,
-        Bearish,
         Sell,
         Buy,
         Close,
@@ -29,6 +28,8 @@
         PriceExtendedTooFarFromEMA9,
         Cooling,
         Standby,
+        Bullish,
+        Bearish,
         None
     }
 }

@@ -233,6 +233,16 @@ namespace MetaTrader.Services
             }
         }
 
+
+        private class LiveBreakState
+        {
+            public bool BullBreakDetected;
+            public bool BearBreakDetected;
+            public DateTime FirstBreakTimeUtc;
+        }
+
+        private static readonly Dictionary<string, LiveBreakState> _liveBreakStates = new();
+
         // 🔥 ADD THIS NEW HELPER
         private static bool IsTrueCompression(MqlRates[] rates, int lookback, double atr)
         {
@@ -269,16 +279,6 @@ namespace MetaTrader.Services
 
             return tight && consistent && directionalAgreement;
         }
-
-        private class LiveBreakState
-        {
-            public bool BullBreakDetected;
-            public bool BearBreakDetected;
-            public DateTime FirstBreakTimeUtc;
-        }
-
-        private static readonly Dictionary<string, LiveBreakState> _liveBreakStates = new();
-
         public static bool ShouldEnterLive(
             string symbol,
             MqlRates[] rates,
@@ -504,6 +504,7 @@ namespace MetaTrader.Services
             _liveBreakStates[symbol].FirstBreakTimeUtc = DateTime.MinValue;
         }
 
+        
         private static int GetLiveHoldSeconds(string symbol)
         {
             symbol = NormalizeSymbol(symbol);

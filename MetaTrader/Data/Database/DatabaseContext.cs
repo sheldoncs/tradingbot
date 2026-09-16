@@ -43,7 +43,6 @@ namespace MetaTrader.Data.Database
             _configuration = configuration;
             _logger = logger;
         }
-
         public TData AddEntry<TData>(TData data, Boolean saveType)
         {
             if (saveType)

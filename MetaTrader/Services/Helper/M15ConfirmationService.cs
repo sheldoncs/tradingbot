@@ -2,6 +2,7 @@
 {
     using global::MetaTrader.Data.Entities;
     using global::MetaTrader.Enums;
+    using global::MetaTrader.Util;
     using MtApi5;
     using System;
     using System.Collections.Concurrent;
@@ -33,40 +34,40 @@
         }
 
         private static readonly Dictionary<string, M15Profile> Profiles = new()
-    {
-        { "XAUUSD", new M15Profile
-            {
-                ImpulseRangeAtr = 1.8,
-                BodyRatioMin = 0.65,
-                EmaSeparationAtr = 0.15,
-                EmaSlopeAtr = 0.02   // 🔥 relaxed
-            }
-        },
-        { "FX", new M15Profile
-            {
-                ImpulseRangeAtr = 1.4,
-                BodyRatioMin = 0.55,
-                EmaSeparationAtr = 0.08,
-                EmaSlopeAtr = 0.015  // 🔥 relaxed
-            }
-        },
-        { "CRYPTO", new M15Profile
-            {
-                ImpulseRangeAtr = 2.0,
-                BodyRatioMin = 0.60,
-                EmaSeparationAtr = 0.12,
-                EmaSlopeAtr = 0.02   // 🔥 relaxed
-            }
-        },
-        { "INDEX", new M15Profile
-            {
-                ImpulseRangeAtr = 1.6,
-                BodyRatioMin = 0.60,
-                EmaSeparationAtr = 0.10,
-                EmaSlopeAtr = 0.02   // 🔥 relaxed
-            }
+{
+    { "XAUUSD", new M15Profile
+        {
+            ImpulseRangeAtr = 1.8,
+            BodyRatioMin = 0.65,
+            EmaSeparationAtr = 0.15,
+            EmaSlopeAtr = 0.02   // 🔥 relaxed
         }
-    };
+    },
+    { "FX", new M15Profile
+        {
+            ImpulseRangeAtr = 1.4,
+            BodyRatioMin = 0.55,
+            EmaSeparationAtr = 0.08,
+            EmaSlopeAtr = 0.015  // 🔥 relaxed
+        }
+    },
+    { "CRYPTO", new M15Profile
+        {
+            ImpulseRangeAtr = 2.0,
+            BodyRatioMin = 0.60,
+            EmaSeparationAtr = 0.12,
+            EmaSlopeAtr = 0.02   // 🔥 relaxed
+        }
+    },
+    { "INDEX", new M15Profile
+        {
+            ImpulseRangeAtr = 1.6,
+            BodyRatioMin = 0.60,
+            EmaSeparationAtr = 0.10,
+            EmaSlopeAtr = 0.02   // 🔥 relaxed
+        }
+    }
+};
 
         private static M15Profile GetProfile(string symbol)
         {
@@ -93,34 +94,87 @@
 
             var profile = GetProfile(symbol);
 
+            // =============================================================
+            // CLOSED-CANDLE M15 CONFIRMATION
+            //
+            // rates[^1] = latest CLOSED M15 candle.
+            // We deliberately do NOT use rates[0] and we do NOT use the
+            // incomplete/live M15 candle for confirmation.
+            // =============================================================
+            var current = rates[^1];
+
             double atr = CalculateATR(rates, 14);
             double ema9 = CalculateEMA(rates, 9);
             double ema21 = CalculateEMA(rates, 21);
 
-            var current = rates[0];
+            // EMA9 as it stood on the candle immediately BEFORE rates[^1].
+            // This gives us a true closed-candle EMA slope instead of
+            // comparing against the previous service refresh/cache value.
+            double previousClosedEma9 =
+                CalculateEMA(
+                    rates,
+                    9,
+                    rates.Length - 1
+                );
+
             double range = current.high - current.low;
             double body = Math.Abs(current.close - current.open);
+            double bodyRatio = body / Math.Max(range, 0.00001);
 
-            _cache.TryGetValue(symbol, out var prev);
+            bool closedCandleBullish =
+                current.close > current.open;
+
+            bool closedCandleBearish =
+                current.close < current.open;
+
+            bool bullishStructure =
+                ema9 > ema21 &&
+                ema9 > previousClosedEma9 &&
+                current.close >= ema9;
+
+            bool bearishStructure =
+                ema9 < ema21 &&
+                ema9 < previousClosedEma9 &&
+                current.close <= ema9;
 
             var snapshot = new M15Snapshot
             {
                 Symbol = symbol,
-                CandleTime = rates[^1].time,
+                CandleTime = current.time,
 
                 Atr = atr,
 
-                PrevEmaFast = prev?.EmaFast ?? ema9,
+                PrevEmaFast = previousClosedEma9,
                 EmaFast = ema9,
                 EmaSlow = ema21,
 
                 IsImpulsive =
                     range >= atr * profile.ImpulseRangeAtr &&
-                    (body / Math.Max(range, 0.00001)) >= profile.BodyRatioMin,
+                    bodyRatio >= profile.BodyRatioMin,
 
-                Bullish = ema9 > ema21 && ema9 > (prev?.EmaFast ?? ema9),
-                Bearish = ema9 < ema21 && ema9 < (prev?.EmaFast ?? ema9)
+                // IMPORTANT:
+                // M15 now CONFIRMS direction using the latest CLOSED candle.
+                // A BUY requires a bullish closed M15 candle plus bullish EMA
+                // structure/slope. A SELL requires the mirror image.
+                Bullish =
+                    closedCandleBullish &&
+                    bullishStructure,
+
+                Bearish =
+                    closedCandleBearish &&
+                    bearishStructure
             };
+
+            LogFile.Write(
+                $"[{symbol}] M15 CLOSED CONFIRMATION | " +
+                $"time={current.time} | " +
+                $"open={current.open:F5} | close={current.close:F5} | " +
+                $"ema9={ema9:F5} | prevEma9={previousClosedEma9:F5} | " +
+                $"ema21={ema21:F5} | " +
+                $"candleBullish={closedCandleBullish} | " +
+                $"candleBearish={closedCandleBearish} | " +
+                $"Bullish={snapshot.Bullish} | Bearish={snapshot.Bearish}"
+            );
 
             _cache[symbol] = snapshot;
         }
@@ -230,12 +284,48 @@
         // =====================================
         private static double CalculateEMA(MqlRates[] rates, int period)
         {
-            double k = 2.0 / (period + 1);
-            double ema = rates[^period].close;
+            return CalculateEMA(
+                rates,
+                period,
+                rates.Length
+            );
+        }
 
-            for (int i = rates.Length - period + 1; i < rates.Length; i++)
+        // =============================================================
+        // EMA END-BOUND OVERLOAD
+        //
+        // endExclusive allows us to calculate the EMA as of a specific
+        // CLOSED candle without copying/mutating the rates array.
+        // =============================================================
+        private static double CalculateEMA(
+            MqlRates[] rates,
+            int period,
+            int endExclusive)
+        {
+            if (rates == null ||
+                period <= 0 ||
+                endExclusive <= 0 ||
+                endExclusive > rates.Length ||
+                endExclusive < period)
             {
-                ema = rates[i].close * k + ema * (1 - k);
+                return 0.0;
+            }
+
+            double k = 2.0 / (period + 1.0);
+
+            int startIndex =
+                endExclusive - period;
+
+            double ema =
+                rates[startIndex].close;
+
+            for (int i = startIndex + 1;
+                 i < endExclusive;
+                 i++)
+            {
+                ema =
+                    rates[i].close * k +
+                    ema * (1.0 - k);
             }
 
             return ema;
@@ -414,7 +504,7 @@
             // =====================================
             // 🟡 CONTINUATION (UPDATED)
             // =====================================
-            if (model == EntryModel.Continuation || 
+            if (model == EntryModel.Continuation ||
                 model == EntryModel.TrendRideContinuation)
             {
                 // 🔥 allow strong impulse continuation

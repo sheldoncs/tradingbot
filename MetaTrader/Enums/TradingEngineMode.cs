@@ -8,8 +8,7 @@
         BreakoutContinuationMode,
         BreakRetestMode,
         TrendRideMode,
-        ExhaustionReversalMode,
-        CascadeBreakdownMode
+        ExhaustionReversalMode
     }
 }
 

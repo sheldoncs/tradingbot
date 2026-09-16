@@ -1,6 +1,7 @@
 using MetaTrader.Data.Database;
 using MetaTrader.Services;
 using MetaTrader.Services.Contract;
+using MetaTrader.Services.Helper;
 using MetaTrader.Services.Interfaces;
 using MetaTrader.Util;
 using MetaTrader.Util.Trading.Execution;

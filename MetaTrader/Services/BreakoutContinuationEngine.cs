@@ -80,6 +80,7 @@ namespace MetaTrader.Services
             double atr,
             double[] emaFast,
             double[] emaSlow,
+            double ema9Previous,
             double momentum,
             double bid,
             double ask,
@@ -136,24 +137,101 @@ namespace MetaTrader.Services
 
 
             // ==================================================
+            // 2A. LIVE CANDLE DIRECTION
+            //
+            // rates[^1] is the latest CLOSED candle.  Entry decisions,
+            // however, are made with live bid / ask.  Keep those two
+            // concepts separate so an old bearish candle cannot trigger
+            // a fresh SELL while the current live candle is rebounding
+            // bullish (and vice versa for BUYs).
+            // ==================================================
+
+            double liveMid =
+                (bid + ask) / 2.0;
+
+            double liveOpen =
+                c0.close;
+
+            double liveDirectionalBody =
+                Math.Abs(
+                    liveMid -
+                    liveOpen
+                );
+
+            double liveDirectionalBodyAtr =
+                liveDirectionalBody / atr;
+
+            bool liveBullishNow =
+                liveMid > liveOpen;
+
+            bool liveBearishNow =
+                liveMid < liveOpen;
+
+            // Direct/instant entries need a meaningful live move in the
+            // same direction as the proposed trade.  0.15 ATR is large
+            // enough to reject tiny spread/tick noise without demanding
+            // another full impulse candle.
+            bool liveBullishConfirmation =
+                liveBullishNow &&
+                liveDirectionalBodyAtr >= 0.15;
+
+            bool liveBearishConfirmation =
+                liveBearishNow &&
+                liveDirectionalBodyAtr >= 0.15;
+
+
+            // ==================================================
             // 3. EMA STRUCTURE
             // ==================================================
 
             double ema9 =
                 emaFast[^1];
 
+            // IMPORTANT:
+            // ema9Previous must be the most recent CLOSED EMA9 value.
+            // Passing it explicitly prevents a live EMA array from
+            // comparing against the second-most-recent closed EMA.
             double ema21 =
                 emaSlow[^1];
 
 
+            bool ema9Rising =
+                ema9 > ema9Previous;
+
+            bool ema9Falling =
+                ema9 < ema9Previous;
+
+
             bool trendUp =
                 ema9 > ema21 &&
-                emaFast[^1] > emaFast[^2];
+                ema9Rising;
 
 
             bool trendDown =
                 ema9 < ema21 &&
-                emaFast[^1] < emaFast[^2];
+                ema9Falling;
+
+
+            // ==================================================
+            // PRIMARY DIRECTIONAL REGIME
+            //
+            // EMA9 / EMA21 alignment is the final directional
+            // authority for this engine.  A BUY is never allowed
+            // while EMA9 is below EMA21, and a SELL is never
+            // allowed while EMA9 is above EMA21.
+            //
+            // EMA9 slope is still used by trendUp / trendDown for
+            // normal continuation quality, but escape / instant /
+            // pullback paths can no longer bypass EMA alignment.
+            // ==================================================
+
+            bool buyRegimeAllowed =
+                ema9 > ema21 &&
+                ema9Rising;
+
+            bool sellRegimeAllowed =
+                ema9 < ema21 &&
+                ema9Falling;
 
 
             double emaSpreadAtr =
@@ -327,6 +405,7 @@ namespace MetaTrader.Services
             // ==================================================
 
             bool liveBullEscape =
+                buyRegimeAllowed &&
                 liveBuyPrice > c1.high &&
                 liveBuyPrice > ema9 &&
                 liveBuyPrice > ema21 &&
@@ -334,6 +413,7 @@ namespace MetaTrader.Services
 
 
             bool liveBearEscape =
+                sellRegimeAllowed &&
                 liveSellPrice < c1.low &&
                 liveSellPrice < ema9 &&
                 liveSellPrice < ema21 &&
@@ -592,6 +672,7 @@ namespace MetaTrader.Services
 
             bool preBreakoutBuy =
                 trendUp &&
+                liveBullishConfirmation &&
                 liveBuyPrice > ema9 &&
                 liveBuyPrice > ema21 &&
                 distToBreakoutAtr > 0 &&
@@ -643,6 +724,7 @@ namespace MetaTrader.Services
 
             bool preBreakoutSell =
                 trendDown &&
+                liveBearishConfirmation &&
                 liveSellPrice < ema9 &&
                 liveSellPrice < ema21 &&
                 distToBreakdownAtr > 0 &&
@@ -878,6 +960,7 @@ namespace MetaTrader.Services
 
                 if (liveBullEscape &&
                     ultraMomentum &&
+                    liveBullishConfirmation &&
                     !choppySetup)
                 {
                     action =
@@ -890,6 +973,8 @@ namespace MetaTrader.Services
                     LogFile.Write(
                         $"[{s}] ⚡ ULTRA MOMENTUM BUY | " +
                         $"bodyAtr={bodyAtrCheck:F2}, " +
+                        $"liveBodyAtr={liveDirectionalBodyAtr:F2}, " +
+                        $"liveBullish={liveBullishNow}, " +
                         $"emaDist={distBuyFromEma9Atr:F2}, " +
                         $"choppy={choppySetup}"
                     );
@@ -904,7 +989,8 @@ namespace MetaTrader.Services
                 // ==================================================
 
                 if (liveBullEscape &&
-                    instantBuyQuality)
+                    instantBuyQuality &&
+                    liveBullishConfirmation)
                 {
                     action =
                         TradeAction.EnterBuy;
@@ -936,6 +1022,24 @@ namespace MetaTrader.Services
                         $"{profile.InstantMinEmaDistanceAtr:F2}-" +
                         $"{profile.InstantMaxEmaDistanceAtr:F2}, " +
                         $"choppy={choppySetup}"
+                    );
+                }
+
+
+                // If the historical breakout/escape is bullish but the
+                // CURRENT live candle is not confirming BUY direction,
+                // do not fire an instant entry.  The normal delayed path
+                // may still track the breakout and enter later if live
+                // direction becomes bullish again.
+                if ((liveBullEscape || liveBullBreak) &&
+                    !liveBullishConfirmation)
+                {
+                    LogFile.Write(
+                        $"[{s}] ⛔ BUY instant entry blocked: live candle not confirming | " +
+                        $"liveOpen={liveOpen:F5}, " +
+                        $"liveMid={liveMid:F5}, " +
+                        $"liveBodyAtr={liveDirectionalBodyAtr:F2}, " +
+                        $"liveBullish={liveBullishNow}"
                     );
                 }
 
@@ -996,6 +1100,19 @@ namespace MetaTrader.Services
                             $"price fell below EMA9 | " +
                             $"price={liveBuyPrice:F5}, " +
                             $"ema9={ema9:F5}"
+                        );
+
+                        return false;
+                    }
+
+
+                    if (!liveBullishNow)
+                    {
+                        LogFile.Write(
+                            $"[{s}] BUY still holding: live candle not bullish | " +
+                            $"liveOpen={liveOpen:F5}, " +
+                            $"liveMid={liveMid:F5}, " +
+                            $"liveBodyAtr={liveDirectionalBodyAtr:F2}"
                         );
 
                         return false;
@@ -1184,6 +1301,7 @@ namespace MetaTrader.Services
 
                 if (liveBearEscape &&
                     ultraMomentum &&
+                    liveBearishConfirmation &&
                     !choppySetup)
                 {
                     action =
@@ -1196,6 +1314,8 @@ namespace MetaTrader.Services
                     LogFile.Write(
                         $"[{s}] ⚡ ULTRA MOMENTUM SELL | " +
                         $"bodyAtr={bodyAtrCheck:F2}, " +
+                        $"liveBodyAtr={liveDirectionalBodyAtr:F2}, " +
+                        $"liveBearish={liveBearishNow}, " +
                         $"emaDist={distSellFromEma9Atr:F2}, " +
                         $"choppy={choppySetup}"
                     );
@@ -1210,7 +1330,8 @@ namespace MetaTrader.Services
                 // ==================================================
 
                 if (liveBearEscape &&
-                    instantSellQuality)
+                    instantSellQuality &&
+                    liveBearishConfirmation)
                 {
                     action =
                         TradeAction.EnterSell;
@@ -1242,6 +1363,24 @@ namespace MetaTrader.Services
                         $"{profile.InstantMinEmaDistanceAtr:F2}-" +
                         $"{profile.InstantMaxEmaDistanceAtr:F2}, " +
                         $"choppy={choppySetup}"
+                    );
+                }
+
+
+                // If the historical breakout/escape is bearish but the
+                // CURRENT live candle is not confirming SELL direction,
+                // do not fire an instant entry.  The normal delayed path
+                // may still track the breakout and enter later if live
+                // direction becomes bearish again.
+                if ((liveBearEscape || liveBearBreak) &&
+                    !liveBearishConfirmation)
+                {
+                    LogFile.Write(
+                        $"[{s}] ⛔ SELL instant entry blocked: live candle not confirming | " +
+                        $"liveOpen={liveOpen:F5}, " +
+                        $"liveMid={liveMid:F5}, " +
+                        $"liveBodyAtr={liveDirectionalBodyAtr:F2}, " +
+                        $"liveBearish={liveBearishNow}"
                     );
                 }
 
@@ -1302,6 +1441,19 @@ namespace MetaTrader.Services
                             $"price moved above EMA9 | " +
                             $"price={liveSellPrice:F5}, " +
                             $"ema9={ema9:F5}"
+                        );
+
+                        return false;
+                    }
+
+
+                    if (!liveBearishNow)
+                    {
+                        LogFile.Write(
+                            $"[{s}] SELL still holding: live candle not bearish | " +
+                            $"liveOpen={liveOpen:F5}, " +
+                            $"liveMid={liveMid:F5}, " +
+                            $"liveBodyAtr={liveDirectionalBodyAtr:F2}"
                         );
 
                         return false;
@@ -1370,7 +1522,8 @@ namespace MetaTrader.Services
                     c1.close < ema9;
 
 
-                if (pulledBackToEma &&
+                if (sellRegimeAllowed &&
+                    pulledBackToEma &&
                     weakBullishBounce &&
                     bearishContinuation)
                 {
@@ -1422,7 +1575,8 @@ namespace MetaTrader.Services
                     c1.close > ema9;
 
 
-                if (pulledBackToEma &&
+                if (buyRegimeAllowed &&
+                    pulledBackToEma &&
                     weakBearishPullback &&
                     bullishContinuation)
                 {
@@ -1451,6 +1605,8 @@ namespace MetaTrader.Services
 
             LogFile.Write(
                 $"[{s}] Breakout no entry | " +
+                $"buyRegime={buyRegimeAllowed}, " +
+                $"sellRegime={sellRegimeAllowed}, " +
                 $"trendUp={trendUp}, " +
                 $"trendDown={trendDown}, " +
                 $"normalBuy={liveBullBreak}, " +
@@ -1939,15 +2095,15 @@ namespace MetaTrader.Services
 
             string[] currencies =
             {
-            "USD",
-            "EUR",
-            "GBP",
-            "JPY",
-            "AUD",
-            "NZD",
-            "CAD",
-            "CHF"
-        };
+    "USD",
+    "EUR",
+    "GBP",
+    "JPY",
+    "AUD",
+    "NZD",
+    "CAD",
+    "CHF"
+};
 
 
             bool validBase =
