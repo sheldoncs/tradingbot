@@ -12,6 +12,7 @@ namespace MetaTrader.Services
             public double H1Change { get; set; }
             public double Hybrid { get; set; }
 
+            public double PreviousHybrid { get; set; }
             public bool Strong { get; set; }
             public bool Breakout { get; set; }
             public bool Impulse { get; set; }
@@ -464,6 +465,7 @@ namespace MetaTrader.Services
             {
                 PriceMomentum = priceMomentum,
                 H1Change = h1Change,
+                PreviousHybrid = prevHybrid,
                 Hybrid = hybrid,
 
                 Strong = strong,

@@ -41,6 +41,10 @@ namespace MetaTrader.Services.Helper
 
         public static bool AllowMomentumLotBoost = false;
 
+        // GOLD uses this fixed profile lot rather than a monetary-risk calculator.
+        // WARNING: the software risk manager cannot guarantee a maximum loss.
+        public static double GoldFixedLot = 0.01;
+
         // =====================================================
         // DYNAMIC TRACKING
         // =====================================================
@@ -48,11 +52,24 @@ namespace MetaTrader.Services.Helper
 
         private static readonly Dictionary<string, int> SymbolWins = new();
         private static readonly Dictionary<string, int> SymbolLosses = new();
+        private static readonly object _statsSync = new object();
+
+        // Wire these once at application startup using REAL MT5 account data.
+        // The profit calculator must return the USD/account-currency LOSS for ONE LOT
+        // from entryPrice to stopLoss; a nonpositive result rejects the trade.
+        public static Func<string, double, double, double> LossPerLotInAccountCurrency { get; set; }
+        public static Func<double> LiveAccountEquityProvider { get; set; }
+
+        // Set true after wiring LossPerLotInAccountCurrency to MT5.
+        // XRP CFD contract sizes and tick values vary by broker.
+        // Default true: reject crypto trades until a verified MT5-backed calculator is wired.
+        public static bool RequireBrokerLossCalculatorForCrypto = true;
+
 
         // =====================================================
         // SYMBOL PROFILES
         // =====================================================
-        private static readonly Dictionary<string, SymbolLotProfile> Profiles = new()
+        private static readonly Dictionary<string, SymbolLotProfile> Profiles = new(StringComparer.OrdinalIgnoreCase)
         {
             // -----------------------------
             // GOLD / METALS
@@ -234,6 +251,9 @@ namespace MetaTrader.Services.Helper
             public double RiskPercent { get; set; }
             public double RiskAmount { get; set; }
             public double SlDistance { get; set; }
+            public double EstimatedSLRisk { get; set; }
+            public double LossPerLot { get; set; }
+            public string RiskSource { get; set; }
         }
 
         // =====================================================
@@ -245,16 +265,13 @@ namespace MetaTrader.Services.Helper
         {
             symbol = NormalizeSymbol(symbol);
 
-            if (!SymbolWins.ContainsKey(symbol))
-                SymbolWins[symbol] = 0;
-
-            if (!SymbolLosses.ContainsKey(symbol))
-                SymbolLosses[symbol] = 0;
-
-            if (win)
-                SymbolWins[symbol]++;
-            else
-                SymbolLosses[symbol]++;
+            lock (_statsSync)
+            {
+                if (!SymbolWins.ContainsKey(symbol)) SymbolWins[symbol] = 0;
+                if (!SymbolLosses.ContainsKey(symbol)) SymbolLosses[symbol] = 0;
+                if (win) SymbolWins[symbol]++;
+                else SymbolLosses[symbol]++;
+            }
         }
 
         // =====================================================
@@ -263,18 +280,19 @@ namespace MetaTrader.Services.Helper
         public static void UpdateRiskMode(
             double currentEquity)
         {
-            PeakEquity =
-                Math.Max(PeakEquity, currentEquity);
+            if (double.IsNaN(currentEquity) || double.IsInfinity(currentEquity) || currentEquity <= 0)
+                return;
 
-            double drawdownPercent =
-                ((PeakEquity - currentEquity)
-                / PeakEquity) * 100.0;
-
-            int totalWins =
-                SymbolWins.Values.Sum();
-
-            int totalLosses =
-                SymbolLosses.Values.Sum();
+            int totalWins;
+            int totalLosses;
+            double drawdownPercent;
+            lock (_statsSync)
+            {
+                PeakEquity = Math.Max(PeakEquity, currentEquity);
+                drawdownPercent = ((PeakEquity - currentEquity) / PeakEquity) * 100.0;
+                totalWins = SymbolWins.Values.Sum();
+                totalLosses = SymbolLosses.Values.Sum();
+            }
 
             int totalTrades =
                 totalWins + totalLosses;
@@ -344,130 +362,177 @@ namespace MetaTrader.Services.Helper
             bool isStrongMomentum)
         {
             symbol = NormalizeSymbol(symbol);
-
             var profile = GetProfile(symbol);
-
             double riskPercent = GetRiskPercent(symbol);
+            double riskAmount = accountEquity * riskPercent / 100.0;
+            double slDistance = Math.Abs(entryPrice - stopLoss);
 
-            double riskAmount =
-                accountEquity * (riskPercent / 100.0);
-
-            double normalizedAtrPercentile =
-                atrPercentile > 1.0
-                ? atrPercentile / 100.0
-                : atrPercentile;
-
-            // --------------------------------
-            // REAL SL DISTANCE
-            // --------------------------------
-            double slDistance =
-                Math.Abs(entryPrice - stopLoss);
-
-            if (slDistance <= 0)
+            // GOLD: explicit fixed-lot execution mode for XAUUSD / XAUEUR.
+            // No broker loss calculator, verification configuration or USD-budget
+            // veto. The caller must still send a valid broker-side SL.
+            if (IsGold(symbol))
             {
-                LogFile.Write(
-                    $"❌ {symbol} invalid SL distance");
-
+                if (string.IsNullOrWhiteSpace(symbol) ||
+                    !double.IsFinite(accountEquity) || accountEquity <= 0 ||
+                    !double.IsFinite(entryPrice) || entryPrice <= 0 ||
+                    !double.IsFinite(stopLoss) || stopLoss <= 0 ||
+                    slDistance <= 0 || !double.IsFinite(GoldFixedLot) ||
+                    GoldFixedLot < profile.BaseLot || GoldFixedLot > profile.MaxLot)
+                {
+                    LogFile.Write($"[{symbol}] GOLD FIXED LOT REJECTED | invalid equity/price/SL or lot exceeds profile");
+                    return new LotDecision
+                    {
+                        Lot = 0,
+                        RiskSource = "REJECTED",
+                        Reason = "Invalid GOLD fixed lot or price/stop inputs"
+                    };
+                }
+                double fixedLot = Math.Round(Math.Floor((GoldFixedLot + 1e-10) / 0.01) * 0.01, 2);
+                if (fixedLot < profile.BaseLot || fixedLot > profile.MaxLot)
+                    return new LotDecision
+                    {
+                        Lot = 0,
+                        RiskSource = "REJECTED",
+                        Reason = "GOLD fixed lot outside profile"
+                    };
+                LogFile.Write($"[{symbol}] GOLD FIXED LOT APPROVED | lot={fixedLot:F2} | " +
+                    "riskBudgetVeto=False | brokerLossCalculatorRequired=False");
                 return new LotDecision
                 {
-                    Lot = profile.BaseLot,
-                    Reason = "Invalid SL distance",
-                    RiskPercent = riskPercent,
-                    RiskAmount = riskAmount,
-                    SlDistance = slDistance
+                    Lot = fixedLot,
+                    RiskPercent = 0,
+                    RiskAmount = 0,
+                    SlDistance = slDistance,
+                    EstimatedSLRisk = double.NaN,
+                    LossPerLot = double.NaN,
+                    RiskSource = "FIXED_GOLD_PROFILE",
+                    Reason = "GOLD fixed profile lot - no account-currency sizing gate"
                 };
             }
 
-            // --------------------------------
-            // BASE LOT
-            // --------------------------------
-            double lot =
-                riskAmount /
-                (slDistance * profile.ContractSize);
-
-            // --------------------------------
-            // HIGH VOLATILITY CUT
-            // --------------------------------
-            if (normalizedAtrPercentile >= 0.85)
+            LotDecision Reject(string reason)
             {
-                lot *= profile.HighVolatilityCut;
+                LogFile.Write($"[{symbol}] LOT SIZING BLOCKED | {reason}");
+                return new LotDecision
+                {
+                    Lot = 0.0,
+                    Reason = reason,
+                    RiskPercent = riskPercent,
+                    RiskAmount = riskAmount,
+                    SlDistance = slDistance,
+                    EstimatedSLRisk = 0.0,
+                    LossPerLot = 0.0,
+                    RiskSource = "REJECTED"
+                };
             }
 
-            // --------------------------------
-            // LOW VOLATILITY BOOST
-            // --------------------------------
-            else if (
-                normalizedAtrPercentile <= 0.30 &&
-                CurrentRiskMode != RiskMode.Recovery)
+            if (string.IsNullOrWhiteSpace(symbol) ||
+                double.IsNaN(accountEquity) || double.IsInfinity(accountEquity) || accountEquity <= 0 ||
+                double.IsNaN(entryPrice) || double.IsInfinity(entryPrice) || entryPrice <= 0 ||
+                double.IsNaN(stopLoss) || double.IsInfinity(stopLoss) || stopLoss <= 0 ||
+                slDistance <= 0 || profile.BaseLot <= 0 || profile.MaxLot < profile.BaseLot ||
+                double.IsNaN(riskAmount) || double.IsInfinity(riskAmount) || riskAmount <= 0 ||
+                double.IsNaN(atrPercentile) || double.IsInfinity(atrPercentile) || atrPercentile < 0)
+                return Reject("Invalid equity, price, stop, or profile");
+
+            // A buy stop must be below entry; a sell stop must be above entry.
+            // Direction is not part of this public method signature, so validate
+            // the intended side at the OpenTrade caller before using the lot.
+            if (IsCrypto(symbol) && RequireBrokerLossCalculatorForCrypto &&
+                LossPerLotInAccountCurrency == null)
+                return Reject("Broker loss calculator is required for crypto CFD risk");
+
+            // For accurate currency conversion and CFD specifications, prefer
+            // a REAL broker-backed loss calculator (for one standard lot).
+            double lossPerLot;
+            string riskSource;
+            if (LossPerLotInAccountCurrency != null)
             {
-                lot *= profile.LowVolatilityBoost;
+                try
+                {
+                    lossPerLot = LossPerLotInAccountCurrency(symbol, entryPrice, stopLoss);
+                    riskSource = "BROKER_DELEGATE";
+                }
+                catch (Exception ex) { return Reject("MT5 loss calculation failed: " + ex.Message); }
+            }
+            else if (symbol.EndsWith("USD", StringComparison.OrdinalIgnoreCase) &&
+                     profile.ContractSize > 0)
+            {
+                // Approximation only for USD-quoted instruments on a USD account.
+                // CFDs may still have different contract/tick economics: wire the provider.
+                lossPerLot = slDistance * profile.ContractSize;
+                riskSource = "PROFILE_APPROXIMATION";
+            }
+            else
+            {
+                return Reject("Broker account-currency loss calculator required for " + symbol);
             }
 
-            // --------------------------------
-            // MOMENTUM BOOST
-            // --------------------------------
-            if (
-                isStrongMomentum &&
-                AllowMomentumLotBoost &&
-                CurrentRiskMode != RiskMode.Recovery)
+            if (double.IsNaN(lossPerLot) || double.IsInfinity(lossPerLot) || lossPerLot <= 0)
+                return Reject("Invalid broker loss per lot");
+
+            // Never round UP to the broker's minimum lot when that exceeds risk.
+            if (lossPerLot * profile.BaseLot > riskAmount)
+                return Reject($"Minimum lot {profile.BaseLot:F2} risks " +
+                    $"{lossPerLot * profile.BaseLot:F2}, above budget {riskAmount:F2}");
+
+            double lot = riskAmount / lossPerLot;
+            double normalizedAtr = atrPercentile > 1 ? atrPercentile / 100.0 : atrPercentile;
+            if (!double.IsNaN(normalizedAtr) && !double.IsInfinity(normalizedAtr))
             {
+                if (normalizedAtr >= 0.85) lot *= profile.HighVolatilityCut;
+                else if (normalizedAtr <= 0.30 && CurrentRiskMode != RiskMode.Recovery)
+                    lot *= profile.LowVolatilityBoost;
+            }
+
+            if (isStrongMomentum && AllowMomentumLotBoost && CurrentRiskMode != RiskMode.Recovery)
                 lot *= 1.10;
-            }
 
-            // --------------------------------
-            // SYMBOL FACTOR
-            // --------------------------------
             lot *= profile.VolatilityFactor;
+            lot = Math.Min(lot, profile.MaxLot);
+            lot = Math.Min(lot, riskAmount / lossPerLot); // cap after ALL boosts
+            if (double.IsNaN(lot) || double.IsInfinity(lot) || lot <= 0)
+                return Reject("Invalid calculated lot");
 
-            // --------------------------------
-            // ROUNDING
-            // --------------------------------
+            // Existing profiles use 0.01 lots as the step. Validate broker step at execution.
+            lot = Math.Floor((lot + 1e-10) / 0.01) * 0.01;
             lot = Math.Round(lot, 2);
+            if (lot < profile.BaseLot)
+                return Reject("Calculated lot below minimum after volatility adjustments");
 
-            // --------------------------------
-            // MIN LOT
-            // --------------------------------
-            lot = Math.Max(profile.BaseLot, lot);
+            double estimatedLoss = lot * lossPerLot;
+            if (double.IsNaN(estimatedLoss) || double.IsInfinity(estimatedLoss) ||
+                estimatedLoss <= 0.0)
+                return Reject("Invalid estimated stop-loss risk");
 
-            // --------------------------------
-            // MAX CAP
-            // --------------------------------
-            if (lot > profile.MaxLot)
-            {
-                LogFile.Write(
-                    $"⚠️ {symbol} lot capped from {lot} → {profile.MaxLot}");
+            if (estimatedLoss > riskAmount + 1e-7)
+                return Reject("Calculated loss exceeds trade budget");
 
-                lot = profile.MaxLot;
-            }
-
-            // --------------------------------
-            // FINAL LOG
-            // --------------------------------
-            LogFile.Write(
-                $"[{symbol}] Lot={lot:F2} | " +
-                $"Mode={CurrentRiskMode} | " +
-                $"Equity={accountEquity:F2} | " +
-                $"Risk%={riskPercent:F2}% | " +
-                $"Risk=${riskAmount:F2} | " +
-                $"SL={slDistance:F5} | " +
-                $"ATR%={normalizedAtrPercentile:F2}"
-            );
+            LogFile.Write($"[{symbol}] LOT SIZING DIAGNOSTIC | " +
+                $"Lot={lot:F2} | Mode={CurrentRiskMode} | " +
+                $"Equity={accountEquity:F2} | RiskPercent={riskPercent:F3}% | " +
+                $"RiskBudget={riskAmount:F4} | " +
+                $"EntryPrice={entryPrice:F8} | StopLoss={stopLoss:F8} | " +
+                $"SLDistance={slDistance:F8} | " +
+                $"ProfileContractSize={profile.ContractSize:F4} | " +
+                $"RiskSource={riskSource} | " +
+                $"LossPerLot={lossPerLot:F8} | EstimatedSLRisk={estimatedLoss:F8}");
 
             return new LotDecision
             {
                 Lot = lot,
-                Reason =
-                    $"{symbol} → SL-based dynamic sizing ({CurrentRiskMode})",
-
                 RiskPercent = riskPercent,
                 RiskAmount = riskAmount,
-                SlDistance = slDistance
+                SlDistance = slDistance,
+                EstimatedSLRisk = estimatedLoss,
+                LossPerLot = lossPerLot,
+                RiskSource = riskSource,
+                Reason = $"{symbol} SL-based dynamic sizing ({CurrentRiskMode})"
             };
         }
 
-        // =====================================================
-        // BACKWARD COMPATIBLE
-        // =====================================================
+        // Existing five-argument callers remain compilable, but no stale hardcoded
+        // account equity is permitted. Wire LiveAccountEquityProvider at startup.
         public static LotDecision Calculate(
             string symbol,
             double entryPrice,
@@ -475,20 +540,11 @@ namespace MetaTrader.Services.Helper
             double atrPercentile,
             bool isStrongMomentum)
         {
-            double fallbackEquity = 9637.00;
-
-            LogFile.Write(
-                $"⚠️ Old Calculate() overload used. " +
-                $"Fallback equity={fallbackEquity:F2}");
-
-            return Calculate(
-                symbol,
-                fallbackEquity,
-                entryPrice,
-                stopLoss,
-                atrPercentile,
-                isStrongMomentum
-            );
+            double equity = 0;
+            try { if (LiveAccountEquityProvider != null) equity = LiveAccountEquityProvider(); }
+            catch (Exception ex) { LogFile.Write("Equity provider failed: " + ex.Message); }
+            return Calculate(symbol, equity, entryPrice, stopLoss,
+                atrPercentile, isStrongMomentum);
         }
 
         // =====================================================
@@ -514,15 +570,13 @@ namespace MetaTrader.Services.Helper
 
             symbol = NormalizeSymbol(symbol);
 
-            int wins =
-                SymbolWins.ContainsKey(symbol)
-                ? SymbolWins[symbol]
-                : 0;
-
-            int losses =
-                SymbolLosses.ContainsKey(symbol)
-                ? SymbolLosses[symbol]
-                : 0;
+            int wins;
+            int losses;
+            lock (_statsSync)
+            {
+                SymbolWins.TryGetValue(symbol, out wins);
+                SymbolLosses.TryGetValue(symbol, out losses);
+            }
 
             int total = wins + losses;
 

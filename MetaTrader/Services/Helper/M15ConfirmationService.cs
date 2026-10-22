@@ -7,6 +7,7 @@
     using System;
     using System.Collections.Concurrent;
     using System.Collections.Generic;
+    using System.Linq;
     using static global::MetaTrader.Services.TradeServiceEngine;
 
     public class M15ConfirmationService
@@ -71,7 +72,7 @@
 
         private static M15Profile GetProfile(string symbol)
         {
-            if (symbol.Contains("XAU"))
+            if (symbol.Contains("XAU") || symbol.Contains("XAG"))
                 return Profiles["XAUUSD"];
 
             if (symbol.Contains("US100") || symbol.Contains("NAS") || symbol.Contains("SPX"))
@@ -88,9 +89,14 @@
         // =====================================
         public void Update(string symbol)
         {
-            _client.CopyRates(symbol, TF, 0, BarsToFetch, out MqlRates[] rates);
+            _client.CopyRates(symbol, TF, 1, BarsToFetch, out MqlRates[] rates);
             if (rates == null || rates.Length < 22)
                 return;
+
+            // MT5 shift=1 excludes the currently forming candle. Sort because
+            // MtApi5Client array ordering can vary with its bridge implementation.
+            rates = rates.OrderBy(x => x.time).ToArray();
+            if (rates.Length < 22 || rates[^1].time == rates[^2].time) return;
 
             var profile = GetProfile(symbol);
 
@@ -230,10 +236,11 @@
         // =====================================
         public bool IsChoppy(string symbol)
         {
-            _client.CopyRates(symbol, TF, 0, 5, out MqlRates[] rates);
+            _client.CopyRates(symbol, TF, 1, 5, out MqlRates[] rates);
             if (rates == null || rates.Length < 4)
                 return true;
 
+            rates = rates.OrderBy(x => x.time).ToArray();
             double atr = CalculateATR(rates, 4);
 
             bool overlapping =

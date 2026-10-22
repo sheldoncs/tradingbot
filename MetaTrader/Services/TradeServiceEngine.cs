@@ -7,6 +7,7 @@ using MetaTrader.Enums;
 using MetaTrader.Enums.MetaTrader.Enums;
 using MetaTrader.helper;
 using MetaTrader.Services.Contract;
+using MetaTrader.Services.Diagnostic.Test;
 using MetaTrader.Services.Exits;
 using MetaTrader.Services.Helper;
 using MetaTrader.Services.Helper.MetaTrader.Services.Helper;
@@ -34,6 +35,7 @@ using Telegram.Bot.Types;
 using static MetaTrader.Services.ExitTrade;
 using static MetaTrader.Services.Helper.TransitionZoneEngine;
 using static MetaTrader.Services.HybridMomentumEngine;
+using static StackExchange.Redis.Role;
 using static System.Collections.Specialized.BitVector32;
 using static System.Runtime.InteropServices.JavaScript.JSType;
 
@@ -43,7 +45,6 @@ namespace MetaTrader.Services
     {
         private static DateTime _lastSignalCandleTime = DateTime.MinValue;
         private readonly INotificationService _notificationService;
-        private readonly ITradingPairProperties _tradingPairProperties;
         private readonly ITradingDbContext _dbContext;
         private TradingWindow tradingWindow = new TradingWindow();
         private readonly IConfiguration _configuration;
@@ -119,6 +120,24 @@ namespace MetaTrader.Services
         DateTime _lastCandleTime = DateTime.MinValue;
         private static bool _orderInProgress = false;
         private static bool _fastOrderInProgress = false;
+        // Atomic, per-symbol reservation for entry preparation through
+        // broker reconciliation. Guard is independent of legacy bool flags.
+        private static readonly object _fastEntryReservationSync = new object();
+        private static readonly System.Collections.Generic.HashSet<string>
+            _fastEntryReservations = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private static bool TryReserveFastEntry(string symbol)
+        {
+            lock (_fastEntryReservationSync)
+                return !string.IsNullOrWhiteSpace(symbol) && _fastEntryReservations.Add(symbol);
+        }
+
+        private static void ReleaseFastEntry(string symbol)
+        {
+            lock (_fastEntryReservationSync)
+                _fastEntryReservations.Remove(symbol);
+        }
+
         private static DateTime _lastOrderCandleTime = DateTime.MinValue;
         private readonly TradeCoordinator _tradeCoordinator;
         private readonly TimeframeDiversityExecutor _tfExecutor;
@@ -138,6 +157,22 @@ namespace MetaTrader.Services
         // position. Serialize those calls so BNBUSD and ETHUSD cannot
         // contaminate each other's position/risk-management state.
         private static readonly object _mt5PositionSync = new object();
+
+        // Serialize the FINAL broker duplicate check + OrderSend.
+        // This closes the race window where another timer/callback can
+        // change position state after the normal duplicate check but
+        // before the order is actually submitted.
+        private static readonly object _tradeExecutionSync = new object();
+
+        // Gold no longer uses AccountWideRiskCoordinator to authorize orders.
+        // Compatibility only: existing startup wiring can still call this method.
+        // This deliberately does NOT retain or enable the coordinator for Gold.
+        public static void ConfigureAccountWideRisk(
+            object coordinator)
+        {
+            LogFile.Write($"[{SYMBOL}] Gold account-wide entry coordinator disabled; configuration ignored.");
+        }
+
         static List<ClosedTrade> closedTrades = new List<ClosedTrade>();
         private SmartTradeExitService tradeExitService = new SmartTradeExitService();
         private static int _lastOrderBlockIndex = -1; // tracks last OB index
@@ -181,6 +216,15 @@ namespace MetaTrader.Services
         private static DateTime _lastRealizedTime = DateTime.MinValue;
         private static IConnectionMultiplexer _redis;
         private static RedisProfitEngine _profitEngine;
+
+        // ============================================================
+        // SENTINELFX 50 -> 100 TRADE STUDY
+        // Observation only: never changes entries, exits, SL, TP,
+        // lot sizing, or risk decisions.
+        // ============================================================
+        private static TradePerformanceTracker _performanceTracker;
+        private static MissedOpportunityTracker _missedOpportunityTracker;
+        private const string PERFORMANCE_STUDY_ID = "2026-10-10";
         private readonly IHubContext<ChatHub> _chatHub;
 
         private static readonly Dictionary<string, SymbolContext> _contexts = new Dictionary<string, SymbolContext>();
@@ -197,6 +241,61 @@ namespace MetaTrader.Services
         // --- MT5 client wiring (non-breaking bridge) ---
         private static readonly object _clientSync = new();
 
+        // Temporary, diagnostic-only. Runs at most once per process.
+        private static int _xauH1LiveProbeAttempted = 0;
+
+        private static void ProbeCurrentXauH1Once()
+        {
+            if (System.Threading.Interlocked.CompareExchange(
+                    ref _xauH1LiveProbeAttempted, 1, 0) != 0)
+                return;
+
+            const string testSymbol = "XAUUSD";
+            try
+            {
+                if (_client == null)
+                {
+                    LogFile.Write("[XAUUSD] H1 LIVE TEST | FAILED | MT5 client is null");
+                    return;
+                }
+
+                LogFile.Write($"[XAUUSD] H1 LIVE TEST | START | " +
+                              $"requestedShift=0 | requestedCount=2 | utcNow={DateTime.UtcNow:O}");
+
+                var copied = _client.CopyRates(
+                    testSymbol,
+                    ENUM_TIMEFRAMES.PERIOD_H1,
+                    0,
+                    2,
+                    out MqlRates[] testRates);
+
+                LogFile.Write($"[XAUUSD] H1 LIVE TEST | RESULT | " +
+                              $"copyResult={copied} | returnedCount={(testRates == null ? 0 : testRates.Length)}");
+
+                if (testRates == null || testRates.Length == 0)
+                {
+                    LogFile.Write("[XAUUSD] H1 LIVE TEST | NO DATA | Shift 0 yielded no candles");
+                    return;
+                }
+
+                for (int i = 0; i < testRates.Length; i++)
+                {
+                    var bar = testRates[i];
+                    LogFile.Write($"[XAUUSD] H1 LIVE TEST | index={i} | " +
+                                  $"time={bar.time} | open={bar.open:F2} | " +
+                                  $"high={bar.high:F2} | low={bar.low:F2} | close={bar.close:F2}");
+                }
+
+                LogFile.Write("[XAUUSD] H1 LIVE TEST | END | " +
+                              "Compare bar times against current broker H1 hour; array order is not assumed");
+            }
+            catch (Exception ex)
+            {
+                LogFile.Write($"[XAUUSD] H1 LIVE TEST | ERROR | {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+
         // Keep BOTH fields so NOTHING breaks
         private static MtApi5Client _client;                // IIS/Injected client
 
@@ -206,7 +305,6 @@ namespace MetaTrader.Services
         static readonly TimeSpan ReentryCooldown = TimeSpan.FromMinutes(30);
         public TradeServiceEngine(
             INotificationService notificationService,
-            ITradingPairProperties tradingPairProperties,
             IConfiguration configuration,
             TradeCoordinator tradeCoordinator,
             MtApi5Client client,
@@ -223,10 +321,31 @@ namespace MetaTrader.Services
             _tradeCoordinator = tradeCoordinator;
             _notificationService = notificationService;
             _configuration = configuration;
-            _tradingPairProperties = tradingPairProperties;
+            // GOLD fixed-volume profile; no broker loss calculator configuration gate.
+            ConfigureGoldLotRisk();
 
             _redis = ConnectionMultiplexer.Connect("localhost:6379");
             _profitEngine = new RedisProfitEngine(_redis);
+
+            _performanceTracker =
+                new TradePerformanceTracker(
+                    _redis,
+                    PERFORMANCE_STUDY_ID
+                );
+
+            // Observation only: records meaningful rejected entry candidates.
+            // It never changes entries, exits, SL, TP, lot size, or risk decisions.
+            _missedOpportunityTracker = new MissedOpportunityTracker(_redis, PERFORMANCE_STUDY_ID);
+        }
+
+        // GOLD uses the existing fixed profile lot. No verification flag or
+        // monetary loss-per-lot delegate is required for XAUUSD/XAUEUR.
+        // Keep the method for existing constructor/reconnect calls.
+        private void ConfigureGoldLotRisk()
+        {
+            LogFile.Write("GOLD LOT PROFILE ACTIVE | fixed GoldFixedLot=" +
+                DynamicLotSizingHelper.GoldFixedLot.ToString("F2") +
+                " | broker SL and final stop-side checks remain enabled");
         }
 
         public void setupInitialProperties(string connectionId)
@@ -256,6 +375,8 @@ namespace MetaTrader.Services
                     lock (_clientSync)
                     {
                         _client = clientFromCaller; // ✅ prefer this for IIS
+                        // Refresh GOLD fixed-volume profile notice for the injected client.
+                        ConfigureGoldLotRisk();
                     }
                 }
 
@@ -352,9 +473,254 @@ namespace MetaTrader.Services
                     );
 
                     CheckCloseReason(trade);
+
+                    _ = CompletePerformanceStudyTradeAsync(
+                        trade,
+                        "Broker position closed / SL / TP / manual close",
+                        trade.ProfitUsd,
+                        trade.Side == TradeSide.Buy
+                            ? _client.SymbolInfoDouble(
+                                trade.Symbol,
+                                ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_BID)
+                            : _client.SymbolInfoDouble(
+                                trade.Symbol,
+                                ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_ASK)
+                    );
+
                     openTrades.Remove(trade);
                 }
             }
+        }
+
+        // ============================================================
+        // PERFORMANCE STUDY HELPERS
+        // ============================================================
+
+        private static string GetPerformanceBotType(string symbol)
+        {
+            if (string.IsNullOrWhiteSpace(symbol))
+                return "UNKNOWN";
+
+            string s = symbol.ToUpperInvariant();
+
+            if (s.Contains("XAU") || s.Contains("XAG") ||
+                s.Contains("GOLD") || s.Contains("SILVER"))
+                return "GOLD";
+
+            if (s.Contains("US100") || s.Contains("NAS") ||
+                s.Contains("SPX") || s.Contains("US30") ||
+                s.Contains("GER") || s.Contains("UK100"))
+                return "CASH_INDEX";
+
+            if (s.Contains("XRP"))
+                return "XRP";
+
+            if (s.Contains("BNB"))
+                return "BNB";
+
+            if (s.Contains("BTC") || s.Contains("ETH") ||
+                s.Contains("SOL") || s.Contains("ADA") ||
+                s.Contains("DOGE") || s.Contains("LTC"))
+                return "CRYPTO";
+
+            return "FX";
+        }
+
+        private static async Task CompletePerformanceStudyTradeAsync(
+            TrackedTrade trade,
+            string exitReason,
+            double fallbackProfitUsd,
+            double fallbackExitPrice)
+        {
+            if (_performanceTracker == null ||
+                trade == null ||
+                trade.Ticket == 0)
+                return;
+
+            try
+            {
+                var completed =
+                    await _performanceTracker.CompleteTradeAsync(
+                        trade.Ticket,
+                        DateTime.UtcNow,
+                        fallbackExitPrice,
+                        fallbackProfitUsd,
+                        exitReason
+                    );
+
+                if (completed != null)
+                {
+                    LogFile.Write(
+                        $"[{trade.Symbol}] 📊 STUDY TRADE COMPLETED | " +
+                        $"global=#{completed.GlobalSequence:D3} | " +
+                        $"ticket={trade.Ticket} | " +
+                        $"result={completed.Result} | " +
+                        $"profit={completed.RealizedProfitUsd:F2} | " +
+                        $"MFE={completed.MfeUsd:F2} | " +
+                        $"MAE={completed.MaeUsd:F2} | " +
+                        $"capture={completed.CapturePercent:F1}% | " +
+                        $"study={PERFORMANCE_STUDY_ID}"
+                    );
+
+                    if (completed.GlobalSequence == 50 ||
+                        completed.GlobalSequence == 100)
+                    {
+                        string summary =
+                            await _performanceTracker.GetSummaryTextAsync();
+
+                        LogFile.Write(
+                            Environment.NewLine +
+                            summary
+                        );
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogFile.Write(
+                    $"[{trade.Symbol}] ⚠️ STUDY CLOSE FAILED | " +
+                    $"ticket={trade.Ticket} | error={ex.Message}"
+                );
+            }
+        }
+
+        public static async Task<string> GetPerformanceStudySummaryAsync()
+        {
+            if (_performanceTracker == null)
+                return "Performance study tracker is not initialized.";
+
+            return await _performanceTracker.GetSummaryTextAsync();
+        }
+
+        public static async Task<string> ExportPerformanceStudyCsvAsync()
+        {
+            if (_performanceTracker == null)
+                return string.Empty;
+
+            return await _performanceTracker.ExportCsvAsync();
+        }
+
+        // ============================================================
+        // MISSED-OPPORTUNITY STUDY HELPERS
+        // Observation only. These methods NEVER approve or reject a trade.
+        // ============================================================
+
+        private static async Task RegisterMissedOpportunityAsync(
+            string symbol,
+            string direction,
+            string engine,
+            string blockReason,
+            SymbolContext context,
+            double bid,
+            double ask,
+            double ema9,
+            double ema21,
+            double atr,
+            double momentum,
+            string notes = null,
+            double liveOpen = 0.0,
+            double recentHigh = 0.0,
+            double recentLow = 0.0,
+            double realIntrabarHigh = 0.0,
+            double realIntrabarLow = 0.0,
+            bool hasRealIntrabarExtremes = false)
+        {
+            if (_missedOpportunityTracker == null ||
+                string.IsNullOrWhiteSpace(symbol) ||
+                string.IsNullOrWhiteSpace(direction) ||
+                bid <= 0 ||
+                ask <= 0 ||
+                atr <= 0)
+            {
+                return;
+            }
+
+            try
+            {
+                bool isBuy = direction.Equals(
+                    "BUY",
+                    StringComparison.OrdinalIgnoreCase);
+
+                double referencePrice = isBuy ? ask : bid;
+
+                double emaDistanceAtr =
+                    Math.Abs(referencePrice - ema9) / atr;
+
+                var candidate =
+                    new MissedOpportunityTracker.RejectedCandidateInput
+                    {
+                        Symbol = symbol,
+                        BotType = GetPerformanceBotType(symbol),
+                        Direction = isBuy ? "BUY" : "SELL",
+                        Engine = engine ?? "UNKNOWN",
+                        BlockReason = blockReason ?? "Blocked",
+                        MarketState = context?.State.ToString() ?? "UNKNOWN",
+                        TimeUtc = DateTime.UtcNow,
+
+                        ReferencePrice = referencePrice,
+                        Bid = bid,
+                        Ask = ask,
+
+                        Ema9 = ema9,
+                        Ema21 = ema21,
+                        Atr = atr,
+                        DistanceFromEma9Atr = emaDistanceAtr,
+                        Momentum = momentum,
+
+                        // New inputs for automatic CSV calculations
+                        LiveOpen = liveOpen,
+                        RecentHigh = recentHigh,
+                        RecentLow = recentLow,
+
+                        // Only provide genuine live H1 extremes.
+                        HasRealIntrabarExtremes = hasRealIntrabarExtremes,
+                        RealIntrabarHigh = realIntrabarHigh,
+                        RealIntrabarLow = realIntrabarLow,
+
+                        Notes = notes ?? string.Empty
+                    };
+
+                bool created =
+                    await _missedOpportunityTracker
+                        .RegisterRejectedCandidateAsync(candidate);
+
+                if (created)
+                {
+                    LogFile.Write(
+                        $"[{symbol}] MISSED-OPPORTUNITY REGISTERED | " +
+                        $"direction={(isBuy ? "BUY" : "SELL")} | " +
+                        $"engine={engine} | reason={blockReason} | " +
+                        $"liveOpen={liveOpen:F5} | " +
+                        $"recentHigh={recentHigh:F5} | " +
+                        $"recentLow={recentLow:F5} | " +
+                        $"hasRealH1Range={hasRealIntrabarExtremes} | " +
+                        $"emaDistATR={emaDistanceAtr:F3} | " +
+                        $"momentum={momentum:F3} | " +
+                        $"study={PERFORMANCE_STUDY_ID}"
+                    );
+                }
+            }
+            catch (Exception ex)
+            {
+                LogFile.Write(
+                    $"[{symbol}] MISSED-OPPORTUNITY REGISTER FAILED | " +
+                    $"error={ex.Message}"
+                );
+            }
+        }
+
+
+        private static async Task UpdateMissedOpportunityObservationsAsync(string symbol, double bid, double ask)
+        {
+            if (_missedOpportunityTracker == null || string.IsNullOrWhiteSpace(symbol) || bid <= 0 || ask <= 0) return;
+            try { await _missedOpportunityTracker.UpdateOpenCandidatesAsync(symbol, bid, ask, DateTime.UtcNow); }
+            catch (Exception ex) { LogFile.Write($"[{symbol}] ⚠️ MISSED-OPPORTUNITY UPDATE FAILED | error={ex.Message}"); }
+        }
+
+        public static async Task<string> ExportMissedOpportunityStudyCsvAsync()
+        {
+            if (_missedOpportunityTracker == null) return string.Empty;
+            return await _missedOpportunityTracker.ExportCsvAsync();
         }
 
         private void CheckCloseReason(TrackedTrade trade)
@@ -412,6 +778,8 @@ namespace MetaTrader.Services
                 results.Data = "Connected to MT5";
                 results.status = 200;
                 _onMessageReceived(results);
+                // Refresh GOLD fixed-volume profile after connecting to MT5.
+                ConfigureGoldLotRisk();
                 InitializeTrade();
 
                 startingBalance = _client.AccountInfoDouble(ENUM_ACCOUNT_INFO_DOUBLE.ACCOUNT_EQUITY);
@@ -473,11 +841,11 @@ namespace MetaTrader.Services
         }
 
         private KryptoLabelsDto _labels;
-        public async Task InitializeAsync(string symbol, CancellationToken ct)
+        public Task InitializeAsync(string symbol, CancellationToken ct)
         {
-            _labels = await _tradingPairProperties.GetKryptoPairsAsync(symbol);
 
             startTrading(ct);
+            return Task.CompletedTask;
         }
         private CancellationToken _cancellationToken;
 
@@ -1477,8 +1845,14 @@ namespace MetaTrader.Services
     MqlRates[] rates,
     double[] emaFast,
     double[] emaSlow,
-    double atr)
+    double atr,
+    MqlRates liveCandle,
+    double livePrice)
         {
+            // ========================================================
+            // VALIDATION
+            // ========================================================
+
             if (ctx == null ||
                 rates == null ||
                 rates.Length < 6 ||
@@ -1488,9 +1862,28 @@ namespace MetaTrader.Services
                 emaSlow.Length < 2 ||
                 atr <= 0)
             {
+                LogFile.Write(
+                    $"[{ctx?.Symbol ?? "UNKNOWN"}] ❌ CHOP FILTER INVALID INPUT | " +
+                    $"ctxNull={ctx == null} | " +
+                    $"ratesNull={rates == null} | " +
+                    $"ratesLength={(rates == null ? -1 : rates.Length)} | " +
+                    $"emaFastNull={emaFast == null} | " +
+                    $"emaFastLength={(emaFast == null ? -1 : emaFast.Length)} | " +
+                    $"emaSlowNull={emaSlow == null} | " +
+                    $"emaSlowLength={(emaSlow == null ? -1 : emaSlow.Length)} | " +
+                    $"ATR={atr:F5}"
+                );
+
                 return true;
             }
 
+
+            // ========================================================
+            // CLOSED CANDLES
+            //
+            // rates[^1] is the latest CLOSED H1 candle.
+            // These are used only for historical chop / alternation.
+            // ========================================================
 
             var c0 = rates[^1];
             var c1 = rates[^2];
@@ -1498,27 +1891,40 @@ namespace MetaTrader.Services
             var c3 = rates[^4];
 
 
-            double ema9 = emaFast[^1];
-            double ema9Prev = emaFast[^2];
+            double ema9 =
+                emaFast[^1];
 
-            double ema21 = emaSlow[^1];
-            double ema21Prev = emaSlow[^2];
+            double ema9Prev =
+                emaFast[^2];
+
+
+            double ema21 =
+                emaSlow[^1];
+
+            double ema21Prev =
+                emaSlow[^2];
 
 
             // ========================================================
-            // EMA / PRICE STRUCTURE
+            // EMA / LIVE PRICE STRUCTURE
             // ========================================================
 
             double emaSpreadAtr =
-                Math.Abs(ema9 - ema21) / atr;
+                Math.Abs(
+                    ema9 - ema21
+                ) / atr;
 
 
             double priceToEma9Atr =
-                Math.Abs(c0.close - ema9) / atr;
+                Math.Abs(
+                    livePrice - ema9
+                ) / atr;
 
 
             double priceToEma21Atr =
-                Math.Abs(c0.close - ema21) / atr;
+                Math.Abs(
+                    livePrice - ema21
+                ) / atr;
 
 
             bool compressedEmas =
@@ -1534,19 +1940,28 @@ namespace MetaTrader.Services
 
 
             bool compressionState =
-                ctx.State == MarketState.Compression;
+                ctx.State ==
+                MarketState.Compression;
 
 
             // ========================================================
-            // CANDLE CHOP / WHIPSAW
+            // HISTORICAL CANDLE CHOP / WHIPSAW
             // ========================================================
 
             bool alternatingCandles =
-                (c0.close > c0.open && c1.close < c1.open) ||
-                (c0.close < c0.open && c1.close > c1.open);
+                (
+                    c0.close > c0.open &&
+                    c1.close < c1.open
+                )
+                ||
+                (
+                    c0.close < c0.open &&
+                    c1.close > c1.open
+                );
 
 
-            int directionChanges = 0;
+            int directionChanges =
+                0;
 
 
             MqlRates[] recent =
@@ -1558,7 +1973,10 @@ namespace MetaTrader.Services
     };
 
 
-            for (int i = 0; i < recent.Length - 1; i++)
+            for (
+                int i = 0;
+                i < recent.Length - 1;
+                i++)
             {
                 bool currentBull =
                     recent[i].close >
@@ -1582,18 +2000,28 @@ namespace MetaTrader.Services
 
 
             // ========================================================
-            // CURRENT CANDLE STRENGTH
+            // LIVE CANDLE STRENGTH
             // ========================================================
 
-            double body =
+            bool liveBullish =
+                livePrice >
+                liveCandle.open;
+
+
+            bool liveBearish =
+                livePrice <
+                liveCandle.open;
+
+
+            double liveBody =
                 Math.Abs(
-                    c0.close -
-                    c0.open
+                    livePrice -
+                    liveCandle.open
                 );
 
 
-            double bodyAtr =
-                body / atr;
+            double liveBodyAtr =
+                liveBody / atr;
 
 
             // ========================================================
@@ -1627,40 +2055,24 @@ namespace MetaTrader.Services
             // ========================================================
             // COMPRESSION ESCAPE
             //
-            // IMPORTANT:
-            //
-            // A stale Compression state must NOT block a genuine
-            // directional move.
-            //
-            // Require:
-            //
-            // BUY:
-            // - bullish candle
-            // - meaningful body
-            // - price above EMA9
-            // - EMA9 above EMA21
-            // - EMA9 rising
-            //
-            // SELL:
-            // - bearish candle
-            // - meaningful body
-            // - price below EMA9
-            // - EMA9 below EMA21
-            // - EMA9 falling
+            // A stale Compression state must not block a genuine
+            // directional expansion.
             // ========================================================
 
             bool bullishEscape =
-                c0.close > c0.open &&
-                bodyAtr >= 0.60 &&
-                c0.close > ema9 &&
+                liveBullish &&
+                liveBodyAtr >= 0.60 &&
+                livePrice > ema9 &&
+                livePrice > ema21 &&
                 bullishAlignment &&
                 ema9Rising;
 
 
             bool bearishEscape =
-                c0.close < c0.open &&
-                bodyAtr >= 0.60 &&
-                c0.close < ema9 &&
+                liveBearish &&
+                liveBodyAtr >= 0.60 &&
+                livePrice < ema9 &&
+                livePrice < ema21 &&
                 bearishAlignment &&
                 ema9Falling;
 
@@ -1668,16 +2080,16 @@ namespace MetaTrader.Services
             // ========================================================
             // STRONGER TREND ESCAPE
             //
-            // This catches a market which may not currently have
-            // one huge candle but has clearly transitioned out of chop.
+            // This catches a market which has already transitioned
+            // away from the EMA cluster even without one huge candle.
             // ========================================================
 
             bool bullishTrendEscape =
                 bullishAlignment &&
                 ema9Rising &&
                 ema21Rising &&
+                livePrice > ema9 &&
                 c0.close > ema9 &&
-                c1.close > ema9 &&
                 emaSpreadAtr >= 0.20;
 
 
@@ -1685,8 +2097,8 @@ namespace MetaTrader.Services
                 bearishAlignment &&
                 ema9Falling &&
                 ema21Falling &&
+                livePrice < ema9 &&
                 c0.close < ema9 &&
-                c1.close < ema9 &&
                 emaSpreadAtr >= 0.20;
 
 
@@ -1701,15 +2113,26 @@ namespace MetaTrader.Services
             {
                 LogFile.Write(
                     $"[{ctx.Symbol}] ✅ CHOP FILTER ESCAPE | " +
+
                     $"bullEscape={bullishEscape} | " +
                     $"bearEscape={bearishEscape} | " +
+
                     $"bullTrendEscape={bullishTrendEscape} | " +
                     $"bearTrendEscape={bearishTrendEscape} | " +
-                    $"bodyATR={bodyAtr:F2} | " +
+
+                    $"liveBodyATR={liveBodyAtr:F2} | " +
+
                     $"emaSpreadATR={emaSpreadAtr:F2} | " +
+
                     $"priceToEMA9ATR={priceToEma9Atr:F2} | " +
+                    $"priceToEMA21ATR={priceToEma21Atr:F2} | " +
+
+                    $"ema9Rising={ema9Rising} | " +
+                    $"ema9Falling={ema9Falling} | " +
+
                     $"state={ctx.State}"
                 );
+
 
                 return false;
             }
@@ -1718,9 +2141,9 @@ namespace MetaTrader.Services
             // ========================================================
             // TRUE CHOP
             //
-            // Do NOT block merely because ctx.State says Compression.
-            //
-            // Require actual current evidence of chop as well.
+            // Compressed EMAs BY THEMSELVES are not enough.
+            // Price must still be trapped around the EMA cluster,
+            // or there must be whipsaw / alternation evidence.
             // ========================================================
 
             bool closeToBothEmas =
@@ -1728,13 +2151,23 @@ namespace MetaTrader.Services
                 priceNearEma21;
 
 
-            bool actualChop =
-                compressedEmas ||
-                whipsaw ||
+            bool compressedAndTrapped =
+                compressedEmas &&
                 (
-                    alternatingCandles &&
-                    closeToBothEmas
+                    priceNearEma9 ||
+                    priceNearEma21
                 );
+
+
+            bool alternatingNearEmas =
+                alternatingCandles &&
+                closeToBothEmas;
+
+
+            bool actualChop =
+                whipsaw ||
+                compressedAndTrapped ||
+                alternatingNearEmas;
 
 
             bool shouldBlock =
@@ -1743,24 +2176,79 @@ namespace MetaTrader.Services
 
 
             // ========================================================
-            // DIAGNOSTIC
+            // BLOCK DIAGNOSTIC
             // ========================================================
 
             if (shouldBlock)
             {
                 LogFile.Write(
                     $"[{ctx.Symbol}] ⛔ CHOP FILTER BLOCK | " +
+
                     $"state={ctx.State} | " +
+
+                    $"compressionState={compressionState} | " +
+
                     $"compressedEmas={compressedEmas} | " +
+                    $"compressedAndTrapped={compressedAndTrapped} | " +
+
                     $"emaSpreadATR={emaSpreadAtr:F2} | " +
+
                     $"whipsaw={whipsaw} | " +
                     $"directionChanges={directionChanges} | " +
+
                     $"alternating={alternatingCandles} | " +
+
                     $"priceNearEMA9={priceNearEma9} | " +
                     $"priceNearEMA21={priceNearEma21} | " +
-                    $"bodyATR={bodyAtr:F2}"
+
+                    $"liveBodyATR={liveBodyAtr:F2} | " +
+
+                    $"liveBullish={liveBullish} | " +
+                    $"liveBearish={liveBearish} | " +
+
+                    $"actualChop={actualChop}"
                 );
             }
+
+
+            // ========================================================
+            // ALWAYS LOG FINAL RESULT
+            //
+            // This is especially useful for diagnosing cases where
+            // ctx.State = Neutral but the caller still appears to block.
+            // ========================================================
+
+            LogFile.Write(
+                $"[{ctx.Symbol}] 🔎 CHOP FILTER RESULT | " +
+
+                $"state={ctx.State} | " +
+
+                $"compressionState={compressionState} | " +
+
+                $"compressedEmas={compressedEmas} | " +
+
+                $"emaSpreadATR={emaSpreadAtr:F2} | " +
+
+                $"whipsaw={whipsaw} | " +
+                $"directionChanges={directionChanges} | " +
+
+                $"alternating={alternatingCandles} | " +
+
+                $"priceNearEMA9={priceNearEma9} | " +
+                $"priceNearEMA21={priceNearEma21} | " +
+
+                $"liveBodyATR={liveBodyAtr:F2} | " +
+
+                $"bullEscape={bullishEscape} | " +
+                $"bearEscape={bearishEscape} | " +
+
+                $"bullTrendEscape={bullishTrendEscape} | " +
+                $"bearTrendEscape={bearishTrendEscape} | " +
+
+                $"actualChop={actualChop} | " +
+
+                $"shouldBlock={shouldBlock}"
+            );
 
 
             return shouldBlock;
@@ -1771,6 +2259,9 @@ namespace MetaTrader.Services
             // 📈 MARKET DATA + INDICATORS
             // =========================================================
             _client.CopyRates(SYMBOL, ENUM_TIMEFRAMES.PERIOD_H1, 1, BarsToFetch, out var rates1H);
+
+            // Diagnostic-only H1 shift-0 probe. Never changes the trading candles.
+            ProbeCurrentXauH1Once();
             _client.CopyRates(SYMBOL, ENUM_TIMEFRAMES.PERIOD_H4, 1, BarsToFetch, out var rates4H);
 
             var currentCandleTime = rates1H[^1].time;
@@ -1782,6 +2273,14 @@ namespace MetaTrader.Services
 
             var lastCandle = rates1H[0].close;
             double atrRaw = CalculateATR(rates1H, 14);
+
+            // Observation only: advance any rejected Gold candidates already being measured.
+            if (!string.IsNullOrWhiteSpace(SYMBOL))
+            {
+                double observationBid = _client.SymbolInfoDouble(SYMBOL, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_BID);
+                double observationAsk = _client.SymbolInfoDouble(SYMBOL, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_ASK);
+                await UpdateMissedOpportunityObservationsAsync(SYMBOL, observationBid, observationAsk);
+            }
 
 
             // =========================================================
@@ -2291,6 +2790,8 @@ namespace MetaTrader.Services
 
                 ctx = coordinator.GetContext(SYMBOL);
 
+                await UpdateMissedOpportunityObservationsAsync(SYMBOL, bid, ask);
+
                 TradingEventBus.State(new BotStateUpdate
                 {
                     state = ctx.State.ToString(),
@@ -2318,6 +2819,17 @@ namespace MetaTrader.Services
                 // This is also consistent with the live-candle convention
                 // being used by FastEntry.
                 double liveOpen = last.close;
+
+                // MISSED-OPPORTUNITY DIAGNOSTICS ONLY.
+                // rates1H is the CLOSED H1 history used by FastEntryEngine.
+                // Do not include the synthetic/current H1 candle in these levels.
+                // Recalculate the same last-ten-bar structure FastEntryEngine uses.
+                double missedStudyRecentHigh = rates1H
+                    .Skip(Math.Max(0, rates1H.Length - 10))
+                    .Max(r => r.high);
+                double missedStudyRecentLow = rates1H
+                    .Skip(Math.Max(0, rates1H.Length - 10))
+                    .Min(r => r.low);
 
                 // ----------------------------------------------------------
                 // 🔥 LIVE HYBRID MOMENTUM
@@ -2352,31 +2864,103 @@ namespace MetaTrader.Services
                     $"impulse={earlyMomentum.Impulse}"
                 );
 
+                double liveMid =
+                  (bid + ask) / 2.0;
+
+                MqlRates liveCandle =
+                 new MqlRates
+                 {
+                     open = liveOpen,
+                     high = Math.Max(liveOpen, liveMid),
+                     low = Math.Min(liveOpen, liveMid),
+                     close = liveMid
+                 };
+
                 if (ShouldAvoidChoppyMarket(
-                ctx,
-                rates1H,
-                emaFast1H,
-                emaSlow1H,
-                atrRaw))
+                    ctx,
+                    rates1H,
+                    emaFast1H,
+                    emaSlow1H,
+                    atrRaw,
+                    liveCandle,
+                    liveMid
+                ))
                 {
                     LogFile.Write(
                         $"[{SYMBOL}] ⛔ ALL ENTRIES BLOCKED | " +
                         $"reason=Compression / choppy market"
                     );
 
+                    string chopDirection = null;
+                    if (emaFast1H[^1] > emaSlow1H[^1] && emaFast1H[^1] > emaFast1H[^2] && liveMid > emaFast1H[^1])
+                        chopDirection = "BUY";
+                    else if (emaFast1H[^1] < emaSlow1H[^1] && emaFast1H[^1] < emaFast1H[^2] && liveMid < emaFast1H[^1])
+                        chopDirection = "SELL";
+
+                    if (chopDirection != null)
+                        await RegisterMissedOpportunityAsync(SYMBOL, chopDirection, "GlobalChopFilter",
+                            "Compression / choppy market", ctx, bid, ask, emaFast1H[^1], emaSlow1H[^1],
+                            atrRaw, earlyMomentum.Hybrid,
+                            "Directional structure existed but global chop filter blocked all entries.",
+                            liveOpen: liveOpen,
+                            recentHigh: missedStudyRecentHigh,
+                            recentLow: missedStudyRecentLow,
+                            hasRealIntrabarExtremes: false);
+
                     return;
                 }
 
-                var (fastAction, fastModel) = FastEntryEngine.Evaluate(
+                var (fastAction, fastModel) =
+                FastEntryEngine.Evaluate(
                     SYMBOL,
                     rates1H,
                     atrRaw,
                     emaFast1H,
                     emaSlow1H,
-                    earlyMomentum.Hybrid, // ✅ FIXED
+
+                    earlyMomentum.Hybrid,
+                    earlyMomentum.PreviousHybrid,
+
+                    earlyMomentum.Rising,
+                    earlyMomentum.Falling,
+                    earlyMomentum.Strong,
+
                     bid,
-                    ask, _m15Service, out var tradeType, out var isImpulse
+                    ask,
+                    _m15Service,
+                    out var tradeType,
+                    out var isImpulse
                 );
+
+                // ============================================================
+                // GOLD PERFORMANCE STUDY - FREEZE APPROVED ENTRY CONTEXT
+                //
+                // Consume immediately after FastEntryEngine.Evaluate(), before
+                // any await can occur. The local value is then carried safely
+                // into OpenTrade for this exact Gold entry.
+                // ============================================================
+                var entryStudyDiagnostics =
+                    FastEntryEngine.ConsumeApprovedEntryDiagnostics();
+
+                // Record only directional Holds; this does not change FastEntryEngine behavior.
+                if (fastAction != TradeAction.EnterBuy && fastAction != TradeAction.EnterSell)
+                {
+                    string holdDirection = null;
+                    bool bullishStructure = emaFast1H[^1] > emaSlow1H[^1] && emaFast1H[^1] > emaFast1H[^2] && liveMid > emaFast1H[^1];
+                    bool bearishStructure = emaFast1H[^1] < emaSlow1H[^1] && emaFast1H[^1] < emaFast1H[^2] && liveMid < emaFast1H[^1];
+                    if (bullishStructure) holdDirection = "BUY";
+                    else if (bearishStructure) holdDirection = "SELL";
+
+                    if (holdDirection != null)
+                        await RegisterMissedOpportunityAsync(SYMBOL, holdDirection, "FastEntryEngine",
+                            "Hold / no qualified entry", ctx, bid, ask, emaFast1H[^1], emaSlow1H[^1],
+                            atrRaw, earlyMomentum.Hybrid,
+                            $"fastModel={fastModel}; isImpulse={isImpulse}; tradeType={tradeType}",
+                            liveOpen: liveOpen,
+                            recentHigh: missedStudyRecentHigh,
+                            recentLow: missedStudyRecentLow,
+                            hasRealIntrabarExtremes: false);
+                }
 
                 if (fastAction == TradeAction.EnterBuy || fastAction == TradeAction.EnterSell)
                 {
@@ -2476,89 +3060,126 @@ namespace MetaTrader.Services
                     //    return; // 🔥 STOP — do not continue to state engine
                     //}
 
-                    if (!_fastOrderInProgress)
+                    // Reserve BEFORE any await or location/broker checks.
+                    // Capture the symbol: static SYMBOL can change during awaits.
+                    string reservedFastSymbol = SYMBOL;
+                    if (!TryReserveFastEntry(reservedFastSymbol))
                     {
-                        LogFile.Write($"⚡ FAST ENGINE TRIGGERED: {fastAction} {SYMBOL}");
-
-                        if (!GlobalTradeManager.TryAcquireTradeLock(_provider))
+                        LogFile.Write($"[{reservedFastSymbol}] FAST ENTRY DUPLICATE RESERVATION BLOCK");
+                        return;
+                    }
+                    try
+                    {
+                        if (!_fastOrderInProgress)
                         {
-                            LogFile.Write("❌ FAST ENGINE failed to acquire lock");
-                            return;
-                        }
+                            LogFile.Write($"⚡ FAST ENGINE TRIGGERED: {fastAction} {reservedFastSymbol}");
 
-                        var fastTradeDecision = new TradeDecision
-                        {
-                            Momentum = earlyMomentum.Hybrid,
-                            // set only what OpenTrade actually uses
-                        };
-
-                        _client.CopyRates(SYMBOL, ENUM_TIMEFRAMES.PERIOD_H1, 1, BarsToFetch, out var openTrade1H);
-
-                        ctx.IsImpulse = isImpulse;
-
-                        if (isImpulse)
-                        {
-                            if (!isGoodImpulseLocation(ctx, fastAction, openTrade1H))
+                            if (!GlobalTradeManager.TryAcquireTradeLock(_provider))
                             {
-                                LogFile.Write($"⚡ FAST ENGINE: impulse location NOT favorable");
-                                GlobalTradeManager.ReleaseTradeLock(_provider);
-                                return; // 🚫 DO NOT touch _fastOrderInProgress
+                                LogFile.Write("❌ FAST ENGINE failed to acquire lock");
+                                return;
                             }
-                        }
+
+                            var fastTradeDecision = new TradeDecision
+                            {
+                                Momentum = earlyMomentum.Hybrid,
+                                // set only what OpenTrade actually uses
+                            };
+
+                            _client.CopyRates(SYMBOL, ENUM_TIMEFRAMES.PERIOD_H1, 1, BarsToFetch, out var openTrade1H);
+
+                            ctx.IsImpulse = isImpulse;
+
+                            if (isImpulse)
+                            {
+                                if (!isGoodImpulseLocation(ctx, fastAction, openTrade1H))
+                                {
+                                    LogFile.Write($"⚡ FAST ENGINE: impulse location NOT favorable");
+
+                                    await RegisterMissedOpportunityAsync(
+                                        SYMBOL, fastAction == TradeAction.EnterBuy ? "BUY" : "SELL",
+                                        "FastEntryEngine / Impulse", "Impulse location not favorable", ctx,
+                                        bid, ask, emaFast1H[^1], emaSlow1H[^1], atrRaw, earlyMomentum.Hybrid,
+                                        $"fastModel={fastModel}; tradeType={tradeType}",
+                                        liveOpen: liveOpen,
+                                        recentHigh: missedStudyRecentHigh,
+                                        recentLow: missedStudyRecentLow,
+                                        hasRealIntrabarExtremes: false);
+
+                                    GlobalTradeManager.ReleaseTradeLock(_provider);
+                                    return; // 🚫 DO NOT touch _fastOrderInProgress
+                                }
+                            }
 
 
 
-                        // 🔥 ONLY SET HERE
-                        _fastOrderInProgress = true;
+                            // 🔥 ONLY SET HERE
+                            _fastOrderInProgress = true;
 
-                        // --------------------------------------------------
-                        // 🚫 LAST DEFENCE AGAINST DUPLICATE ENTRIES
-                        // --------------------------------------------------
-                        if (HasAnyOpenPositionBySymbol(SYMBOL))
-                        {
-                            LogFile.Write($"⛔ Trade already exists for {SYMBOL}");
-                            _orderInProgress = false;
-                            _fastOrderInProgress = false;
-                            GlobalTradeManager.ReleaseTradeLock(_provider);
-                            return;
-                        }
-
-                        double dailyPnL = await _profitEngine.GetDailyProfit();
-                        //if (!HardRiskGuardEngine.CanEnter(dailyPnL))
-                        //    return;
-
-                        await OpenTrade(
-                            fastAction == TradeAction.EnterBuy ? TradeSide.Buy : TradeSide.Sell,
-                            fastAction == TradeAction.EnterBuy ? ask : bid,
-                            LotSizingMode.Fixed,
-                            fastModel,
-                            openTrade1H,
-                            fastTradeDecision,
-                            transition, tradeType
-                        );
-
-                        // ------------------------------------
-                        // Wait until MT5 confirms the position
-                        // ------------------------------------
-                        for (int i = 0; i < 20; i++)
-                        {
+                            // --------------------------------------------------
+                            // 🚫 LAST DEFENCE AGAINST DUPLICATE ENTRIES
+                            // --------------------------------------------------
                             if (HasAnyOpenPositionBySymbol(SYMBOL))
-                                break;
+                            {
+                                LogFile.Write($"⛔ Trade already exists for {SYMBOL}");
+                                _orderInProgress = false;
+                                _fastOrderInProgress = false;
+                                GlobalTradeManager.ReleaseTradeLock(_provider);
+                                return;
+                            }
 
-                            await Task.Delay(100);
-                        }
+                            double dailyPnL = await _profitEngine.GetDailyProfit();
+                            //if (!HardRiskGuardEngine.CanEnter(dailyPnL))
+                            //    return;
 
-                        await _notificationService.sendNotification(
-                                $"{fastAction.ToString()} - {fastModel.ToString()} — entry approved - {SYMBOL}",
-                                _configuration["CHAT_ID"],
-                                _configuration["BOT_TOKEN"]
+                            await OpenTrade(
+                                fastAction == TradeAction.EnterBuy ? TradeSide.Buy : TradeSide.Sell,
+                                fastAction == TradeAction.EnterBuy ? ask : bid,
+                                LotSizingMode.Fixed,
+                                fastModel,
+                                openTrade1H,
+                                fastTradeDecision,
+                                transition,
+                                tradeType,
+                                entryStudyDiagnostics
                             );
 
-                        if (isImpulse) ctx.ImpulseConsumed = true;
+                            // ------------------------------------
+                            // Wait until MT5 confirms the position
+                            // ------------------------------------
+                            for (int i = 0; i < 20; i++)
+                            {
+                                if (HasAnyOpenPositionBySymbol(SYMBOL))
+                                    break;
 
-                        _lastOrderCandleTime = currentCandleTime;
+                                await Task.Delay(100);
+                            }
 
-                        return;
+                            bool actualPositionOpened = HasAnyOpenPositionBySymbol(reservedFastSymbol);
+                            if (!actualPositionOpened)
+                            {
+                                LogFile.Write($"[{reservedFastSymbol}] FAST ENTRY NOT EXECUTED | " +
+                                    "OpenTrade returned without a confirmed broker position; " +
+                                    "candle and impulse remain available for a later signal");
+                                _orderInProgress = false;
+                                _fastOrderInProgress = false;
+                                GlobalTradeManager.ReleaseTradeLock(_provider);
+                                return;
+                            }
+
+                            // Commit consumption only after the broker has an actual position.
+                            if (isImpulse) ctx.ImpulseConsumed = true;
+                            _lastOrderCandleTime = currentCandleTime;
+                            await _notificationService.sendNotification(
+                                $"{fastAction} - {fastModel} — MT5 position confirmed - {reservedFastSymbol}",
+                                _configuration["CHAT_ID"],
+                                _configuration["BOT_TOKEN"]);
+                            return;
+                        }
+                    }
+                    finally
+                    {
+                        ReleaseFastEntry(reservedFastSymbol);
                     }
                 }
 
@@ -2677,12 +3298,12 @@ namespace MetaTrader.Services
         // MT5 position access is serialized.
         // =============================================================
         private static bool TryResolveOpenPositionSnapshot(
-            string symbol,
-            out ulong positionTicket,
-            out double entryPrice,
-            out double volume,
-            out double stopLoss,
-            out double takeProfit)
+    string symbol,
+    out ulong positionTicket,
+    out double entryPrice,
+    out double volume,
+    out double stopLoss,
+    out double takeProfit)
         {
             positionTicket = 0;
             entryPrice = 0.0;
@@ -2695,6 +3316,9 @@ namespace MetaTrader.Services
             {
                 return false;
             }
+
+            symbol =
+                symbol.Trim();
 
             lock (_mt5PositionSync)
             {
@@ -2709,85 +3333,260 @@ namespace MetaTrader.Services
                     if (candidateTicket == 0)
                         continue;
 
+
+                    // ========================================================
+                    // 1. VERIFY TICKET + SYMBOL + MAGIC
+                    // ========================================================
+
                     if (!_client.PositionSelectByTicket(candidateTicket))
                         continue;
 
-                    string symbolBefore =
+                    string firstSymbol =
                         _client.PositionGetString(
                             ENUM_POSITION_PROPERTY_STRING.POSITION_SYMBOL
                         );
 
-                    long candidateMagic =
+                    long firstMagic =
                         _client.PositionGetInteger(
                             ENUM_POSITION_PROPERTY_INTEGER.POSITION_MAGIC
                         );
 
+
                     if (!string.Equals(
-                            symbolBefore,
+                            firstSymbol,
                             symbol,
                             StringComparison.OrdinalIgnoreCase))
                     {
                         continue;
                     }
 
-                    if (candidateMagic != MAGIC_NUMBER)
+
+                    if (firstMagic != MAGIC_NUMBER)
                         continue;
+
+
+                    // ========================================================
+                    // 2. ENTRY PRICE
+                    //
+                    // Re-select the EXACT ticket immediately before reading.
+                    // ========================================================
+
+                    if (!TrySelectAndVerifyPosition(
+                            candidateTicket,
+                            symbol))
+                    {
+                        continue;
+                    }
 
                     double candidateEntry =
                         _client.PositionGetDouble(
                             ENUM_POSITION_PROPERTY_DOUBLE.POSITION_PRICE_OPEN
                         );
 
+
+                    // ========================================================
+                    // 3. VOLUME
+                    // ========================================================
+
+                    if (!TrySelectAndVerifyPosition(
+                            candidateTicket,
+                            symbol))
+                    {
+                        continue;
+                    }
+
                     double candidateVolume =
                         _client.PositionGetDouble(
                             ENUM_POSITION_PROPERTY_DOUBLE.POSITION_VOLUME
                         );
+
+
+                    // ========================================================
+                    // 4. STOP LOSS
+                    // ========================================================
+
+                    if (!TrySelectAndVerifyPosition(
+                            candidateTicket,
+                            symbol))
+                    {
+                        continue;
+                    }
 
                     double candidateSL =
                         _client.PositionGetDouble(
                             ENUM_POSITION_PROPERTY_DOUBLE.POSITION_SL
                         );
 
+
+                    // ========================================================
+                    // 5. TAKE PROFIT
+                    // ========================================================
+
+                    if (!TrySelectAndVerifyPosition(
+                            candidateTicket,
+                            symbol))
+                    {
+                        continue;
+                    }
+
                     double candidateTP =
                         _client.PositionGetDouble(
                             ENUM_POSITION_PROPERTY_DOUBLE.POSITION_TP
                         );
 
-                    string symbolAfter =
-                        _client.PositionGetString(
-                            ENUM_POSITION_PROPERTY_STRING.POSITION_SYMBOL
-                        );
 
-                    if (!string.Equals(
-                            symbolBefore,
-                            symbolAfter,
-                            StringComparison.OrdinalIgnoreCase) ||
-                        !string.Equals(
-                            symbolAfter,
-                            symbol,
-                            StringComparison.OrdinalIgnoreCase))
+                    // ========================================================
+                    // 6. FINAL TICKET / SYMBOL / MAGIC VERIFICATION
+                    // ========================================================
+
+                    if (!TrySelectAndVerifyPosition(
+                            candidateTicket,
+                            symbol))
                     {
                         LogFile.Write(
-                            $"[{symbol}] ⚠ POSITION SNAPSHOT CHANGED DURING READ | " +
+                            $"[{symbol}] ⚠ POSITION SNAPSHOT FAILED FINAL VERIFY | " +
                             $"candidateTicket={candidateTicket} | " +
-                            $"before={symbolBefore} | after={symbolAfter} | " +
                             $"action=RETRY"
                         );
 
                         continue;
                     }
 
-                    positionTicket = candidateTicket;
-                    entryPrice = candidateEntry;
-                    volume = candidateVolume;
-                    stopLoss = candidateSL;
-                    takeProfit = candidateTP;
+
+                    long finalMagic =
+                        _client.PositionGetInteger(
+                            ENUM_POSITION_PROPERTY_INTEGER.POSITION_MAGIC
+                        );
+
+
+                    if (finalMagic != MAGIC_NUMBER)
+                    {
+                        LogFile.Write(
+                            $"[{symbol}] ⚠ POSITION SNAPSHOT MAGIC CHANGED | " +
+                            $"candidateTicket={candidateTicket} | " +
+                            $"expectedMagic={MAGIC_NUMBER} | " +
+                            $"actualMagic={finalMagic} | " +
+                            $"action=RETRY"
+                        );
+
+                        continue;
+                    }
+
+
+                    // ========================================================
+                    // 7. BASIC SANITY CHECKS
+                    // ========================================================
+
+                    if (candidateEntry <= 0.0 ||
+                        candidateVolume <= 0.0)
+                    {
+                        LogFile.Write(
+                            $"[{symbol}] ⚠ INVALID POSITION SNAPSHOT VALUES | " +
+                            $"candidateTicket={candidateTicket} | " +
+                            $"entry={candidateEntry:F5} | " +
+                            $"volume={candidateVolume:F2} | " +
+                            $"SL={candidateSL:F5} | " +
+                            $"TP={candidateTP:F5} | " +
+                            $"action=RETRY"
+                        );
+
+                        continue;
+                    }
+
+
+                    // ========================================================
+                    // 8. ACCEPT SNAPSHOT
+                    // ========================================================
+
+                    positionTicket =
+                        candidateTicket;
+
+                    entryPrice =
+                        candidateEntry;
+
+                    volume =
+                        candidateVolume;
+
+                    stopLoss =
+                        candidateSL;
+
+                    takeProfit =
+                        candidateTP;
+
+
+                    LogFile.Write(
+                        $"[{symbol}] ✅ VERIFIED POSITION SNAPSHOT | " +
+                        $"ticket={positionTicket} | " +
+                        $"entry={entryPrice:F5} | " +
+                        $"volume={volume:F2} | " +
+                        $"SL={stopLoss:F5} | " +
+                        $"TP={takeProfit:F5}"
+                    );
+
 
                     return true;
                 }
             }
 
             return false;
+        }
+
+        private static bool TrySelectAndVerifyPosition(
+    ulong expectedTicket,
+    string expectedSymbol)
+        {
+            if (_client == null ||
+                expectedTicket == 0 ||
+                string.IsNullOrWhiteSpace(expectedSymbol))
+            {
+                return false;
+            }
+
+
+            if (!_client.PositionSelectByTicket(expectedTicket))
+                return false;
+
+
+            string actualSymbol =
+                _client.PositionGetString(
+                    ENUM_POSITION_PROPERTY_STRING.POSITION_SYMBOL
+                );
+
+
+            if (!string.Equals(
+                    actualSymbol,
+                    expectedSymbol,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                LogFile.Write(
+                    $"[{expectedSymbol}] 🚨 POSITION SELECTION CONTAMINATION | " +
+                    $"expectedTicket={expectedTicket} | " +
+                    $"actualSymbol={actualSymbol} | " +
+                    $"action=REJECT"
+                );
+
+                return false;
+            }
+
+            long actualMagic =
+                _client.PositionGetInteger(
+                    ENUM_POSITION_PROPERTY_INTEGER.POSITION_MAGIC
+                );
+
+            if (actualMagic != MAGIC_NUMBER)
+            {
+                LogFile.Write(
+                    $"[{expectedSymbol}] 🚨 POSITION MAGIC MISMATCH | " +
+                    $"expectedTicket={expectedTicket} | " +
+                    $"expectedMagic={MAGIC_NUMBER} | " +
+                    $"actualMagic={actualMagic} | " +
+                    $"action=REJECT"
+                );
+
+                return false;
+            }
+
+            return true;
         }
 
         bool HasAnyOpenPositionByTicket()
@@ -3143,9 +3942,79 @@ namespace MetaTrader.Services
             return overlapCount < lookahead * 0.8;
         }
 
-        public async Task OpenTrade(TradeSide side, double price, LotSizingMode sizingMode,
-                                     EntryModel entry, MqlRates[] rates1H, TradeDecision tradeDecision,
-                                      TransitionResult transition, MetaTrader.Services.TradeType tradeType)
+        // =============================================================
+        // GOLD FINAL ENTRY STRUCTURAL ADAPTER (CLOSED H1 ONLY)
+        // Uses recent H1 highs/lows as candidate zones. This is an
+        // independent protective scan, not an exact copy of the shelf
+        // clustering in SupportResistanceEngine.
+        // =============================================================
+        private static void BuildGoldFinalEntryStructure(
+            MqlRates[] closedH1, TradeSide side, double executionPrice,
+            double atr, out double nearestWall, out double nextWall,
+            out bool closedBarBreakout)
+        {
+            nearestWall = 0;
+            nextWall = 0;
+            closedBarBreakout = false;
+            if (closedH1 == null || closedH1.Length < 22 || atr <= 0)
+                return;
+
+            bool buy = side == TradeSide.Buy;
+            var levels = new System.Collections.Generic.List<double>();
+            int start = Math.Max(0, closedH1.Length - 12);
+            for (int i = start; i < closedH1.Length; i++)
+            {
+                double level = buy ? closedH1[i].high : closedH1[i].low;
+                if (level > 0 && !double.IsNaN(level) && !double.IsInfinity(level))
+                    levels.Add(level);
+            }
+
+            // Retain levels ahead and levels crossed by <= 0.35 ATR.
+            // Make sure adjacent candles with nearly identical highs/lows
+            // do not masquerade as two independent walls.
+            const double crossedMemoryAtr = 0.35;
+            const double distinctLevelAtr = 0.12;
+            var candidates = levels
+                .Where(x => buy ? x >= executionPrice - crossedMemoryAtr * atr
+                                : x <= executionPrice + crossedMemoryAtr * atr)
+                .OrderBy(x => Math.Abs(x - executionPrice))
+                .ToArray();
+            if (candidates.Length == 0) return;
+
+            nearestWall = candidates[0];
+            foreach (double candidate in candidates.Skip(1))
+            {
+                bool isFurtherInTradeDirection = buy
+                    ? candidate > nearestWall + distinctLevelAtr * atr
+                    : candidate < nearestWall - distinctLevelAtr * atr;
+                if (isFurtherInTradeDirection)
+                {
+                    nextWall = candidate;
+                    break;
+                }
+            }
+
+            // A CLOSED H1 candle beyond the OUTER zone edge is required.
+            // A live tick crossing is not confirmation. No fabricated retest.
+            double outerEdge = buy
+                ? nearestWall + 0.12 * atr
+                : nearestWall - 0.12 * atr;
+            MqlRates lastClosed = closedH1[closedH1.Length - 1];
+            closedBarBreakout = buy
+                ? lastClosed.close > outerEdge
+                : lastClosed.close < outerEdge;
+        }
+
+        public async Task OpenTrade(
+            TradeSide side,
+            double price,
+            LotSizingMode sizingMode,
+            EntryModel entry,
+            MqlRates[] rates1H,
+            TradeDecision tradeDecision,
+            TransitionResult transition,
+            MetaTrader.Services.TradeType tradeType,
+            FastEntryEngine.EntryStudyDiagnostics entryStudyDiagnostics = null)
         {
 
             double point = _client.SymbolInfoDouble(SYMBOL, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_POINT);
@@ -3180,12 +4049,13 @@ namespace MetaTrader.Services
                 tradeDecision.Momentum > 4.0
             );
 
-            decision.Lot =
-               Math.Max(
-                   0.01,
-                   Math.Floor(
-                       ((double)decision.Lot * 0.7) * 100
-                   ) / 100);
+            // GOLD: use the existing fixed profile lot, avoiding the MT5 loss-calculator gate.
+            // The stop-loss and other execution checks remain active.
+            if (decision.Lot <= 0 || double.IsNaN(decision.Lot) || double.IsInfinity(decision.Lot))
+            {
+                LogFile.Write($"[{SYMBOL}] GOLD LOT BLOCKED | {decision.Reason}");
+                return;
+            }
 
             var request = new MqlTradeRequest
             {
@@ -3202,7 +4072,253 @@ namespace MetaTrader.Services
                 Comment = "EMA closed-candle"
             };
 
-            if (_client.OrderSend(request, out MqlTradeResult result) && result != null)
+            // ========================================================
+            // FINAL DUPLICATE DEFENCE + ORDER SEND
+            //
+            // IMPORTANT:
+            // The earlier FastEntry duplicate check remains in place.
+            // This second check is intentionally performed immediately
+            // before OrderSend and under the same execution lock.
+            //
+            // That closes the race window between:
+            //
+            //      HasAnyOpenPositionBySymbol(...)
+            //                  and
+            //              OrderSend(...)
+            //
+            // which can otherwise allow two back-to-back trades.
+            // ========================================================
+
+            MqlTradeResult result = null;
+            bool orderSent = false;
+            bool armedBreakoutVerifiedForThisOrder = false;
+
+            lock (_tradeExecutionSync)
+            {
+                // ----------------------------------------------------
+                // 1. LOCAL TRACKING CHECK
+                // ----------------------------------------------------
+                // The Gold bot currently allows one trade at a time.
+                // Do not submit another order if a tracked trade still
+                // exists for this symbol.
+                // ----------------------------------------------------
+
+                bool locallyTracked;
+
+                lock (_openTradesSync)
+                {
+                    locallyTracked =
+                        openTrades.Any(
+                            x =>
+                                x != null &&
+                                string.Equals(
+                                    x.Symbol,
+                                    SYMBOL,
+                                    StringComparison.OrdinalIgnoreCase
+                                )
+                        );
+                }
+
+
+                if (locallyTracked)
+                {
+                    LogFile.Write(
+                        $"[{SYMBOL}] 🔒 ORDER CANCELLED - LOCAL POSITION ALREADY TRACKED | " +
+                        $"action=DO NOT SEND DUPLICATE"
+                    );
+
+                    _orderInProgress = false;
+                    _fastOrderInProgress = false;
+
+                    GlobalTradeManager.ReleaseTradeLock(
+                        _provider
+                    );
+
+                    return;
+                }
+
+
+                // ----------------------------------------------------
+                // 2. FRESH BROKER-SIDE CHECK
+                // ----------------------------------------------------
+                // Never rely only on openTrades. MT5 callbacks and local
+                // tracking can briefly be out of sync.
+                // ----------------------------------------------------
+
+                ulong existingBrokerTicket =
+                    FindOpenPositionTicketBySymbol(
+                        SYMBOL
+                    );
+
+
+                if (existingBrokerTicket > 0)
+                {
+                    LogFile.Write(
+                        $"[{SYMBOL}] 🔒 ORDER CANCELLED - BROKER POSITION ALREADY EXISTS | " +
+                        $"ticket={existingBrokerTicket} | " +
+                        $"action=DO NOT SEND DUPLICATE"
+                    );
+
+                    _orderInProgress = false;
+                    _fastOrderInProgress = false;
+
+                    GlobalTradeManager.ReleaseTradeLock(
+                        _provider
+                    );
+
+                    return;
+                }
+
+
+                // ----------------------------------------------------
+                // 3. UNIFIED FINAL ENTRY GUARD - GOLD ONLY
+                // Evaluated with a NEW quote and CLOSED H1 structure,
+                // under the same lock as the eventual OrderSend.
+                // ----------------------------------------------------
+                if (IsGold(SYMBOL))
+                {
+                    double freshBid = _client.SymbolInfoDouble(
+                        SYMBOL, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_BID);
+                    double freshAsk = _client.SymbolInfoDouble(
+                        SYMBOL, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_ASK);
+                    DateTime quoteUtc = DateTime.UtcNow;
+                    double freshExecutionPrice = side == TradeSide.Buy ? freshAsk : freshBid;
+
+                    // Existing SL/TP were constructed from the earlier quote.
+                    // Refuse to send if price has materially changed.
+                    if (atr <= 0 || freshBid <= 0 || freshAsk < freshBid ||
+                        Math.Abs(freshExecutionPrice - price) > 0.10 * atr)
+                    {
+                        LogFile.Write($"[{SYMBOL}] FINAL ENTRY BLOCKED | reason=STALE_PRICE_OR_INVALID_QUOTE | " +
+                                      $"preparedPrice={price:F5} | currentPrice={freshExecutionPrice:F5}");
+                        _orderInProgress = false;
+                        _fastOrderInProgress = false;
+                        GlobalTradeManager.ReleaseTradeLock(_provider);
+                        return;
+                    }
+
+                    double[] freshEma9Series = rates1H != null && rates1H.Length >= 22
+                        ? CalculateEMA(rates1H, 9) : null;
+                    bool structureValid = rates1H != null && rates1H.Length >= 22 &&
+                                          freshEma9Series != null && freshEma9Series.Length > 0;
+                    double nearestWall = 0.0;
+                    double nextWall = 0.0;
+                    bool closedBarBreakout = false;
+
+                    if (structureValid)
+                    {
+                        BuildGoldFinalEntryStructure(
+                            rates1H, side, freshExecutionPrice, atr,
+                            out nearestWall, out nextWall, out closedBarBreakout);
+                    }
+
+                    // Align the FINAL gate with the already-armed GOLD S/R wall.
+                    // Verify using the latest executable BUY ask / SELL bid.
+                    double armedWall = 0.0;
+                    double finalClosedEma9 = freshEma9Series != null && freshEma9Series.Length > 0
+                        ? freshEma9Series[freshEma9Series.Length - 1] : 0.0;
+                    // The armed-watch trigger used LIVE EMA9 and the latest
+                    // CLOSED EMA9 as its slope reference. Reconstruct those
+                    // exact inputs for the final verification, rather than
+                    // passing two closed EMA values (which can reverse slope).
+                    double freshMid = (freshBid + freshAsk) / 2.0;
+                    double finalLiveEma9 = structureValid
+                        ? finalClosedEma9 + (2.0 / 10.0) * (freshMid - finalClosedEma9)
+                        : 0.0;
+                    bool verifiedArmedBreakout = structureValid &&
+                        SupportResistanceEngine.TryVerifyArmedGoldBreakForFinalGuard(
+                            SYMBOL,
+                            side == TradeSide.Buy ? TradeAction.EnterBuy : TradeAction.EnterSell,
+                            atr, freshExecutionPrice, finalLiveEma9, finalClosedEma9,
+                            tradeDecision == null ? 0.0 : tradeDecision.Momentum,
+                            out armedWall);
+                    armedBreakoutVerifiedForThisOrder = verifiedArmedBreakout;
+                    if (verifiedArmedBreakout)
+                    {
+                        // Use the SAME remembered wall in both engines.
+                        nearestWall = armedWall;
+                        // Re-scan the SAME closed H1 inputs for the nearest
+                        // untouched wall beyond this breakout. Do not mistake
+                        // the crossed wall for the next wall, or discard a real
+                        // untouched wall when the independent scan chose another.
+                        nextWall = 0.0;
+                        double nextRoom = double.MaxValue;
+                        for (int wallIndex = Math.Max(0, rates1H.Length - 12);
+                             wallIndex < rates1H.Length; wallIndex++)
+                        {
+                            double candidate = side == TradeSide.Buy
+                                ? rates1H[wallIndex].high : rates1H[wallIndex].low;
+                            double room = side == TradeSide.Buy
+                                ? candidate - 0.12 * atr - freshExecutionPrice
+                                : freshExecutionPrice - (candidate + 0.12 * atr);
+                            if (room >= 0.0 && room < nextRoom)
+                            {
+                                nextRoom = room;
+                                nextWall = candidate;
+                            }
+                        }
+                        LogFile.Write($"[{SYMBOL}] GOLD ARMED BREAKOUT VERIFIED FOR FINAL GUARD | " +
+                                      $"wall={armedWall:F5} | price={freshExecutionPrice:F5} | next={nextWall:F5}");
+                    }
+
+
+                    // Recheck the fixed GOLD profile lot at the actual quote.
+                    // Only decrease the prepared volume; never increase it here.
+                    // This preserves the existing execution/order structure.
+                    var finalLotDecision = DynamicLotSizingHelper.Calculate(
+                        SYMBOL,
+                        _client.AccountInfoDouble(ENUM_ACCOUNT_INFO_DOUBLE.ACCOUNT_EQUITY),
+                        freshExecutionPrice,
+                        sl,
+                        ctx.AtrPercentile,
+                        tradeDecision != null && tradeDecision.Momentum > 4.0);
+
+                    bool stopSideValid = side == TradeSide.Buy
+                        ? sl < freshExecutionPrice
+                        : sl > freshExecutionPrice;
+                    double finalLot = Math.Min(request.Volume, finalLotDecision.Lot);
+                    if (!stopSideValid ||
+                        finalLotDecision.RiskSource != "FIXED_GOLD_PROFILE" ||
+                        finalLotDecision.Lot <= 0 ||
+                        finalLot < 0.01 ||
+                        double.IsNaN(finalLot) || double.IsInfinity(finalLot))
+                    {
+                        LogFile.Write($"[{SYMBOL}] GOLD FINAL LOT BLOCKED | " +
+                                      $"reason={finalLotDecision.Reason} | stopSideValid={stopSideValid} | " +
+                                      $"preparedLot={request.Volume:F2} | refreshedLot={finalLotDecision.Lot:F2}");
+                        _orderInProgress = false;
+                        _fastOrderInProgress = false;
+                        GlobalTradeManager.ReleaseTradeLock(_provider);
+                        return;
+                    }
+
+                    // Do not round up or rescale to the broker minimum.
+                    request.Volume = finalLot;
+                    LogFile.Write($"[{SYMBOL}] GOLD FINAL FIXED LOT ACCEPTED | " +
+                                  $"lot={request.Volume:F2} | " +
+                                  $"brokerLossCalculatorRequired=False | " +
+                                  $"stopSideValid={stopSideValid} | " +
+                                  $"source={finalLotDecision.RiskSource} | " +
+                                  "monetarySLRiskNotCalculated=True");
+
+                    // Keep SL/TP prices fixed only for negligible price drift.
+                    // The guard validated them against the actual execution quote.
+                    request.Price = freshExecutionPrice;
+                }
+
+                // ----------------------------------------------------
+                // 3. SEND WHILE STILL HOLDING EXECUTION LOCK
+                // ----------------------------------------------------
+
+                // Gold: submit directly under the existing local execution lock.
+                // AccountWideRiskCoordinator does not impose any entry budget or veto.
+                // Final trade guards, broker SL, duplicate checks and order submission
+                // remain unchanged; broker may still reject invalid volume or margin.
+                orderSent = _client.OrderSend(request, out result);
+            }
+
+
+            if (orderSent && result != null)
             {
                 TradeServiceEngine.closingTrade = false;
 
@@ -3211,6 +4327,11 @@ namespace MetaTrader.Services
                 // Do NOT store it as the TrackedTrade position ticket.
                 // ----------------------------------------------------------
                 ulong orderTicket = result.Order;
+
+                // Consume only after broker order submission succeeded.
+                // A final-gate rejection must not erase the pending breakout.
+                if (armedBreakoutVerifiedForThisOrder)
+                    SupportResistanceEngine.ClearGoldBreakdownWatch(SYMBOL);
 
                 LogFile.Write(
                     $"[{SYMBOL}] ✅ ORDER ACCEPTED | " +
@@ -3248,6 +4369,61 @@ namespace MetaTrader.Services
                     if (positionResolved &&
                         positionTicket > 0)
                     {
+                        // --------------------------------------------------
+                        // HARD SYMBOL VALIDATION
+                        // --------------------------------------------------
+                        // TryResolveOpenPositionSnapshot already filters by
+                        // symbol + magic. Verify the selected broker position
+                        // once more before accepting the snapshot.
+                        //
+                        // This prevents XAUUSD/XAUEUR position data from being
+                        // accepted if MT5's selected-position state changes
+                        // unexpectedly during concurrent callbacks.
+                        // --------------------------------------------------
+
+                        bool exactPositionConfirmed = false;
+                        string brokerSymbol = null;
+
+                        lock (_mt5PositionSync)
+                        {
+                            if (_client.PositionSelectByTicket(
+                                    positionTicket))
+                            {
+                                brokerSymbol =
+                                    _client.PositionGetString(
+                                        ENUM_POSITION_PROPERTY_STRING.POSITION_SYMBOL
+                                    );
+
+
+                                exactPositionConfirmed =
+                                    string.Equals(
+                                        brokerSymbol,
+                                        SYMBOL,
+                                        StringComparison.OrdinalIgnoreCase
+                                    );
+                            }
+                        }
+
+
+                        if (!exactPositionConfirmed)
+                        {
+                            LogFile.Write(
+                                $"[{SYMBOL}] 🚨 RESOLVED POSITION REJECTED - SYMBOL MISMATCH | " +
+                                $"ticket={positionTicket} | " +
+                                $"brokerSymbol={brokerSymbol} | " +
+                                $"attempt={attempt} | " +
+                                $"action=RETRY"
+                            );
+
+                            positionResolved = false;
+                            positionTicket = 0;
+
+                            await Task.Delay(100);
+
+                            continue;
+                        }
+
+
                         LogFile.Write(
                             $"[{SYMBOL}] ✅ ACTUAL POSITION RESOLVED | " +
                             $"attempt={attempt} | " +
@@ -3338,6 +4514,55 @@ namespace MetaTrader.Services
                     );
 
                     openTrades.Add(tracked);
+                }
+
+                // ====================================================
+                // PERFORMANCE STUDY - REGISTER ACTUAL MT5 POSITION
+                //
+                // IMPORTANT:
+                // Keep this OUTSIDE _openTradesSync. C# does not allow
+                // await inside a lock statement (CS1996).
+                // ====================================================
+                if (_performanceTracker != null)
+                {
+                    try
+                    {
+                        await _performanceTracker.RegisterOpenTradeAsync(
+                            tracked.Ticket,
+                            tracked.Symbol,
+                            GetPerformanceBotType(tracked.Symbol),
+                            tracked.Side.ToString(),
+                            tracked.Model.ToString(),
+                            tracked.Model.ToString(),
+                            tracked.OpenTime,
+                            tracked.EntryPrice,
+                            tracked.Volume,
+                            tracked.StopLoss,
+                            tracked.TakeProfit,
+                            atr,
+                            entryStudyDiagnostics?.SrWall ?? 0.0,
+                            entryStudyDiagnostics?.SrClearanceAtr ?? 0.0,
+                            entryStudyDiagnostics?.SrAhead ?? false,
+                            entryStudyDiagnostics?.Ema9DistanceAtr ?? 0.0
+                        );
+
+                        LogFile.Write(
+                            $"[{tracked.Symbol}] 📊 STUDY OPEN REGISTERED | " +
+                            $"ticket={tracked.Ticket} | " +
+                            $"srAhead={entryStudyDiagnostics?.SrAhead ?? false} | " +
+                            $"srWall={(entryStudyDiagnostics?.SrWall ?? 0.0):F5} | " +
+                            $"srClearanceATR={(entryStudyDiagnostics?.SrClearanceAtr ?? 0.0):F2} | " +
+                            $"ema9DistATR={(entryStudyDiagnostics?.Ema9DistanceAtr ?? 0.0):F2} | " +
+                            $"study={PERFORMANCE_STUDY_ID}"
+                        );
+                    }
+                    catch (Exception ex)
+                    {
+                        LogFile.Write(
+                            $"[{tracked.Symbol}] ⚠️ STUDY OPEN REGISTER FAILED | " +
+                            $"ticket={tracked.Ticket} | error={ex.Message}"
+                        );
+                    }
                 }
 
                 LogFile.Write(
@@ -4050,13 +5275,13 @@ namespace MetaTrader.Services
 
         private static int barsSinceEntry = 0;
         static async Task ManageOpenTrades(
-    double midPrice,
-    double bid,
-    double ask,
-    MqlRates[] rates1Hr,
-    SymbolContext ctx,
-    MomentumResult momentumResult,
-    bool? isBuy = null)
+        double midPrice,
+        double bid,
+        double ask,
+        MqlRates[] rates1Hr,
+        SymbolContext ctx,
+        MomentumResult momentumResult,
+        bool? isBuy = null)
         {
             double atr =
                 CalculateATR(
@@ -4071,6 +5296,7 @@ namespace MetaTrader.Services
                     9
                 );
 
+            double closedEma9 = emaFast1H[^1];
 
             double[] emaSlow1H =
                 CalculateEMAUpdate(
@@ -4078,89 +5304,141 @@ namespace MetaTrader.Services
                     21
                 );
 
+            double liveMid =
+               (bid + ask) / 2.0;
 
+            var baseCandle =
+                rates1Hr[^1];
+
+            MqlRates liveCandle =
+                new MqlRates
+                {
+                    open = baseCandle.open,
+
+                    close = liveMid,
+
+                    high = Math.Max(
+                        baseCandle.high,
+                        Math.Max(bid, ask)
+                    ),
+
+                    low = Math.Min(
+                        baseCandle.low,
+                        Math.Min(bid, ask)
+                    ),
+
+                    mt_time = baseCandle.mt_time
+                };
+
+            double liveEma9 =
+             closedEma9 +
+             (2.0 / (9.0 + 1.0)) *
+             (liveMid - closedEma9);
             // ==================================================
             // 1. ALWAYS SYNC OPEN TRADES FIRST
             // ==================================================
 
-            List<long> mt5Tickets =
-                GetAllOpenPositionTickets();
+            // ==================================================
+            // IMPORTANT:
+            // Recover ONLY the broker position belonging to the
+            // symbol/context currently being managed.
+            //
+            // Never use mt5Tickets.First(). With multiple strategy
+            // instances that can recover ETH/XRP/BNB/etc. into a
+            // Gold context and contaminate volume/profit/SL data.
+            // ==================================================
 
+            string managementSymbol =
+                ctx?.Symbol;
 
-            if (openTrades.Count == 0 &&
-                mt5Tickets.Count > 0)
+            if (string.IsNullOrWhiteSpace(managementSymbol))
             {
-                long ticket =
-                    mt5Tickets.First();
+                LogFile.Write(
+                    "⚠️ ManageOpenTrades aborted - ctx.Symbol is empty."
+                );
 
-
-                if (_client.PositionSelectByTicket(
-                        (ulong)ticket))
-                {
-                    var recoveredTrade =
-                        new TrackedTrade
-                        {
-                            Ticket =
-                                (ulong)ticket,
-
-                            Symbol =
-                                _client.PositionGetString(
-                                    ENUM_POSITION_PROPERTY_STRING.POSITION_SYMBOL
-                                ),
-
-                            EntryPrice =
-                                _client.PositionGetDouble(
-                                    ENUM_POSITION_PROPERTY_DOUBLE.POSITION_PRICE_OPEN
-                                ),
-
-                            StopLoss =
-                                _client.PositionGetDouble(
-                                    ENUM_POSITION_PROPERTY_DOUBLE.POSITION_SL
-                                ),
-
-                            TakeProfit =
-                                _client.PositionGetDouble(
-                                    ENUM_POSITION_PROPERTY_DOUBLE.POSITION_TP
-                                ),
-
-                            Volume =
-                                _client.PositionGetDouble(
-                                    ENUM_POSITION_PROPERTY_DOUBLE.POSITION_VOLUME
-                                ),
-
-                            Side =
-                                _client.PositionGetInteger(
-                                    ENUM_POSITION_PROPERTY_INTEGER.POSITION_TYPE
-                                )
-                                ==
-                                (long)ENUM_POSITION_TYPE.POSITION_TYPE_BUY
-
-                                    ? TradeSide.Buy
-                                    : TradeSide.Sell,
-
-                            // This path should now be rare.  It is only a
-                            // recovery path when local tracking was lost.
-                            Model =
-                                globalEntryModel
-                        };
-
-                    lock (_openTradesSync)
-                    {
-                        if (!openTrades.Any(
-                                x => x.Ticket == recoveredTrade.Ticket))
-                        {
-                            openTrades.Add(recoveredTrade);
-                        }
-                    }
-
-                    LogFile.Write(
-                        $"[{recoveredTrade.Symbol}] 🔄 RECOVERED OPEN POSITION | " +
-                        $"ticket={recoveredTrade.Ticket} | " +
-                        $"model={recoveredTrade.Model}"
-                    );
-                }
+                return;
             }
 
+            if (openTrades.Count == 0)
+            {
+                ulong recoveredTicket =
+                    FindOpenPositionTicketBySymbol(
+                        managementSymbol
+                    );
+
+                if (recoveredTicket > 0)
+                {
+                    lock (_mt5PositionSync)
+                    {
+                        if (TrySelectAndVerifyPosition(
+                                recoveredTicket,
+                                managementSymbol))
+                        {
+                            var recoveredTrade =
+                                new TrackedTrade
+                                {
+                                    Ticket =
+                                        recoveredTicket,
+
+                                    Symbol =
+                                        managementSymbol,
+
+                                    EntryPrice =
+                                        _client.PositionGetDouble(
+                                            ENUM_POSITION_PROPERTY_DOUBLE.POSITION_PRICE_OPEN
+                                        ),
+
+                                    StopLoss =
+                                        _client.PositionGetDouble(
+                                            ENUM_POSITION_PROPERTY_DOUBLE.POSITION_SL
+                                        ),
+
+                                    TakeProfit =
+                                        _client.PositionGetDouble(
+                                            ENUM_POSITION_PROPERTY_DOUBLE.POSITION_TP
+                                        ),
+
+                                    Volume =
+                                        _client.PositionGetDouble(
+                                            ENUM_POSITION_PROPERTY_DOUBLE.POSITION_VOLUME
+                                        ),
+
+                                    Side =
+                                        _client.PositionGetInteger(
+                                            ENUM_POSITION_PROPERTY_INTEGER.POSITION_TYPE
+                                        )
+                                        ==
+                                        (long)ENUM_POSITION_TYPE.POSITION_TYPE_BUY
+
+                                            ? TradeSide.Buy
+                                            : TradeSide.Sell,
+
+                                    Model =
+                                        globalEntryModel
+                                };
+
+                            lock (_openTradesSync)
+                            {
+                                if (!openTrades.Any(
+                                        x => x.Ticket == recoveredTrade.Ticket))
+                                {
+                                    openTrades.Add(
+                                        recoveredTrade
+                                    );
+                                }
+                            }
+
+                            LogFile.Write(
+                                $"[{recoveredTrade.Symbol}] 🔄 RECOVERED EXACT OPEN POSITION | " +
+                                $"ticket={recoveredTrade.Ticket} | " +
+                                $"volume={recoveredTrade.Volume:F2} | " +
+                                $"model={recoveredTrade.Model}"
+                            );
+                        }
+                    }
+                }
+            }
 
             // ==================================================
             // 2. LOOP THROUGH OPEN TRADES
@@ -4168,6 +5446,160 @@ namespace MetaTrader.Services
 
             foreach (var t in openTrades.ToList())
             {
+                // ==================================================
+                // HARD SYMBOL OWNERSHIP BOUNDARY
+                //
+                // openTrades is static/shared. A timer running for
+                // XAUUSD must never evaluate an ETHUSD/XRPUSD/etc.
+                // trade with XAU market data.
+                // ==================================================
+                if (!string.Equals(
+                        t.Symbol,
+                        managementSymbol,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                double tradeBid =
+                    _client.SymbolInfoDouble(
+                        t.Symbol,
+                        ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_BID
+                    );
+
+                double tradeAsk =
+                    _client.SymbolInfoDouble(
+                        t.Symbol,
+                        ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_ASK
+                    );
+
+                if (tradeBid <= 0 || tradeAsk <= 0)
+                {
+                    LogFile.Write(
+                        $"[{t.Symbol}] ⚠️ INVALID SYMBOL QUOTE | " +
+                        $"ticket={t.Ticket} | bid={tradeBid:F5} | ask={tradeAsk:F5} | " +
+                        $"action=SKIP MANAGEMENT"
+                    );
+
+                    continue;
+                }
+
+                bool failedEntry =
+                FailedEntryExitGuard.ShouldExit(
+                    t.Symbol,
+                     t.Side == TradeSide.Buy
+                        ? TradeAction.EnterBuy
+                        : TradeAction.EnterSell,          // EnterBuy or EnterSell
+                    tradeBid,
+                    tradeAsk,
+                    liveEma9,
+                    momentumResult.Hybrid,
+                    momentumResult.Rising,
+                    momentumResult.Falling,
+                    liveCandle,
+                    atr
+                );
+
+                if (failedEntry)
+                {
+                    LogFile.Write(
+                        $"[{t.Symbol}] 🚨 FAILED ENTRY GUARD TRIGGERED | " +
+                        $"action={(t.Side == TradeSide.Buy ? TradeAction.EnterBuy : TradeAction.EnterSell)} | " +
+                        $"bid={tradeBid:F5} | ask={tradeAsk:F5} | " +
+                        $"ema9={liveEma9:F5} | " +
+                        $"momentum={momentumResult.Hybrid:F2}"
+                    );
+
+                    // ==================================================
+                    // PERFORMANCE STUDY CLOSE FIX
+                    //
+                    // Capture the latest broker P/L BEFORE requesting
+                    // the close. The old path returned immediately after
+                    // CloseTradeByTicket(), so a FailedEntryExitGuard
+                    // close could disappear from MT5 without ever being
+                    // completed in the 50 -> 100 trade study.
+                    // ==================================================
+                    double failedEntryProfitUsd = t.ProfitUsd;
+
+                    lock (_mt5PositionSync)
+                    {
+                        if (TrySelectAndVerifyPosition(
+                                t.Ticket,
+                                t.Symbol))
+                        {
+                            failedEntryProfitUsd =
+                                _client.PositionGetDouble(
+                                    ENUM_POSITION_PROPERTY_DOUBLE.POSITION_PROFIT
+                                );
+
+                            t.ProfitUsd =
+                                failedEntryProfitUsd;
+                        }
+                    }
+
+                    TradeServiceEngine.closingTrade = true;
+
+                    CloseTradeByTicket(
+                        t,
+                        tradeBid,
+                        tradeAsk
+                    );
+
+                    // Give MT5 a short opportunity to process the close.
+                    await Task.Delay(100);
+
+                    bool failedEntryStillOpen;
+
+                    lock (_mt5PositionSync)
+                    {
+                        failedEntryStillOpen =
+                            TrySelectAndVerifyPosition(
+                                t.Ticket,
+                                t.Symbol
+                            );
+                    }
+
+                    if (!failedEntryStillOpen)
+                    {
+                        double failedEntryExitPrice =
+                            t.Side == TradeSide.Buy
+                                ? tradeBid
+                                : tradeAsk;
+
+                        LogFile.Write(
+                            $"[{t.Symbol}] ✅ FAILED ENTRY CLOSE CONFIRMED | " +
+                            $"ticket={t.Ticket} | " +
+                            $"profitSnapshot={failedEntryProfitUsd:F2}"
+                        );
+
+                        await CompletePerformanceStudyTradeAsync(
+                            t,
+                            "Failed Entry Exit Guard",
+                            failedEntryProfitUsd,
+                            failedEntryExitPrice
+                        );
+
+                        // CloseTradeByTicket may already have removed it.
+                        // RemoveAll is deliberately idempotent.
+                        lock (_openTradesSync)
+                        {
+                            openTrades.RemoveAll(
+                                x => x != null &&
+                                     x.Ticket == t.Ticket
+                            );
+                        }
+                    }
+                    else
+                    {
+                        LogFile.Write(
+                            $"[{t.Symbol}] ⚠️ FAILED ENTRY CLOSE NOT YET CONFIRMED | " +
+                            $"ticket={t.Ticket} | keeping local tracking"
+                        );
+                    }
+
+                    return;
+                }
+
                 string brokerSymbol;
                 double brokerProfit;
                 double brokerSL;
@@ -4237,6 +5669,34 @@ namespace MetaTrader.Services
 
                 t.Volume =
                     brokerVolume;
+
+
+                // ==================================================
+                // PERFORMANCE STUDY - LIVE MFE / MAE
+                // ==================================================
+                if (_performanceTracker != null)
+                {
+                    try
+                    {
+                        double studyExecutablePrice =
+                            t.Side == TradeSide.Buy
+                                ? bid
+                                : ask;
+
+                        await _performanceTracker.UpdateOpenTradeAsync(
+                            t.Ticket,
+                            t.ProfitUsd,
+                            studyExecutablePrice
+                        );
+                    }
+                    catch (Exception ex)
+                    {
+                        LogFile.Write(
+                            $"[{t.Symbol}] ⚠️ STUDY UPDATE FAILED | " +
+                            $"ticket={t.Ticket} | error={ex.Message}"
+                        );
+                    }
+                }
 
 
                 // ==================================================
@@ -4377,8 +5837,8 @@ namespace MetaTrader.Services
                     UnifiedRiskManagementEngine.Evaluate(
                         t,
                         t.Symbol,
-                        bid,
-                        ask,
+                        tradeBid,
+                        tradeAsk,
                         atr,
                         rates1Hr,
                         emaFast1H,
@@ -4635,32 +6095,14 @@ namespace MetaTrader.Services
                                 $"reason={riskDecision.Reason}"
                             );
 
+                            TradeServiceEngine.closingTrade = true;
 
-                            TradeServiceEngine.closingTrade =
-                                true;
-
-
-                            // ==================================================
-                            // IMPORTANT
-                            //
-                            // This preserves your existing architecture.
-                            //
-                            // Your separate close path/event handler is expected
-                            // to execute the actual close when closingTrade=true.
-                            // ==================================================
+                            CloseTradeByTicket(t, tradeBid, tradeAsk);
 
                             await Task.Delay(100);
 
-
-                            // ==================================================
-                            // VERIFY WHETHER POSITION ACTUALLY DISAPPEARED
-                            // ==================================================
-
                             bool stillOpen =
-                                _client.PositionSelectByTicket(
-                                    t.Ticket
-                                );
-
+                                _client.PositionSelectByTicket(t.Ticket);
 
                             if (!stillOpen)
                             {
@@ -4669,25 +6111,24 @@ namespace MetaTrader.Services
                                     $"ticket={t.Ticket}"
                                 );
 
+                                await CompletePerformanceStudyTradeAsync(
+                                    t,
+                                    riskDecision.Reason,
+                                    t.ProfitUsd,
+                                    t.Side == TradeSide.Buy ? bid : ask
+                                );
 
                                 openTrades.Remove(t);
                             }
                             else
                             {
-                                // Refresh latest broker information so our tracked
-                                // object does not retain stale values.
-
                                 t.ProfitUsd =
                                     _client.PositionGetDouble(
-                                        ENUM_POSITION_PROPERTY_DOUBLE.POSITION_PROFIT
-                                    );
-
+                                        ENUM_POSITION_PROPERTY_DOUBLE.POSITION_PROFIT);
 
                                 t.StopLoss =
                                     _client.PositionGetDouble(
-                                        ENUM_POSITION_PROPERTY_DOUBLE.POSITION_SL
-                                    );
-
+                                        ENUM_POSITION_PROPERTY_DOUBLE.POSITION_SL);
 
                                 LogFile.Write(
                                     $"[{t.Symbol}] ⚠️ Position still open after close request | " +
@@ -4696,7 +6137,6 @@ namespace MetaTrader.Services
                                     $"brokerSL={t.StopLoss:F5}"
                                 );
                             }
-
 
                             break;
                         }
@@ -4820,6 +6260,21 @@ namespace MetaTrader.Services
         // ================================
         private static void ModifyTrade(TrackedTrade t)
         {
+            lock (_mt5PositionSync)
+            {
+                if (!TrySelectAndVerifyPosition(
+                        t.Ticket,
+                        t.Symbol))
+                {
+                    LogFile.Write(
+                        $"[{t.Symbol}] 🚨 MODIFY ABORTED - EXACT POSITION VERIFY FAILED | " +
+                        $"ticket={t.Ticket}"
+                    );
+
+                    return;
+                }
+            }
+
             var request = new MqlTradeRequest
             {
                 Action = ENUM_TRADE_REQUEST_ACTIONS.TRADE_ACTION_SLTP,
@@ -4915,7 +6370,9 @@ namespace MetaTrader.Services
             var closeReq = new MqlTradeRequest
             {
                 Action = ENUM_TRADE_REQUEST_ACTIONS.TRADE_ACTION_DEAL,
-                Symbol = SYMBOL,
+                // CRITICAL: use the tracked position's symbol.
+                // SYMBOL is global/static and may belong to another timer.
+                Symbol = t.Symbol,
                 Volume = t.Volume,
                 Type = closeType,
                 Price = closePrice,
@@ -4939,8 +6396,41 @@ namespace MetaTrader.Services
                 LogFile.Write($"Close attempt failed for ticket {t.Ticket}");
             }
 
-            // remove from local tracking regardless (we assume close will be processed)
-            openTrades.RemoveAll(x => x.Ticket == t.Ticket);
+            // Do NOT remove local tracking merely because OrderSend returned.
+            // Keep tracking until MT5 confirms that the exact ticket is gone.
+            // This prevents a failed/foreign close attempt from orphaning a
+            // still-open broker position.
+            bool stillOpen;
+
+            lock (_mt5PositionSync)
+            {
+                stillOpen =
+                    TrySelectAndVerifyPosition(
+                        t.Ticket,
+                        t.Symbol
+                    );
+            }
+
+            if (!stillOpen)
+            {
+                lock (_openTradesSync)
+                {
+                    openTrades.RemoveAll(
+                        x => x.Ticket == t.Ticket
+                    );
+                }
+
+                LogFile.Write(
+                    $"[{t.Symbol}] ✅ CLOSE CONFIRMED | ticket={t.Ticket}"
+                );
+            }
+            else
+            {
+                LogFile.Write(
+                    $"[{t.Symbol}] ⚠️ CLOSE NOT YET CONFIRMED | " +
+                    $"ticket={t.Ticket} | keeping local tracking"
+                );
+            }
         }
         private static void CloseManualOpenPositions()
         {

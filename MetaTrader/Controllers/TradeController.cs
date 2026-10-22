@@ -31,7 +31,7 @@ namespace MetaTrader.Controllers
         private readonly INotificationService _notificationService;
         private readonly IConfiguration _configuration;
         private readonly TradeServiceEngine _tradeService;
-        private readonly ITradingPairProperties _tradingPairProperties;
+        
         public TradeController(
                                 //ITradeService tradeService,
                                 TradeServiceEngine tradeService,
@@ -40,7 +40,7 @@ namespace MetaTrader.Controllers
                                   INotificationService notificationService,
                                    IMetaTraderConnectionService metaTraderConnectionService,
                                    TradeStateStore stateStore,
-                                     ITradingPairProperties tradingPairProperties,
+                                     
         ILogger<TradeController> logger) : base(logger)
         {
             _stateStore = stateStore;
@@ -49,7 +49,7 @@ namespace MetaTrader.Controllers
             _MetaTraderConnectionService = metaTraderConnectionService;
             _notificationService = notificationService;
             _configuration = configuration;
-            _tradingPairProperties = tradingPairProperties;
+           
         }
 
         [HttpGet("connection/provider")]
@@ -131,24 +131,7 @@ namespace MetaTrader.Controllers
             return Ok(await Task.FromResult(res));
         }
 
-        [HttpPost("ea/signal")]
-        public IActionResult Signal([FromBody] EaSignalDto dto)
-        {
-            if (!_tradingPairProperties.updateApiToken(dto).Result)
-                return Unauthorized("Invalid or inactive token");
-            // SentinelFX logic goes here
-            TokenService.setAccount(dto.Account);
-            
-            var signal = SignalStore.Get(dto.Account);
-
-            if (signal == null)
-                return Ok(new { action = "HOLD" });
-
-            SignalStore.Clear(dto.Account);
-
-            return Ok(signal);
-
-        }
+       
 
         [HttpPost("connect/{connectionId}")]
         public async Task<IActionResult> connect(String connectionId, CancellationToken cancellationToken)

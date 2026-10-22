@@ -81,7 +81,28 @@ namespace MetaTrader.Services.Helper
             ReversalCandidates =
                 new System.Collections.Generic.Dictionary<string, ReversalCandidate>();
 
+        // Diagnostic sampling only. Does not affect trading decisions.
+        // Periodic Gold HOLD snapshots capture the early phase below 0.45 ATR.
+        private static readonly object GoldDiagnosticSync = new object();
+        private static readonly System.Collections.Generic.Dictionary<string, DateTime>
+            GoldDiagnosticLastSampleUtc = new System.Collections.Generic.Dictionary<string, DateTime>(
+                System.StringComparer.OrdinalIgnoreCase);
 
+        private static bool ShouldSampleGoldHold(string symbol)
+        {
+            DateTime now = DateTime.UtcNow;
+            lock (GoldDiagnosticSync)
+            {
+                if (GoldDiagnosticLastSampleUtc.TryGetValue(symbol, out DateTime last) &&
+                    (now - last).TotalSeconds < 30)
+                    return false;
+
+                GoldDiagnosticLastSampleUtc[symbol] = now;
+                return true;
+            }
+        }
+
+        private const bool EnableConfirmedReversals = false;
         public static bool TryEnter(
             string symbol,
             MqlRates liveCandle,
@@ -93,6 +114,7 @@ namespace MetaTrader.Services.Helper
             double recentLow,
             double bid,
             double ask,
+            double momentum,
             out TradeAction action)
         {
             action = TradeAction.Hold;
@@ -134,6 +156,21 @@ namespace MetaTrader.Services.Helper
                 // does not artificially inflate bullish or bearish body size.
                 double liveMid =
                     (bid + ask) / 2.0;
+
+                // Determine whether the live candle contains meaningful wick data.
+                // The current FastEntryEngine constructs synthetic candles without
+                // historical intrabar highs/lows.
+                double goldCandleRange =
+                    Math.Max(liveCandle.high - liveCandle.low, 0.0000001);
+
+                double goldCandleBody =
+                    Math.Abs(liveCandle.close - liveCandle.open);
+
+                double goldTotalWick =
+                    Math.Max(0.0, goldCandleRange - goldCandleBody);
+
+                bool goldHasMeaningfulWicks =
+                    goldTotalWick / goldCandleRange >= 0.05;
 
                 double liveBullBody =
                     Math.Max(
@@ -284,6 +321,132 @@ namespace MetaTrader.Services.Helper
 
 
                 // ========================================================
+                // LIVE WICK REJECTION PROTECTION
+                // ========================================================
+                // PURPOSE:
+                //
+                // A candle can still have a bearish/bullish body while the
+                // opposite side is already rejecting the move.
+                //
+                // SELL:
+                // - a large LOWER wick means price pushed down and bounced.
+                // - do not enter a fresh SELL after that rejection is already
+                //   visible.
+                //
+                // BUY:
+                // - a large UPPER wick means price pushed up and fell back.
+                // - do not enter a fresh BUY after that rejection is already
+                //   visible.
+                //
+                // This guard is symmetrical and applies before every impulse
+                // entry path below, including confirmed reversals, structural
+                // escape, transition, early and normal impulse.
+                // ========================================================
+
+                double rejectionRange =
+                    Math.Max(
+                        liveCandle.high - liveCandle.low,
+                        0.0000001
+                    );
+
+
+                double lowerWick =
+                    Math.Max(
+                        0.0,
+                        Math.Min(
+                            liveCandle.open,
+                            liveMid
+                        ) - liveCandle.low
+                    );
+
+
+                double upperWick =
+                    Math.Max(
+                        0.0,
+                        liveCandle.high -
+                        Math.Max(
+                            liveCandle.open,
+                            liveMid
+                        )
+                    );
+
+
+                double lowerWickRatio =
+                    lowerWick /
+                    rejectionRange;
+
+
+                double upperWickRatio =
+                    upperWick /
+                    rejectionRange;
+
+
+                // --------------------------------------------------------
+                // ASSET-SPECIFIC WICK THRESHOLD
+                // --------------------------------------------------------
+                // Gold and crypto naturally print larger intrabar wicks, so
+                // they receive a little more tolerance than FX and indices.
+                //
+                // These are starting values and should be validated from logs.
+                // --------------------------------------------------------
+
+                double rejectionWickThreshold =
+                    GetRejectionWickThreshold(
+                        symbol
+                    );
+
+
+                bool sellMomentumRejecting =
+                    bearishLiveCandle &&
+                    lowerWickRatio >=
+                        rejectionWickThreshold;
+
+
+                bool buyMomentumRejecting =
+                    bullishLiveCandle &&
+                    upperWickRatio >=
+                        rejectionWickThreshold;
+
+
+                if (sellMomentumRejecting)
+                {
+                    LogFile.Write(
+                        $"[{symbol}] ⛔ IMPULSE SELL BLOCKED - LOWER WICK REJECTION | " +
+                        $"lowerWickRatio={lowerWickRatio:F2} | " +
+                        $"threshold={rejectionWickThreshold:F2} | " +
+                        $"bodyATR={bodyAtrSell:F2} | " +
+                        $"liveMid={liveMid:F5} | " +
+                        $"open={liveCandle.open:F5} | " +
+                        $"low={liveCandle.low:F5} | " +
+                        $"high={liveCandle.high:F5} | " +
+                        $"reason=sellers pushed lower but price already rejected the low"
+                    );
+
+
+                    return false;
+                }
+
+
+                if (buyMomentumRejecting)
+                {
+                    LogFile.Write(
+                        $"[{symbol}] ⛔ IMPULSE BUY BLOCKED - UPPER WICK REJECTION | " +
+                        $"upperWickRatio={upperWickRatio:F2} | " +
+                        $"threshold={rejectionWickThreshold:F2} | " +
+                        $"bodyATR={bodyAtrBuy:F2} | " +
+                        $"liveMid={liveMid:F5} | " +
+                        $"open={liveCandle.open:F5} | " +
+                        $"low={liveCandle.low:F5} | " +
+                        $"high={liveCandle.high:F5} | " +
+                        $"reason=buyers pushed higher but price already rejected the high"
+                    );
+
+
+                    return false;
+                }
+
+
+                // ========================================================
                 // CONFIRMED COUNTER-TREND REVERSAL
                 // ========================================================
                 // IMPORTANT:
@@ -295,7 +458,7 @@ namespace MetaTrader.Services.Helper
                 //
                 // Normal trend-aligned impulse entries below are unchanged.
 
-                if (TryConfirmedCounterTrendReversal(
+                if (EnableConfirmedReversals && TryConfirmedCounterTrendReversal(
                     symbol,
                     liveCandle,
                     profile,
@@ -406,6 +569,277 @@ namespace MetaTrader.Services.Helper
 
 
                 // ========================================================
+                // GOLD ENTRY-LOCATION QUALITY GATE
+                // ========================================================
+                // PURPOSE:
+                // Prevent XAUUSD / XAUEUR from entering at the extreme end of
+                // an already-expanded live candle.  This runs BEFORE Gold
+                // Acceleration so that acceleration cannot bypass anti-chase.
+                //
+                // This does NOT change trend direction and does NOT add
+                // reversal entries.  It only rejects a late location when the
+                // candle is already expanded AND price is near its extreme.
+                // ========================================================
+
+                if (IsGold(symbol))
+                {
+                    // FINAL XAU ENTRY-LOCATION GATE.
+                    // This is deliberately evaluated before every Gold entry path
+                    // (Acceleration, Structural Escape, Trend Resumption,
+                    // Transition, Early and Normal impulse).
+                    //
+                    // A move is considered spent when price is already near the
+                    // live-candle extreme AND has materially stretched from EMA9
+                    // or beyond structure.  A second hard-extension condition
+                    // catches exceptionally stretched moves even if the candle
+                    // position has temporarily improved because of a wick.
+                    // Gold-specific calibration: avoid vetoing the acceleration
+                    // path solely because EMA distance is 1.10-1.35 ATR.
+                    // Keep breakout-extension and EMA hard-distance guards.
+                    const double goldLocationMinExpandedBodyAtr = 0.55;
+                    const double goldLocationMaxCandlePosition = 0.84;
+                    const double goldLocationMinEmaDistanceAtr = 0.90;
+                    const double goldLocationMaxBeyondBreakAtr = 0.30;
+                    const double goldLocationHardEmaDistanceAtr = 1.35;
+
+                    double goldLocationRange =
+                        Math.Max(
+                            liveCandle.high - liveCandle.low,
+                            0.0000001
+                        );
+
+                    // FastEntryEngine currently supplies a synthetic live H1 candle
+                    // with high/low built from its open and the current midpoint.
+                    // Such a candle has NO intrabar wick history. Bid/ask based
+                    // positions on it can be > 1.0 and are not valid location tests.
+                    double goldWickTolerance = Math.Max(atr * 0.0001, 0.0000001);
+                    double goldLiveUpperWick = Math.Max(
+                        0.0, liveCandle.high - Math.Max(liveCandle.open, liveMid));
+                    double goldLiveLowerWick = Math.Max(
+                        0.0, Math.Min(liveCandle.open, liveMid) - liveCandle.low);
+
+
+                    double goldBuyPositionInCandle =
+                        Math.Max(0.0, Math.Min(1.0,
+                            (liveMid - liveCandle.low) / goldLocationRange));
+
+                    double goldSellPositionInCandle =
+                        Math.Max(0.0, Math.Min(1.0,
+                            (liveCandle.high - liveMid) / goldLocationRange));
+
+                    bool goldLateBuyLocation =
+                        bullishLiveCandle &&
+                        buyRegimeAllowed &&
+                        bodyAtrBuy >= goldLocationMinExpandedBodyAtr &&
+                        (
+                            distFromEmaBuy >= goldLocationHardEmaDistanceAtr ||
+                            // Retain a firm structural anti-chase threshold when
+                            // the synthetic candle cannot provide a true location.
+                            breakoutDistanceBuy >= profile.TransitionBeyondBreakout
+                        );
+
+                    bool goldLateSellLocation =
+                        bearishLiveCandle &&
+                        sellRegimeAllowed &&
+                        bodyAtrSell >= goldLocationMinExpandedBodyAtr &&
+                        (
+                            distFromEmaSell >= goldLocationHardEmaDistanceAtr ||
+                            breakoutDistanceSell >= profile.TransitionBeyondBreakout
+                        );
+
+                    if (goldLateBuyLocation)
+                    {
+                        LogFile.Write(
+                            $"[{symbol}] ⛔ GOLD BUY BLOCKED - LATE ENTRY LOCATION | " +
+                            $"bodyATR={bodyAtrBuy:F2} | " +
+                            $"emaDist={distFromEmaBuy:F2} | " +
+                            $"breakATR={breakoutDistanceBuy:F2} | " +
+                            $"candlePosition={goldBuyPositionInCandle:F2} | " +
+                            $"maxPosition={goldLocationMaxCandlePosition:F2} | " +
+                            $"hardEmaDist={goldLocationHardEmaDistanceAtr:F2} | " +
+                            $"meaningfulWicks={goldHasMeaningfulWicks} | " +
+                            $"reason=expanded bullish candle is too late/extended; wait for next continuation opportunity"
+                        );
+
+                        return false;
+                    }
+
+                    if (goldLateSellLocation)
+                    {
+                        LogFile.Write(
+                            $"[{symbol}] ⛔ GOLD SELL BLOCKED - LATE ENTRY LOCATION | " +
+                            $"bodyATR={bodyAtrSell:F2} | " +
+                            $"emaDist={distFromEmaSell:F2} | " +
+                            $"breakATR={breakoutDistanceSell:F2} | " +
+                            $"candlePosition={goldSellPositionInCandle:F2} | " +
+                            $"maxPosition={goldLocationMaxCandlePosition:F2} | " +
+                            $"hardEmaDist={goldLocationHardEmaDistanceAtr:F2} | " +
+                            $"meaningfulWicks={goldHasMeaningfulWicks} | " +
+                            $"reason=expanded bearish candle is too late/extended; wait for next continuation opportunity"
+                        );
+
+                        return false;
+                    }
+                }
+
+
+                // ========================================================
+                // GOLD ACCELERATION IMPULSE
+                // ========================================================
+                // PURPOSE:
+                // Catch the "middle phase" of a Gold move where the existing
+                // EMA9/EMA21 trend is already aligned and the live candle is
+                // accelerating, but the move has not yet reached the normal
+                // Gold transition / momentum threshold and has not yet become
+                // late enough for the anti-chase guard to reject it.
+                //
+                // IMPORTANT:
+                // - Gold only (XAUUSD / XAUEUR through IsGold()).
+                // - No method signature changes.
+                // - No caller changes.
+                // - Existing wick-rejection guard has already run.
+                // - Existing EMA regime must already agree with the direction.
+                // - This does NOT bypass late-move protection: this path has
+                //   its own tighter EMA-distance / breakout-extension limits.
+                // - This does NOT lower the normal momentum thresholds used by
+                //   the other impulse paths.
+                // ========================================================
+
+                if (IsGold(symbol))
+                {
+                    const double goldAccelerationBodyAtr = 0.35;
+                    const double goldAccelerationMomentumMin = 0.30; // Gold early acceleration
+                    const double goldAccelerationMinEmaDistanceAtr = 0.12;
+                    const double goldAccelerationMaxEmaDistanceAtr = 1.35;
+                    const double goldAccelerationMinEmaSpreadAtr = 0.10;
+                    const double goldAccelerationMinEma9SlopeAtr = 0.025;
+                    const double goldAccelerationMaxPreBreakAtr = 0.65;
+                    const double goldAccelerationMaxBeyondBreakAtr = 0.35;
+                    const double goldAccelerationMaxCandlePosition = 0.90;
+
+                    double goldAccelerationEmaSpreadAtr =
+                        Math.Abs(
+                            ema9 - ema21
+                        ) / atr;
+
+                    double goldAccelerationEma9SlopeAtr =
+                        Math.Abs(
+                            ema9 - ema9Previous
+                        ) / atr;
+
+                    double goldAccelerationRange =
+                        Math.Max(
+                            liveCandle.high - liveCandle.low,
+                            0.0000001
+                        );
+
+                    double goldAccelerationBuyPosition =
+                        Math.Max(0.0, Math.Min(1.0,
+                            (liveMid - liveCandle.low) / goldAccelerationRange));
+
+                    double goldAccelerationSellPosition =
+                        Math.Max(0.0, Math.Min(1.0,
+                            (liveCandle.high - liveMid) / goldAccelerationRange));
+
+                    bool goldAccelerationBuy =
+                        bullishLiveCandle &&
+                        overallBullish &&
+                        buyRegimeAllowed &&
+                        ema9Rising &&
+                        priceAboveEma9 &&
+                        priceAboveEma21 &&
+                        bodyAtrBuy >=
+                            goldAccelerationBodyAtr &&
+                        momentum >=
+                            goldAccelerationMomentumMin &&
+                        distFromEmaBuy >=
+                            goldAccelerationMinEmaDistanceAtr &&
+                        distFromEmaBuy <=
+                            goldAccelerationMaxEmaDistanceAtr &&
+                        goldAccelerationEmaSpreadAtr >=
+                            goldAccelerationMinEmaSpreadAtr &&
+                        goldAccelerationEma9SlopeAtr >=
+                            goldAccelerationMinEma9SlopeAtr &&
+                        breakoutDistanceBuy >=
+                            -goldAccelerationMaxPreBreakAtr &&
+                        breakoutDistanceBuy <=
+                            goldAccelerationMaxBeyondBreakAtr;
+
+                    if (goldAccelerationBuy)
+                    {
+                        action =
+                            TradeAction.EnterBuy;
+
+                        LogFile.Write(
+                            $"[{symbol}] 🚀 GOLD ACCELERATION BUY | " +
+                            $"bodyATR={bodyAtrBuy:F2} | " +
+                            $"bodyReq={goldAccelerationBodyAtr:F2} | " +
+                            $"momentum={momentum:F2} | " +
+                            $"momentumReq={goldAccelerationMomentumMin:F2} | " +
+                            $"emaDist={distFromEmaBuy:F2} | " +
+                            $"emaDistRange={goldAccelerationMinEmaDistanceAtr:F2}-" +
+                            $"{goldAccelerationMaxEmaDistanceAtr:F2} | " +
+                            $"emaSpreadATR={goldAccelerationEmaSpreadAtr:F2} | " +
+                            $"ema9SlopeATR={goldAccelerationEma9SlopeAtr:F2} | " +
+                            $"breakATR={breakoutDistanceBuy:F2} | " +
+                            $"candlePosition={goldAccelerationBuyPosition:F2} | " +
+                            $"NOTE=Gold bullish acceleration entered before late-chase stage"
+                        );
+
+                        return true;
+                    }
+
+                    bool goldAccelerationSell =
+                        bearishLiveCandle &&
+                        overallBearish &&
+                        sellRegimeAllowed &&
+                        ema9Falling &&
+                        priceBelowEma9 &&
+                        priceBelowEma21 &&
+                        bodyAtrSell >=
+                            goldAccelerationBodyAtr &&
+                        momentum >=
+                            goldAccelerationMomentumMin &&
+                        distFromEmaSell >=
+                            goldAccelerationMinEmaDistanceAtr &&
+                        distFromEmaSell <=
+                            goldAccelerationMaxEmaDistanceAtr &&
+                        goldAccelerationEmaSpreadAtr >=
+                            goldAccelerationMinEmaSpreadAtr &&
+                        goldAccelerationEma9SlopeAtr >=
+                            goldAccelerationMinEma9SlopeAtr &&
+                        breakoutDistanceSell >=
+                            -goldAccelerationMaxPreBreakAtr &&
+                        breakoutDistanceSell <=
+                            goldAccelerationMaxBeyondBreakAtr;
+
+                    if (goldAccelerationSell)
+                    {
+                        action =
+                            TradeAction.EnterSell;
+
+                        LogFile.Write(
+                            $"[{symbol}] 🚀 GOLD ACCELERATION SELL | " +
+                            $"bodyATR={bodyAtrSell:F2} | " +
+                            $"bodyReq={goldAccelerationBodyAtr:F2} | " +
+                            $"momentum={momentum:F2} | " +
+                            $"momentumReq={goldAccelerationMomentumMin:F2} | " +
+                            $"emaDist={distFromEmaSell:F2} | " +
+                            $"emaDistRange={goldAccelerationMinEmaDistanceAtr:F2}-" +
+                            $"{goldAccelerationMaxEmaDistanceAtr:F2} | " +
+                            $"emaSpreadATR={goldAccelerationEmaSpreadAtr:F2} | " +
+                            $"ema9SlopeATR={goldAccelerationEma9SlopeAtr:F2} | " +
+                            $"breakATR={breakoutDistanceSell:F2} | " +
+                            $"candlePosition={goldAccelerationSellPosition:F2} | " +
+                            $"NOTE=Gold bearish acceleration entered before late-chase stage"
+                        );
+
+                        return true;
+                    }
+                }
+
+
+                // ========================================================
                 // ANTI-CHASE / EXTENDED IMPULSE PROTECTION
                 // ========================================================
                 // Strong momentum is still required by the existing impulse
@@ -440,23 +874,97 @@ namespace MetaTrader.Services.Helper
                     profile.NormalMaxBeyondBreakout;
 
 
+                // ========================================================
+                // EXTREME DISTANCE PROTECTION
+                // ========================================================
+                // A trade can still be too late even if bodyATR has not yet
+                // reached chaseBodyThreshold.
+                //
+                // If price is already materially beyond the normal chase
+                // distance from EMA9 or the breakout level, block the entry
+                // and wait for a pullback / retest.
+
+                double extremeEmaDistance =
+                    IsGold(symbol)
+                        ? Math.Max(chaseEmaDistance * 1.15, 1.35)
+                        : chaseEmaDistance * 1.15;
+
+
+                double extremeBreakoutDistance =
+                    chaseBreakoutDistance * 1.15;
+
+
+                // ========================================================
+                // LIVE CANDLE ENTRY LOCATION
+                // ========================================================
+                // Avoid BUYING near the top of an already expanded bullish
+                // candle and avoid SELLING near the bottom of an already
+                // expanded bearish candle.
+
+                double liveRange =
+                    Math.Max(
+                        liveCandle.high - liveCandle.low,
+                        0.0000001
+                    );
+
+
+                double buyPositionInCandle =
+                    (ask - liveCandle.low) /
+                    liveRange;
+
+
+                double sellPositionInCandle =
+                    (liveCandle.high - bid) /
+                    liveRange;
+
+
                 bool extendedImpulseBuy =
                     bullishLiveCandle &&
                     buyRegimeAllowed &&
-                    bodyAtrBuy >= chaseBodyThreshold &&
                     (
-                        distFromEmaBuy >= chaseEmaDistance ||
-                        breakoutDistanceBuy >= chaseBreakoutDistance
+                        (
+                            bodyAtrBuy >= chaseBodyThreshold &&
+                            (
+                                distFromEmaBuy >= chaseEmaDistance ||
+                                breakoutDistanceBuy >= chaseBreakoutDistance
+                            )
+                        )
+                        ||
+                        distFromEmaBuy >= extremeEmaDistance
+                        ||
+                        breakoutDistanceBuy >= extremeBreakoutDistance
+                        ||
+                        (
+                            bodyAtrBuy >= profile.BodyThreshold &&
+                            buyPositionInCandle >= 0.85 &&
+                            distFromEmaBuy >=
+                                profile.TransitionMaxEmaDistance * 0.80
+                        )
                     );
 
 
                 bool extendedImpulseSell =
                     bearishLiveCandle &&
                     sellRegimeAllowed &&
-                    bodyAtrSell >= chaseBodyThreshold &&
                     (
-                        distFromEmaSell >= chaseEmaDistance ||
-                        breakoutDistanceSell >= chaseBreakoutDistance
+                        (
+                            bodyAtrSell >= chaseBodyThreshold &&
+                            (
+                                distFromEmaSell >= chaseEmaDistance ||
+                                breakoutDistanceSell >= chaseBreakoutDistance
+                            )
+                        )
+                        ||
+                        distFromEmaSell >= extremeEmaDistance
+                        ||
+                        breakoutDistanceSell >= extremeBreakoutDistance
+                        ||
+                        (
+                            bodyAtrSell >= profile.BodyThreshold &&
+                            sellPositionInCandle >= 0.85 &&
+                            distFromEmaSell >=
+                                profile.TransitionMaxEmaDistance * 0.80
+                        )
                     );
 
 
@@ -468,10 +976,14 @@ namespace MetaTrader.Services.Helper
                         $"chaseBodyReq={chaseBodyThreshold:F2} | " +
                         $"emaDist={distFromEmaBuy:F2} | " +
                         $"maxChaseEmaDist={chaseEmaDistance:F2} | " +
+                        $"extremeEmaDist={extremeEmaDistance:F2} | " +
                         $"breakATR={breakoutDistanceBuy:F2} | " +
                         $"maxChaseBreak={chaseBreakoutDistance:F2} | " +
-                        $"NOTE=Momentum is strong but price is already extended; wait for pullback/retest"
+                        $"extremeBreak={extremeBreakoutDistance:F2} | " +
+                        $"candlePosition={buyPositionInCandle:F2} | " +
+                        $"NOTE=Momentum is valid but BUY entry is too extended; wait for pullback/retest"
                     );
+
 
                     return false;
                 }
@@ -485,14 +997,78 @@ namespace MetaTrader.Services.Helper
                         $"chaseBodyReq={chaseBodyThreshold:F2} | " +
                         $"emaDist={distFromEmaSell:F2} | " +
                         $"maxChaseEmaDist={chaseEmaDistance:F2} | " +
+                        $"extremeEmaDist={extremeEmaDistance:F2} | " +
                         $"breakATR={breakoutDistanceSell:F2} | " +
                         $"maxChaseBreak={chaseBreakoutDistance:F2} | " +
-                        $"NOTE=Momentum is strong but price is already extended; wait for pullback/retest"
+                        $"extremeBreak={extremeBreakoutDistance:F2} | " +
+                        $"candlePosition={sellPositionInCandle:F2} | " +
+                        $"NOTE=Momentum is valid but SELL entry is too extended; wait for pullback/retest"
                     );
+
 
                     return false;
                 }
 
+
+                // ================================================================
+                // GOLD EARLY BULLISH TRANSITION
+                // ================================================================
+                // Recognize a strong EMA21 reclaim while EMA9 is still below EMA21.
+                //
+                // This pathway does NOT:
+                // - enable the disabled counter-trend reversal system;
+                // - bypass the existing wick or anti-chase checks;
+                // - change FX, CRYPTO, or CASH;
+                // - bypass downstream FastEntryEngine SR/M15 approval.
+                // ================================================================
+
+                if (IsGold(symbol) &&
+                    overallBearish &&
+                    bullishLiveCandle &&
+                    ema9Rising &&
+                    priceAboveEma9 &&
+                    priceAboveEma21)
+                {
+                    const double minTransitionBodyAtr = 0.65;
+                    const double minTransitionMomentum = 0.50;
+                    const double maxTransitionEmaDistanceAtr = 0.95;
+                    const double maxTransitionEmaSpreadAtr = 0.65;
+                    const double maxPreBreakDistanceAtr = 1.10;
+                    const double maxBeyondBreakDistanceAtr = 0.20;
+
+                    double transitionSpreadAtr =
+                        Math.Abs(ema9 - ema21) / atr;
+
+                    bool strongBullishRecovery =
+                        bodyAtrBuy >= minTransitionBodyAtr &&
+                        momentum >= minTransitionMomentum;
+
+                    bool acceptableLocation =
+                        distFromEmaBuy >= profile.MinEmaDistance &&
+                        distFromEmaBuy <= maxTransitionEmaDistanceAtr &&
+                        transitionSpreadAtr <= maxTransitionEmaSpreadAtr &&
+                        breakoutDistanceBuy >= -maxPreBreakDistanceAtr &&
+                        breakoutDistanceBuy <= maxBeyondBreakDistanceAtr;
+
+                    if (strongBullishRecovery && acceptableLocation)
+                    {
+                        action = TradeAction.EnterBuy;
+
+                        LogFile.Write(
+                            $"[{symbol}] GOLD EARLY BULLISH TRANSITION BUY | " +
+                            $"bodyATR={bodyAtrBuy:F2} | " +
+                            $"momentum={momentum:F2} | " +
+                            $"emaDistATR={distFromEmaBuy:F2} | " +
+                            $"emaSpreadATR={transitionSpreadAtr:F2} | " +
+                            $"breakATR={breakoutDistanceBuy:F2} | " +
+                            $"ema9={ema9:F5} | " +
+                            $"ema21={ema21:F5} | " +
+                            $"reason=Strong bullish recovery through EMA21 before EMA crossover"
+                        );
+
+                        return true;
+                    }
+                }
 
                 // ========================================================
                 // NORMAL IMPULSE BODY REQUIREMENT
@@ -517,6 +1093,15 @@ namespace MetaTrader.Services.Helper
 
 
                 // ========================================================
+                // GOLD STRUCTURAL ESCAPE MOMENTUM PROTECTION
+                // ========================================================
+                // Structural Escape previously validated geometry/body/EMA
+                // structure but did not require momentum. For Gold, require
+                // real follow-through before promoting a fresh break.
+                // Other symbols keep their existing Structural Escape behavior.
+                const double goldStructuralEscapeMomentumMin = 0.55;
+
+                // ========================================================
                 // STRUCTURAL ESCAPE BUY
                 //
                 // Strong structural move, but direction must still agree
@@ -527,6 +1112,9 @@ namespace MetaTrader.Services.Helper
                     bullishLiveCandle &&
 
                     buyRegimeAllowed &&
+
+                    (!IsGold(symbol) ||
+                     momentum >= goldStructuralEscapeMomentumMin) &&
 
                     bodyAtrBuy >=
                         profile.EscapeBody &&
@@ -557,6 +1145,9 @@ namespace MetaTrader.Services.Helper
 
                         $"bodyATR={bodyAtrBuy:F2} | " +
                         $"required={profile.EscapeBody:F2} | " +
+
+                        $"momentum={momentum:F2} | " +
+                        $"goldMomentumReq={(IsGold(symbol) ? goldStructuralEscapeMomentumMin : 0.0):F2} | " +
 
                         $"breakATR={breakoutDistanceBuy:F2} | " +
 
@@ -597,6 +1188,9 @@ namespace MetaTrader.Services.Helper
 
                     sellRegimeAllowed &&
 
+                    (!IsGold(symbol) ||
+                     momentum >= goldStructuralEscapeMomentumMin) &&
+
                     bodyAtrSell >=
                         profile.EscapeBody &&
 
@@ -627,6 +1221,9 @@ namespace MetaTrader.Services.Helper
                         $"bodyATR={bodyAtrSell:F2} | " +
                         $"required={profile.EscapeBody:F2} | " +
 
+                        $"momentum={momentum:F2} | " +
+                        $"goldMomentumReq={(IsGold(symbol) ? goldStructuralEscapeMomentumMin : 0.0):F2} | " +
+
                         $"breakATR={breakoutDistanceSell:F2} | " +
 
                         $"breakRange=" +
@@ -655,12 +1252,289 @@ namespace MetaTrader.Services.Helper
 
 
                 // ========================================================
+                // GOLD TREND RESUMPTION IMPULSE
+                // ========================================================
+                // PURPOSE:
+                // Catch a fresh continuation push after Gold has pulled back /
+                // retested the EMA9 area inside an already established EMA9/EMA21
+                // trend.
+                //
+                // This is intentionally different from Transition / Early / Normal
+                // impulse because it does NOT require price to already be close to
+                // the previous high / low.
+                //
+                // SAFETY:
+                // - Gold only.
+                // - Existing wick-rejection protection has already run.
+                // - Existing anti-chase protection has already run.
+                // - EMA9/EMA21 regime must already agree with the trade direction.
+                // - The current H1 candle must have STARTED near the prior EMA9,
+                //   which acts as evidence of a pullback / retest before resumption.
+                // ========================================================
+
+                if (IsGold(symbol))
+                {
+                    const double goldResumeBodyAtr = 0.50;
+                    const double goldResumeMomentumMin = 0.60;
+                    const double goldResumeRetestZoneAtr = 0.35;
+                    const double goldResumeRetestSideToleranceAtr = 0.10;
+                    const double goldResumeMinEmaDistanceAtr = 0.08;
+                    const double goldResumeMaxEmaDistanceAtr = 0.80;
+
+
+                    // ----------------------------------------------------
+                    // Was the current candle opened around the PREVIOUS
+                    // EMA9?  Using ema9Previous avoids judging the candle
+                    // start against an EMA9 that is itself moving live.
+                    // ----------------------------------------------------
+
+                    double goldResumeOpenToEma9Atr =
+                        Math.Abs(
+                            liveCandle.open - ema9Previous
+                        ) / atr;
+
+
+                    bool goldBuyRetestSeen =
+                        goldResumeOpenToEma9Atr <=
+                            goldResumeRetestZoneAtr &&
+
+                        liveCandle.open <=
+                            ema9Previous +
+                            (goldResumeRetestSideToleranceAtr * atr);
+
+
+                    bool goldSellRetestSeen =
+                        goldResumeOpenToEma9Atr <=
+                            goldResumeRetestZoneAtr &&
+
+                        liveCandle.open >=
+                            ema9Previous -
+                            (goldResumeRetestSideToleranceAtr * atr);
+
+
+                    // ====================================================
+                    // GOLD TREND RESUMPTION BUY
+                    // ====================================================
+
+                    bool goldTrendResumeBuyGeometry =
+                        bullishLiveCandle &&
+                        overallBullish &&
+                        buyRegimeAllowed &&
+                        ema9Rising &&
+                        goldBuyRetestSeen &&
+                        priceAboveEma9 &&
+                        priceAboveEma21 &&
+                        bodyAtrBuy >= goldResumeBodyAtr &&
+                        distFromEmaBuy >= goldResumeMinEmaDistanceAtr &&
+                        distFromEmaBuy <= goldResumeMaxEmaDistanceAtr;
+
+                    if (goldTrendResumeBuyGeometry &&
+                        momentum < goldResumeMomentumMin)
+                    {
+                        LogFile.Write(
+                            $"[{symbol}] ⛔ GOLD TREND RESUMPTION BUY BLOCKED - WEAK MOMENTUM | " +
+                            $"momentum={momentum:F2} | " +
+                            $"required={goldResumeMomentumMin:F2} | " +
+                            $"bodyATR={bodyAtrBuy:F2} | " +
+                            $"emaDist={distFromEmaBuy:F2} | " +
+                            $"openToPrevEma9ATR={goldResumeOpenToEma9Atr:F2}"
+                        );
+                    }
+
+                    bool goldTrendResumeBuy =
+                        bullishLiveCandle &&
+
+                        overallBullish &&
+                        buyRegimeAllowed &&
+
+                        ema9Rising &&
+
+                        goldBuyRetestSeen &&
+
+                        priceAboveEma9 &&
+                        priceAboveEma21 &&
+
+                        momentum >=
+                            goldResumeMomentumMin &&
+
+                        bodyAtrBuy >=
+                            goldResumeBodyAtr &&
+
+                        distFromEmaBuy >=
+                            goldResumeMinEmaDistanceAtr &&
+
+                        distFromEmaBuy <=
+                            goldResumeMaxEmaDistanceAtr;
+
+
+                    if (goldTrendResumeBuy)
+                    {
+                        action =
+                            TradeAction.EnterBuy;
+
+
+                        LogFile.Write(
+                            $"[{symbol}] 🔄 GOLD TREND RESUMPTION BUY | " +
+
+                            $"bodyATR={bodyAtrBuy:F2} | " +
+
+                            $"required={goldResumeBodyAtr:F2} | " +
+
+                            $"momentum={momentum:F2} | " +
+                            $"momentumReq={goldResumeMomentumMin:F2} | " +
+
+                            $"emaDist={distFromEmaBuy:F2} | " +
+
+                            $"emaRange=" +
+                            $"{goldResumeMinEmaDistanceAtr:F2}-" +
+                            $"{goldResumeMaxEmaDistanceAtr:F2} | " +
+
+                            $"openToPrevEma9ATR={goldResumeOpenToEma9Atr:F2} | " +
+
+                            $"retestZone={goldResumeRetestZoneAtr:F2} | " +
+
+                            $"ema9={ema9:F5} | " +
+
+                            $"ema9Prev={ema9Previous:F5} | " +
+
+                            $"ema21={ema21:F5} | " +
+
+                            $"ema9Rising={ema9Rising} | " +
+
+                            $"trendAligned={overallBullish} | " +
+
+                            $"NOTE=Gold bullish trend resumed after EMA9-area retest"
+                        );
+
+
+                        return true;
+                    }
+
+
+                    // ====================================================
+                    // GOLD TREND RESUMPTION SELL
+                    // ====================================================
+
+                    bool goldTrendResumeSellGeometry =
+                        bearishLiveCandle &&
+                        overallBearish &&
+                        sellRegimeAllowed &&
+                        ema9Falling &&
+                        goldSellRetestSeen &&
+                        priceBelowEma9 &&
+                        priceBelowEma21 &&
+                        bodyAtrSell >= goldResumeBodyAtr &&
+                        distFromEmaSell >= goldResumeMinEmaDistanceAtr &&
+                        distFromEmaSell <= goldResumeMaxEmaDistanceAtr;
+
+                    if (goldTrendResumeSellGeometry &&
+                        momentum < goldResumeMomentumMin)
+                    {
+                        LogFile.Write(
+                            $"[{symbol}] ⛔ GOLD TREND RESUMPTION SELL BLOCKED - WEAK MOMENTUM | " +
+                            $"momentum={momentum:F2} | " +
+                            $"required={goldResumeMomentumMin:F2} | " +
+                            $"bodyATR={bodyAtrSell:F2} | " +
+                            $"emaDist={distFromEmaSell:F2} | " +
+                            $"openToPrevEma9ATR={goldResumeOpenToEma9Atr:F2}"
+                        );
+                    }
+
+                    bool goldTrendResumeSell =
+                        bearishLiveCandle &&
+
+                        overallBearish &&
+                        sellRegimeAllowed &&
+
+                        ema9Falling &&
+
+                        goldSellRetestSeen &&
+
+                        priceBelowEma9 &&
+                        priceBelowEma21 &&
+
+                        momentum >=
+                            goldResumeMomentumMin &&
+
+                        bodyAtrSell >=
+                            goldResumeBodyAtr &&
+
+                        distFromEmaSell >=
+                            goldResumeMinEmaDistanceAtr &&
+
+                        distFromEmaSell <=
+                            goldResumeMaxEmaDistanceAtr;
+
+
+                    if (goldTrendResumeSell)
+                    {
+                        action =
+                            TradeAction.EnterSell;
+
+
+                        LogFile.Write(
+                            $"[{symbol}] 🔄 GOLD TREND RESUMPTION SELL | " +
+
+                            $"bodyATR={bodyAtrSell:F2} | " +
+
+                            $"required={goldResumeBodyAtr:F2} | " +
+
+                            $"momentum={momentum:F2} | " +
+                            $"momentumReq={goldResumeMomentumMin:F2} | " +
+
+                            $"emaDist={distFromEmaSell:F2} | " +
+
+                            $"emaRange=" +
+                            $"{goldResumeMinEmaDistanceAtr:F2}-" +
+                            $"{goldResumeMaxEmaDistanceAtr:F2} | " +
+
+                            $"openToPrevEma9ATR={goldResumeOpenToEma9Atr:F2} | " +
+
+                            $"retestZone={goldResumeRetestZoneAtr:F2} | " +
+
+                            $"ema9={ema9:F5} | " +
+
+                            $"ema9Prev={ema9Previous:F5} | " +
+
+                            $"ema21={ema21:F5} | " +
+
+                            $"ema9Falling={ema9Falling} | " +
+
+                            $"trendAligned={overallBearish} | " +
+
+                            $"NOTE=Gold bearish trend resumed after EMA9-area retest"
+                        );
+
+
+                        return true;
+                    }
+                }
+
+
+                // ========================================================
                 // TRANSITION IMPULSE BUY
                 // ========================================================
 
+                const double goldTransitionMomentumMin = 0.50;
+
+                // Gold was trading well with this older baseline.
+                // Keep the original transition logic, but allow an already
+                // established GOLD trend to resume from farther below the
+                // previous high instead of waiting until price is within
+                // only the original 0.35 ATR window.
+                //
+                // IMPORTANT: this does NOT loosen counter-trend entries.
+                // If EMA9 is not already above EMA21, the original profile
+                // value is used.
+                double transitionBeforeBreakoutBuy =
+                    overallBullish && IsGold(symbol)
+                        ? 1.10
+                        : profile.TransitionBeforeBreakout;
+
+
                 bool nearOrBreakingHigh =
                     breakoutDistanceBuy >=
-                        -profile.TransitionBeforeBreakout &&
+                        -transitionBeforeBreakoutBuy &&
 
                     breakoutDistanceBuy <=
                         profile.TransitionBeyondBreakout;
@@ -670,6 +1544,9 @@ namespace MetaTrader.Services.Helper
                     bullishLiveCandle &&
 
                     buyRegimeAllowed &&
+
+                    (!IsGold(symbol) ||
+                     momentum >= goldTransitionMomentumMin) &&
 
                     bodyAtrBuy >=
                         profile.TransitionBody &&
@@ -701,10 +1578,15 @@ namespace MetaTrader.Services.Helper
                         $"required=" +
                         $"{profile.TransitionBody:F2} | " +
 
+                        $"momentum={momentum:F2} | " +
+                        $"goldMomentumReq={(IsGold(symbol) ? goldTransitionMomentumMin : 0.0):F2} | " +
+
                         $"emaDist={distFromEmaBuy:F2} | " +
 
                         $"breakDist=" +
                         $"{breakoutDistanceBuy:F2} | " +
+
+                        $"preBreakAllowance={transitionBeforeBreakoutBuy:F2} | " +
 
                         $"ema9Rising={ema9Rising} | " +
 
@@ -724,9 +1606,18 @@ namespace MetaTrader.Services.Helper
                 // TRANSITION IMPULSE SELL
                 // ========================================================
 
+                // Mirror the same change for an already established
+                // bearish GOLD trend. Counter-trend sells still use the
+                // original profile allowance.
+                double transitionBeforeBreakoutSell =
+                    overallBearish && IsGold(symbol)
+                        ? 1.10
+                        : profile.TransitionBeforeBreakout;
+
+
                 bool nearOrBreakingLow =
                     breakoutDistanceSell >=
-                        -profile.TransitionBeforeBreakout &&
+                        -transitionBeforeBreakoutSell &&
 
                     breakoutDistanceSell <=
                         profile.TransitionBeyondBreakout;
@@ -736,6 +1627,9 @@ namespace MetaTrader.Services.Helper
                     bearishLiveCandle &&
 
                     sellRegimeAllowed &&
+
+                    (!IsGold(symbol) ||
+                     momentum >= goldTransitionMomentumMin) &&
 
                     bodyAtrSell >=
                         profile.TransitionBody &&
@@ -767,10 +1661,15 @@ namespace MetaTrader.Services.Helper
                         $"required=" +
                         $"{profile.TransitionBody:F2} | " +
 
+                        $"momentum={momentum:F2} | " +
+                        $"goldMomentumReq={(IsGold(symbol) ? goldTransitionMomentumMin : 0.0):F2} | " +
+
                         $"emaDist={distFromEmaSell:F2} | " +
 
                         $"breakDist=" +
                         $"{breakoutDistanceSell:F2} | " +
+
+                        $"preBreakAllowance={transitionBeforeBreakoutSell:F2} | " +
 
                         $"ema9Falling={ema9Falling} | " +
 
@@ -1018,6 +1917,82 @@ namespace MetaTrader.Services.Helper
                 // DIAGNOSTICS
                 // ========================================================
 
+                // GOLD DIAGNOSTIC-ONLY: runs only after every entry path
+                // has declined. No thresholds or trade decisions are changed.
+                // Group repeated tick logs into candle-level episodes offline.
+                if (IsGold(symbol) && ShouldSampleGoldHold(symbol))
+                {
+                    bool diagnosticBuy = bodyAtrBuy >= bodyAtrSell;
+                    double directionalBody = diagnosticBuy ? bodyAtrBuy : bodyAtrSell;
+                    double directionalEmaDistance = diagnosticBuy ? distFromEmaBuy : distFromEmaSell;
+                    double directionalBreak = diagnosticBuy ? breakoutDistanceBuy : breakoutDistanceSell;
+                    double directionalPosition = diagnosticBuy ? buyPositionInCandle : sellPositionInCandle;
+                    bool regimeOk = diagnosticBuy ? buyRegimeAllowed : sellRegimeAllowed;
+                    bool priceEma9Ok = diagnosticBuy ? priceAboveEma9 : priceBelowEma9;
+                    bool priceEma21Ok = diagnosticBuy ? priceAboveEma21 : priceBelowEma21;
+                    double slopeAtr = Math.Abs(ema9 - ema9Previous) / atr;
+                    double spreadAtr = Math.Abs(ema9 - ema21) / atr;
+                    double candleOpenToPrevEma9Atr = Math.Abs(liveCandle.open - ema9Previous) / atr;
+
+                    // Report complete acceleration eligibility in addition to
+                    // individual component checks. Synthetic candles have no
+                    // reliable intrabar wick history, so don't require candle
+                    // position when meaningful wick data is absent.
+                    bool accelerationDirectionOk = diagnosticBuy
+                        ? bullishLiveCandle && overallBullish && buyRegimeAllowed &&
+                          ema9Rising && priceAboveEma9 && priceAboveEma21
+                        : bearishLiveCandle && overallBearish && sellRegimeAllowed &&
+                          ema9Falling && priceBelowEma9 && priceBelowEma21;
+                    bool accelerationBodyOk = directionalBody >= 0.50;
+                    bool accelerationMomentumOk = momentum >= 0.35;
+                    bool accelerationEmaDistanceOk = directionalEmaDistance >= 0.20 &&
+                        directionalEmaDistance <= 1.35;
+                    bool accelerationSlopeOk = slopeAtr >= 0.05;
+                    bool accelerationSpreadOk = spreadAtr >= 0.15;
+                    bool accelerationBreakOk = directionalBreak >= -0.65 &&
+                        directionalBreak <= 0.35;
+                    bool accelerationCandlePositionOk = true; // No additional Gold position veto.
+                    bool accelerationAllOk = accelerationDirectionOk &&
+                        accelerationBodyOk && accelerationMomentumOk &&
+                        accelerationEmaDistanceOk && accelerationSlopeOk &&
+                        accelerationSpreadOk && accelerationBreakOk &&
+                        accelerationCandlePositionOk;
+
+                    // These snapshots are produced only after every entry path
+                    // returned false, sampled once per 30 seconds per Gold symbol.
+                    LogFile.Write(
+                        $"[{symbol}] GOLD IMPULSE PATH DIAGNOSTIC | " +
+                        $"direction={(diagnosticBuy ? "BUY" : "SELL")} | " +
+                        $"sampleUtc={DateTime.UtcNow:O} | liveOpen={liveCandle.open:F5} | " +
+                        $"bid={bid:F5} | ask={ask:F5} | recentHigh={recentHigh:F5} | recentLow={recentLow:F5} | " +
+                        $"atr={atr:F5} | syntheticOrNoWicks={!goldHasMeaningfulWicks} | " +
+                        $"accelerationAllOk={accelerationAllOk} | " +
+                        $"accelerationDirectionOk={accelerationDirectionOk} | " +
+                        $"accelerationEmaDistanceOk={accelerationEmaDistanceOk} | " +
+                        $"accelerationCandlePositionOk={accelerationCandlePositionOk} | " +
+                        $"bodyATR={directionalBody:F2} | momentum={momentum:F2} | " +
+                        $"regimeOk={regimeOk} | priceEma9Ok={priceEma9Ok} | priceEma21Ok={priceEma21Ok} | " +
+                        $"emaDistATR={directionalEmaDistance:F2} | breakATR={directionalBreak:F2} | " +
+                        $"candlePosition={directionalPosition:F2} | emaSpreadATR={spreadAtr:F2} | " +
+                        $"ema9SlopeATR={slopeAtr:F2} | openToPrevEma9ATR={candleOpenToPrevEma9Atr:F2} | " +
+                        $"accelerationBodyOk={directionalBody >= 0.50} | " +
+                        $"accelerationMomentumOk={momentum >= 0.35} | " +
+                        $"accelerationSlopeOk={slopeAtr >= 0.05} | " +
+                        $"accelerationSpreadOk={spreadAtr >= 0.15} | " +
+                        $"accelerationBreakOk={directionalBreak >= -0.65 && directionalBreak <= 0.35} | " +
+                        $"accelerationLocationOk={directionalEmaDistance >= 0.20 && directionalEmaDistance <= 1.35} | " +
+                        $"transitionBodyOk={directionalBody >= profile.TransitionBody} | " +
+                        $"transitionMomentumOk={momentum >= 0.50} | " +
+                        $"transitionBreakOk={directionalBreak >= -1.10 && directionalBreak <= profile.TransitionBeyondBreakout} | " +
+                        $"resumeBodyOk={directionalBody >= 0.50} | " +
+                        $"resumeMomentumOk={momentum >= 0.60} | " +
+                        $"resumeOpenRetestOk={candleOpenToPrevEma9Atr <= 0.35} | " +
+                        $"escapeBodyOk={directionalBody >= profile.EscapeBody} | " +
+                        $"escapeMomentumOk={momentum >= 0.55} | " +
+                        $"escapeBreakOk={directionalBreak >= profile.EscapeMinBreakAtr && directionalBreak <= profile.EscapeMaxBreakAtr}"
+                    );
+                }
+
                 if (bodyAtrBuy >= 0.45 ||
                     bodyAtrSell >= 0.45)
                 {
@@ -1166,8 +2141,16 @@ namespace MetaTrader.Services.Helper
             double ema21ZoneAtr =
                 0.15;
 
+            // Gold needs a more meaningful pullback before a counter-trend
+            // reversal can be confirmed.  Other asset classes keep the
+            // existing behaviour.
+            bool isGold =
+                IsGold(symbol);
+
             double minimumPullbackAtr =
-                0.15;
+                isGold
+                    ? 0.25
+                    : 0.15;
 
             double maximumPullbackAtr =
                 0.60;
@@ -1175,11 +2158,28 @@ namespace MetaTrader.Services.Helper
             double ema9FailureToleranceAtr =
                 0.12;
 
+            // Gold also needs a slightly stronger renewed push after the
+            // pullback.  This avoids confirming a reversal on a tiny 0.15-0.16
+            // ATR reaction such as the XAUUSD trade from 25-Sep-2026.
             double reboundAtrRequired =
-                0.15;
+                isGold
+                    ? 0.20
+                    : 0.15;
 
             double minimumFollowThroughBodyAtr =
                 0.20;
+
+            // How far apart EMA9 and EMA21 still are at the time the
+            // counter-trend reversal is trying to confirm.
+            double emaSpreadAtr =
+                Math.Abs(
+                    ema9 - ema21
+                ) / atr;
+
+            // If Gold is still materially inside the OLD EMA regime, require
+            // a stronger pullback structure before allowing the reversal.
+            const double goldCounterTrendMaxOldRegimeSpreadAtr = 0.25;
+            const double goldCounterTrendStrongPullbackAtr = 0.30;
 
             // ------------------------------------------------------------
             // FINAL EMA21 ENTRY CONFIRMATION
@@ -1435,6 +2435,15 @@ namespace MetaTrader.Services.Helper
                             atr;
 
 
+                        // Preserve the actual depth of the completed pullback.
+                        // This is different from reboundAtr: pullbackDepth tells
+                        // us whether price genuinely reset before trying again.
+                        double buyPullbackDepthAtr =
+                            (candidate.ExtremePrice -
+                             candidate.PullbackPrice) /
+                            atr;
+
+
                         double buyDistanceBelowEma21Atr =
                             Math.Max(
                                 0.0,
@@ -1453,6 +2462,19 @@ namespace MetaTrader.Services.Helper
                             );
 
 
+                        bool goldCounterTrendBuyConfirmed =
+                            !isGold ||
+                            overallBullish ||
+                            emaSpreadAtr <=
+                                goldCounterTrendMaxOldRegimeSpreadAtr ||
+                            (
+                                buyPullbackDepthAtr >=
+                                    goldCounterTrendStrongPullbackAtr &&
+                                reboundAtr >=
+                                    reboundAtrRequired
+                            );
+
+
                         bool followThrough =
                             candidate.TouchedEma21Zone &&
                             buyEma21EntryConfirmed &&
@@ -1464,7 +2486,8 @@ namespace MetaTrader.Services.Helper
                             priceAboveEma9 &&
                             ema9Rising &&
                             distFromEmaBuy <=
-                                profile.TransitionMaxEmaDistance;
+                                profile.TransitionMaxEmaDistance &&
+                            goldCounterTrendBuyConfirmed;
 
 
                         if (followThrough)
@@ -1479,6 +2502,9 @@ namespace MetaTrader.Services.Helper
                                 $"pullbackLow={candidate.PullbackPrice:F5} | " +
                                 $"price={liveMid:F5} | " +
                                 $"reboundATR={reboundAtr:F2} | " +
+                                $"pullbackDepthATR={buyPullbackDepthAtr:F2} | " +
+                                $"emaSpreadATR={emaSpreadAtr:F2} | " +
+                                $"goldCounterTrendConfirmed={goldCounterTrendBuyConfirmed} | " +
                                 $"bodyATR={bodyAtrBuy:F2} | " +
                                 $"ema9Rising={ema9Rising} | " +
                                 $"ema21ZoneSeen={candidate.TouchedEma21Zone} | " +
@@ -1599,6 +2625,15 @@ namespace MetaTrader.Services.Helper
                         atr;
 
 
+                    // Preserve the actual depth of the completed pullback.
+                    // A shallow reaction should not be enough to confirm a
+                    // Gold reversal while the old EMA regime is still wide.
+                    double sellPullbackDepthAtr =
+                        (candidate.PullbackPrice -
+                         candidate.ExtremePrice) /
+                        atr;
+
+
                     double sellDistanceAboveEma21Atr =
                         Math.Max(
                             0.0,
@@ -1617,6 +2652,19 @@ namespace MetaTrader.Services.Helper
                         );
 
 
+                    bool goldCounterTrendSellConfirmed =
+                        !isGold ||
+                        overallBearish ||
+                        emaSpreadAtr <=
+                            goldCounterTrendMaxOldRegimeSpreadAtr ||
+                        (
+                            sellPullbackDepthAtr >=
+                                goldCounterTrendStrongPullbackAtr &&
+                            sellReboundAtr >=
+                                reboundAtrRequired
+                        );
+
+
                     bool followThrough =
                         candidate.TouchedEma21Zone &&
                         sellEma21EntryConfirmed &&
@@ -1628,7 +2676,8 @@ namespace MetaTrader.Services.Helper
                         priceBelowEma9 &&
                         ema9Falling &&
                         distFromEmaSell <=
-                            profile.TransitionMaxEmaDistance;
+                            profile.TransitionMaxEmaDistance &&
+                        goldCounterTrendSellConfirmed;
 
 
                     if (followThrough)
@@ -1643,6 +2692,9 @@ namespace MetaTrader.Services.Helper
                             $"pullbackHigh={candidate.PullbackPrice:F5} | " +
                             $"price={liveMid:F5} | " +
                             $"reboundATR={sellReboundAtr:F2} | " +
+                            $"pullbackDepthATR={sellPullbackDepthAtr:F2} | " +
+                            $"emaSpreadATR={emaSpreadAtr:F2} | " +
+                            $"goldCounterTrendConfirmed={goldCounterTrendSellConfirmed} | " +
                             $"bodyATR={bodyAtrSell:F2} | " +
                             $"ema9Falling={ema9Falling} | " +
                             $"ema21ZoneSeen={candidate.TouchedEma21Zone} | " +
@@ -1666,6 +2718,54 @@ namespace MetaTrader.Services.Helper
 
                 return false;
             }
+        }
+
+
+        // ================================================================
+        // ASSET-SPECIFIC WICK REJECTION THRESHOLD
+        // ================================================================
+        // A higher value means more wick/rejection is tolerated before a
+        // fresh impulse entry is blocked.
+        //
+        // Gold / crypto are intentionally given more tolerance because they
+        // naturally print larger intrabar wicks than FX and indices.
+        //
+        // These values are deliberately isolated here so they can be tuned
+        // later without changing the entry structure.
+        // ================================================================
+
+        private static double GetRejectionWickThreshold(
+            string symbol)
+        {
+            symbol =
+                symbol?.ToUpperInvariant() ?? "";
+
+
+            if (IsGold(symbol))
+            {
+                return 0.35;
+            }
+
+
+            if (IsCrypto(symbol))
+            {
+                return 0.35;
+            }
+
+
+            if (IsIndex(symbol))
+            {
+                return 0.30;
+            }
+
+
+            if (IsFx(symbol))
+            {
+                return 0.30;
+            }
+
+
+            return 0.32;
         }
 
 
@@ -1695,16 +2795,16 @@ namespace MetaTrader.Services.Helper
 
                     EarlyBody = 0.70,
 
-                    EarlyDistance = 0.35,
+                    EarlyDistance = 0.12,
 
                     MinEmaDistance = 0.10,
 
                     MaxEmaDistance = 1.25,
 
-                    EarlyBreakAllowance = 0.10,
+                    EarlyBreakAllowance = 0.00,
 
 
-                    TransitionBody = 0.65,
+                    TransitionBody = 0.75,
 
                     TransitionMaxEmaDistance = 1.20,
 

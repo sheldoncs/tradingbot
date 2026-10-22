@@ -9,6 +9,21 @@ namespace MetaTrader.Services
 {
     public static class SupportResistanceEngine
     {
+        // ============================================================
+        // ENTRY STUDY DIAGNOSTICS
+        //
+        // Instrumentation only. These values are taken from the exact
+        // S/R geometry used by ShouldBlockTrade(). They do not alter
+        // Gold/Silver entry decisions.
+        // ============================================================
+        public sealed class SrEntryDiagnostics
+        {
+            public double Wall { get; set; }
+            public double ClearanceAtr { get; set; }
+            public bool WallAhead { get; set; }
+            public double Ema9DistanceAtr { get; set; }
+        }
+
         public static int Lookback = 12;
 
         private class SrLevel
@@ -17,6 +32,50 @@ namespace MetaTrader.Services
             public int Touches;
             public bool Valid;
         }
+
+        // ============================================================
+        // GOLD STRUCTURAL BREAKDOWN WATCH
+        //
+        // A valid XAU impulse that reaches an SR band is NOT allowed
+        // to punch straight through the hard wall.  Instead we remember
+        // the setup and wait for price to CLEAR the outer edge.
+        //
+        // This solves the 9/28 XAUUSD case:
+        // valid SELL near 4138 -> support band blocked it -> support
+        // later failed -> price accelerated lower.
+        // ============================================================
+
+        private class GoldBreakdownWatch
+        {
+            public TradeAction Action;
+            public double Wall;
+            public double ZoneLow;
+            public double ZoneHigh;
+            public double ArmedPrice;
+            public DateTime ArmedAtUtc;
+        }
+
+        private static readonly object GoldBreakdownWatchLock =
+            new object();
+
+        private static readonly System.Collections.Generic.Dictionary<string, GoldBreakdownWatch>
+            GoldBreakdownWatches =
+                new System.Collections.Generic.Dictionary<string, GoldBreakdownWatch>();
+
+        private const double GoldBreakTriggerClearanceAtr = 0.05;
+        // Preserve an already-approved GOLD acceleration impulse when SR blocks it.
+        // This arms MEMORY only; it does NOT permit an entry or lower release requirements.
+        private const double GoldBreakArmMinMomentum = 0.30;
+        private const double GoldBreakMinMomentum = 0.45;
+
+        // Armed Gold SR breaks must obey the same hard anti-chase distance
+        // as the final Gold entry-location gate in LiveImpulseEntryEngine.
+        // This prevents an SR watch from becoming a back door around that gate.
+        private const double GoldBreakMaxEmaDistanceAtr = 1.25;
+        private const double GoldBreakCancelEmaDistanceAtr = 1.25;
+
+        private const double GoldBreakCancelReversalAtr = 0.25;
+        private const int GoldBreakWatchMinutes = 60;
 
         // ============================================================
         // SYMBOL TYPE DETECTION
@@ -126,7 +185,7 @@ namespace MetaTrader.Services
         private static double GetMinimumSpaceAtr(string symbol)
         {
             if (IsGold(symbol))
-                return 0.50;
+                return 0.40;
 
             if (IsCrypto(symbol))
                 return 0.60;
@@ -206,8 +265,11 @@ namespace MetaTrader.Services
 
         private static double GetCrossedWallMemoryAtr(string symbol)
         {
+            // Retain Gold crossed-wall context past its 0.12 ATR band and
+            // 0.20 ATR breakout clearance. The prior 0.35 ATR window could
+            // drop the wall before a timely breakout was recognized.
             if (IsGold(symbol))
-                return 0.35;
+                return 0.60;
 
             if (IsCrypto(symbol))
                 return 0.40;
@@ -237,6 +299,44 @@ namespace MetaTrader.Services
                 return 0.15;
 
             return 0.20;
+        }
+
+
+        // ============================================================
+        // SUPPORT / RESISTANCE BAND HALF-WIDTH
+        //
+        // A support or resistance level is treated as a ZONE rather
+        // than as one exact price.  The value returned here is the
+        // half-width of that zone in ATR units.
+        //
+        // Example:
+        //   resistance = 780.55
+        //   ATR = 3.48
+        //   crypto half-width = 0.15 ATR
+        //
+        //   zone = resistance +/- 0.52
+        //        = 780.03 -> 781.07
+        //
+        // Price must clear the OUTER EDGE of the zone plus the normal
+        // breakout-clearance requirement before the wall is considered
+        // genuinely broken.
+        // ============================================================
+
+        private static double GetSrZoneHalfWidthAtr(string symbol)
+        {
+            if (IsGold(symbol))
+                return 0.12;
+
+            if (IsCrypto(symbol))
+                return 0.15;
+
+            if (IsIndex(symbol))
+                return 0.12;
+
+            if (IsFx(symbol))
+                return 0.08;
+
+            return 0.10;
         }
 
 
@@ -661,6 +761,15 @@ namespace MetaTrader.Services
             double criticalSpace =
                 GetCriticalSpaceAtr(symbol);
 
+
+            double zoneHalfWidthAtr =
+                GetSrZoneHalfWidthAtr(symbol);
+
+
+            double zoneHalfWidthPrice =
+                zoneHalfWidthAtr * atr;
+
+
             // --------------------------------------------------------
             // BUY
             // --------------------------------------------------------
@@ -669,17 +778,37 @@ namespace MetaTrader.Services
             {
                 if (activeResistance > 0)
                 {
-                    spaceAtr =
-                        Math.Abs(
-                            activeResistance -
-                            currentPrice
-                        )
-                        /
-                        atr;
+                    double resistanceZoneLow =
+                        activeResistance -
+                        zoneHalfWidthPrice;
 
-                    // Whether resistance is just above us OR was only
-                    // just crossed, the setup is still too close to
-                    // that structural wall to be considered safe.
+                    double resistanceZoneHigh =
+                        activeResistance +
+                        zoneHalfWidthPrice;
+
+                    // If price is inside the resistance band, there is
+                    // effectively ZERO safe runway.  If price is below
+                    // the band, measure to the near edge.  If price is
+                    // above the band, measure clearance beyond the far
+                    // edge.
+                    if (currentPrice >= resistanceZoneLow &&
+                        currentPrice <= resistanceZoneHigh)
+                    {
+                        spaceAtr = 0.0;
+                    }
+                    else if (currentPrice < resistanceZoneLow)
+                    {
+                        spaceAtr =
+                            (resistanceZoneLow - currentPrice) /
+                            atr;
+                    }
+                    else
+                    {
+                        spaceAtr =
+                            (currentPrice - resistanceZoneHigh) /
+                            atr;
+                    }
+
                     return
                         spaceAtr <
                         criticalSpace;
@@ -687,6 +816,7 @@ namespace MetaTrader.Services
 
                 return false;
             }
+
 
             // --------------------------------------------------------
             // SELL
@@ -696,16 +826,32 @@ namespace MetaTrader.Services
             {
                 if (activeSupport > 0)
                 {
-                    spaceAtr =
-                        Math.Abs(
-                            currentPrice -
-                            activeSupport
-                        )
-                        /
-                        atr;
+                    double supportZoneLow =
+                        activeSupport -
+                        zoneHalfWidthPrice;
 
-                    // Same protection for support.  A tiny break below
-                    // support does NOT make support disappear.
+                    double supportZoneHigh =
+                        activeSupport +
+                        zoneHalfWidthPrice;
+
+                    if (currentPrice >= supportZoneLow &&
+                        currentPrice <= supportZoneHigh)
+                    {
+                        spaceAtr = 0.0;
+                    }
+                    else if (currentPrice > supportZoneHigh)
+                    {
+                        spaceAtr =
+                            (currentPrice - supportZoneHigh) /
+                            atr;
+                    }
+                    else
+                    {
+                        spaceAtr =
+                            (supportZoneLow - currentPrice) /
+                            atr;
+                    }
+
                     return
                         spaceAtr <
                         criticalSpace;
@@ -714,7 +860,401 @@ namespace MetaTrader.Services
                 return false;
             }
 
+
             return false;
+        }
+
+
+
+        // ============================================================
+        // ARM GOLD BREAKDOWN WATCH
+        // ============================================================
+
+        private static void ArmGoldBreakdownWatch(
+            string symbol,
+            TradeAction action,
+            double wall,
+            double zoneLow,
+            double zoneHigh,
+            double currentPrice)
+        {
+            if (!IsGold(symbol))
+                return;
+
+            symbol =
+                symbol?.ToUpperInvariant()
+                ?? "";
+
+            lock (GoldBreakdownWatchLock)
+            {
+                GoldBreakdownWatch existing;
+
+                if (GoldBreakdownWatches.TryGetValue(
+                        symbol,
+                        out existing))
+                {
+                    bool stillFresh =
+                        DateTime.UtcNow -
+                        existing.ArmedAtUtc <=
+                        TimeSpan.FromMinutes(
+                            GoldBreakWatchMinutes
+                        );
+
+                    // Keep the ORIGINAL structural wall while the watch
+                    // is still fresh.  Do not let a recalculated shelf
+                    // move the goalposts every tick.
+                    if (stillFresh &&
+                        existing.Action == action)
+                    {
+                        return;
+                    }
+                }
+
+                GoldBreakdownWatches[symbol] =
+                    new GoldBreakdownWatch
+                    {
+                        Action = action,
+                        Wall = wall,
+                        ZoneLow = zoneLow,
+                        ZoneHigh = zoneHigh,
+                        ArmedPrice = currentPrice,
+                        ArmedAtUtc = DateTime.UtcNow
+                    };
+            }
+
+            LogFile.Write(
+                $"[{symbol}] 🟠 GOLD SR BREAK WATCH ARMED | " +
+                $"action={action} | " +
+                $"wall={wall:F5} | " +
+                $"zoneLow={zoneLow:F5} | " +
+                $"zoneHigh={zoneHigh:F5} | " +
+                $"armedPrice={currentPrice:F5}"
+            );
+        }
+
+
+        // ============================================================
+        // CHECK ARMED GOLD BREAKDOWN WATCH
+        //
+        // This is intentionally stricter than simply "price crossed
+        // support/resistance".
+        //
+        // SELL:
+        // - price must clear BELOW support-zone low
+        // - EMA9 must still be falling
+        // - price must remain below EMA9
+        // - hybrid momentum must still be meaningful
+        // - entry must not already be too far from EMA9
+        //
+        // BUY is the mirror image.
+        // ============================================================
+
+        public static bool TryTriggerArmedGoldBreakdown(
+            string symbol,
+            double atr,
+            double currentPrice,
+            double ema9,
+            double ema9Previous,
+            double momentum,
+            out TradeAction action)
+        {
+            action =
+                TradeAction.Hold;
+
+            if (!IsGold(symbol) ||
+                atr <= 0 ||
+                currentPrice <= 0 ||
+                ema9 <= 0 ||
+                ema9Previous <= 0)
+            {
+                return false;
+            }
+
+            symbol =
+                symbol?.ToUpperInvariant()
+                ?? "";
+
+            GoldBreakdownWatch watch;
+
+            lock (GoldBreakdownWatchLock)
+            {
+                if (!GoldBreakdownWatches.TryGetValue(
+                        symbol,
+                        out watch))
+                {
+                    return false;
+                }
+
+                if (DateTime.UtcNow -
+                    watch.ArmedAtUtc >
+                    TimeSpan.FromMinutes(
+                        GoldBreakWatchMinutes
+                    ))
+                {
+                    GoldBreakdownWatches.Remove(
+                        symbol
+                    );
+
+                    return false;
+                }
+            }
+
+            double emaDistanceAtr =
+                Math.Abs(
+                    currentPrice -
+                    ema9
+                ) / atr;
+
+            double triggerClearance =
+                GoldBreakTriggerClearanceAtr *
+                atr;
+
+
+            // --------------------------------------------------------
+            // SELL BREAKDOWN
+            // --------------------------------------------------------
+            if (watch.Action ==
+                TradeAction.EnterSell)
+            {
+                bool clearedBand =
+                    currentPrice <=
+                    watch.ZoneLow -
+                    triggerClearance;
+
+                bool emaStillBearish =
+                    ema9 <
+                    ema9Previous &&
+                    currentPrice <
+                    ema9;
+
+                bool momentumOk =
+                    Math.Abs(momentum) >=
+                    GoldBreakMinMomentum;
+
+                bool notTooLate =
+                    emaDistanceAtr <=
+                    GoldBreakMaxEmaDistanceAtr;
+
+                // Cancel if price has run too far before confirmation.
+                if (clearedBand &&
+                    emaDistanceAtr >
+                    GoldBreakCancelEmaDistanceAtr)
+                {
+                    ClearGoldBreakdownWatch(
+                        symbol
+                    );
+
+                    LogFile.Write(
+                        $"[{symbol}] ❌ GOLD BREAK WATCH CANCELLED - TOO EXTENDED | " +
+                        $"action=EnterSell | " +
+                        $"price={currentPrice:F5} | " +
+                        $"emaDistATR={emaDistanceAtr:F2} | " +
+                        $"cancelAbove={GoldBreakCancelEmaDistanceAtr:F2}"
+                    );
+
+                    return false;
+                }
+
+                // Cancel if price rejects the level and moves materially
+                // back above the opposite edge of the band.
+                if (currentPrice >=
+                    watch.ZoneHigh +
+                    atr *
+                    GoldBreakCancelReversalAtr)
+                {
+                    ClearGoldBreakdownWatch(
+                        symbol
+                    );
+
+                    LogFile.Write(
+                        $"[{symbol}] ❌ GOLD BREAK WATCH CANCELLED - SUPPORT HELD | " +
+                        $"action=EnterSell | " +
+                        $"price={currentPrice:F5} | " +
+                        $"zoneHigh={watch.ZoneHigh:F5}"
+                    );
+
+                    return false;
+                }
+
+                if (clearedBand &&
+                    emaStillBearish &&
+                    momentumOk &&
+                    notTooLate)
+                {
+                    action =
+                        TradeAction.EnterSell;
+
+                    LogFile.Write(
+                        $"[{symbol}] 🔥 GOLD SUPPORT BREAK CONFIRMED | " +
+                        $"action={action} | " +
+                        $"wall={watch.Wall:F5} | " +
+                        $"zoneLow={watch.ZoneLow:F5} | " +
+                        $"price={currentPrice:F5} | " +
+                        $"clearanceATR={(watch.ZoneLow - currentPrice) / atr:F2} | " +
+                        $"emaDistATR={emaDistanceAtr:F2} | " +
+                        $"momentum={momentum:F2}"
+                    );
+
+                    return true;
+                }
+
+                return false;
+            }
+
+
+            // --------------------------------------------------------
+            // BUY BREAKOUT
+            // --------------------------------------------------------
+            if (watch.Action ==
+                TradeAction.EnterBuy)
+            {
+                bool clearedBand =
+                    currentPrice >=
+                    watch.ZoneHigh +
+                    triggerClearance;
+
+                bool emaStillBullish =
+                    ema9 >
+                    ema9Previous &&
+                    currentPrice >
+                    ema9;
+
+                bool momentumOk =
+                    Math.Abs(momentum) >=
+                    GoldBreakMinMomentum;
+
+                bool notTooLate =
+                    emaDistanceAtr <=
+                    GoldBreakMaxEmaDistanceAtr;
+
+                if (clearedBand &&
+                    emaDistanceAtr >
+                    GoldBreakCancelEmaDistanceAtr)
+                {
+                    ClearGoldBreakdownWatch(
+                        symbol
+                    );
+
+                    LogFile.Write(
+                        $"[{symbol}] ❌ GOLD BREAK WATCH CANCELLED - TOO EXTENDED | " +
+                        $"action=EnterBuy | " +
+                        $"price={currentPrice:F5} | " +
+                        $"emaDistATR={emaDistanceAtr:F2} | " +
+                        $"cancelAbove={GoldBreakCancelEmaDistanceAtr:F2}"
+                    );
+
+                    return false;
+                }
+
+                if (currentPrice <=
+                    watch.ZoneLow -
+                    atr *
+                    GoldBreakCancelReversalAtr)
+                {
+                    ClearGoldBreakdownWatch(
+                        symbol
+                    );
+
+                    LogFile.Write(
+                        $"[{symbol}] ❌ GOLD BREAK WATCH CANCELLED - RESISTANCE HELD | " +
+                        $"action=EnterBuy | " +
+                        $"price={currentPrice:F5} | " +
+                        $"zoneLow={watch.ZoneLow:F5}"
+                    );
+
+                    return false;
+                }
+
+                if (clearedBand &&
+                    emaStillBullish &&
+                    momentumOk &&
+                    notTooLate)
+                {
+                    action =
+                        TradeAction.EnterBuy;
+
+                    LogFile.Write(
+                        $"[{symbol}] 🔥 GOLD RESISTANCE BREAK CONFIRMED | " +
+                        $"action={action} | " +
+                        $"wall={watch.Wall:F5} | " +
+                        $"zoneHigh={watch.ZoneHigh:F5} | " +
+                        $"price={currentPrice:F5} | " +
+                        $"clearanceATR={(currentPrice - watch.ZoneHigh) / atr:F2} | " +
+                        $"emaDistATR={emaDistanceAtr:F2} | " +
+                        $"momentum={momentum:F2}"
+                    );
+
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+
+        // FINAL-GUARD HANDOFF: read-only confirmation of the ORIGINAL armed wall.
+        // Never manufacture approval from an entry-model name or a single tick.
+        // This preserves the existing armed-watch clearance, direction, momentum,
+        // freshness and EMA-location requirements. No watch is consumed here.
+        public static bool TryVerifyArmedGoldBreakForFinalGuard(
+            string symbol, TradeAction expectedAction, double atr,
+            double executablePrice, double ema9, double previousEma9,
+            double momentum, out double verifiedWall)
+        {
+            verifiedWall = 0.0;
+            if (!IsGold(symbol) || atr <= 0 || executablePrice <= 0 ||
+                ema9 <= 0 || previousEma9 <= 0 ||
+                double.IsNaN(momentum) || double.IsInfinity(momentum))
+                return false;
+
+            GoldBreakdownWatch watch;
+            lock (GoldBreakdownWatchLock)
+            {
+                if (!GoldBreakdownWatches.TryGetValue((symbol ?? "").ToUpperInvariant(), out watch) ||
+                    watch.Action != expectedAction ||
+                    DateTime.UtcNow - watch.ArmedAtUtc > TimeSpan.FromMinutes(GoldBreakWatchMinutes))
+                    return false;
+            }
+
+            double distance = Math.Abs(executablePrice - ema9) / atr;
+            if (distance > GoldBreakMaxEmaDistanceAtr ||
+                Math.Abs(momentum) < GoldBreakMinMomentum)
+                return false;
+
+            bool buy = expectedAction == TradeAction.EnterBuy;
+            bool sell = expectedAction == TradeAction.EnterSell;
+            double clearance = GoldBreakTriggerClearanceAtr * atr;
+            bool valid = (buy && executablePrice >= watch.ZoneHigh + clearance &&
+                          ema9 > previousEma9 && executablePrice > ema9) ||
+                         (sell && executablePrice <= watch.ZoneLow - clearance &&
+                          ema9 < previousEma9 && executablePrice < ema9);
+            if (!valid) return false;
+            verifiedWall = watch.Wall;
+            return true;
+        }
+
+        // ============================================================
+        // CLEAR GOLD BREAKDOWN WATCH
+        // ============================================================
+
+        public static void ClearGoldBreakdownWatch(
+            string symbol)
+        {
+            if (string.IsNullOrWhiteSpace(
+                    symbol))
+            {
+                return;
+            }
+
+            symbol =
+                symbol.ToUpperInvariant();
+
+            lock (GoldBreakdownWatchLock)
+            {
+                GoldBreakdownWatches.Remove(
+                    symbol
+                );
+            }
         }
 
 
@@ -727,6 +1267,8 @@ namespace MetaTrader.Services
         // Do NOT substitute rates[^1].close for EMA9.
         // ============================================================
 
+        // Compatibility overload: existing Gold callers continue to compile
+        // and behave exactly as before.
         public static bool ShouldBlockTrade(
             string symbol,
             TradeAction action,
@@ -736,19 +1278,53 @@ namespace MetaTrader.Services
             double currentPrice,
             double ema9,
             double recentHigh = 0.0,
-            double recentLow = 0.0)
+            double recentLow = 0.0,
+            bool isImpulseEntry = false,
+            bool isArmedBreakdownTrigger = false)
         {
+            SrEntryDiagnostics ignored;
+
+            return ShouldBlockTrade(
+                symbol,
+                action,
+                rates,
+                atr,
+                momentum,
+                currentPrice,
+                ema9,
+                out ignored,
+                recentHigh,
+                recentLow,
+                isImpulseEntry,
+                isArmedBreakdownTrigger
+            );
+        }
+
+        // Diagnostic overload used by FastEntryEngine/Trade Study.
+        // The trading decision is still produced by the same logic below.
+        public static bool ShouldBlockTrade(
+            string symbol,
+            TradeAction action,
+            MqlRates[] rates,
+            double atr,
+            double momentum,
+            double currentPrice,
+            double ema9,
+            out SrEntryDiagnostics diagnostics,
+            double recentHigh = 0.0,
+            double recentLow = 0.0,
+            bool isImpulseEntry = false,
+            bool isArmedBreakdownTrigger = false)
+        {
+            diagnostics = new SrEntryDiagnostics();
+
             if (
                 rates == null ||
-                rates.Length <
-                    Lookback + 2 ||
-                atr <= 0
-            )
+                rates.Length < Lookback + 2 ||
+                atr <= 0)
             {
                 return false;
             }
-
-
             symbol =
                 symbol?.ToUpperInvariant()
                 ?? "";
@@ -812,55 +1388,104 @@ namespace MetaTrader.Services
 
 
             // ========================================================
-            // DIRECTIONAL SPACE + RECENTLY-CROSSED WALL STATE
+            // SR BAND GEOMETRY
             // ========================================================
 
-            double distToResistance =
+            double zoneHalfWidthAtr =
+                GetSrZoneHalfWidthAtr(symbol);
+
+
+            double zoneHalfWidthPrice =
+                zoneHalfWidthAtr * atr;
+
+
+            double resistanceZoneLow =
                 activeResistance > 0
-                    ? Math.Abs(
-                        activeResistance -
-                        currentPrice
-                      )
-                      /
-                      atr
-                    : double.MaxValue;
+                    ? activeResistance - zoneHalfWidthPrice
+                    : 0.0;
 
 
-            double distToSupport =
+            double resistanceZoneHigh =
+                activeResistance > 0
+                    ? activeResistance + zoneHalfWidthPrice
+                    : 0.0;
+
+
+            double supportZoneLow =
                 activeSupport > 0
-                    ? Math.Abs(
-                        currentPrice -
-                        activeSupport
-                      )
-                      /
-                      atr
-                    : double.MaxValue;
+                    ? activeSupport - zoneHalfWidthPrice
+                    : 0.0;
+
+
+            double supportZoneHigh =
+                activeSupport > 0
+                    ? activeSupport + zoneHalfWidthPrice
+                    : 0.0;
+
+
+            // ========================================================
+            // DIRECTIONAL SPACE + RECENTLY-CROSSED BAND STATE
+            //
+            // IMPORTANT:
+            // Space is measured to the NEAREST EDGE of the zone, not
+            // to the old single center-line.  A price inside the zone
+            // has zero runway.
+            // ========================================================
+
+            bool priceInsideResistanceBand =
+                activeResistance > 0 &&
+                currentPrice >= resistanceZoneLow &&
+                currentPrice <= resistanceZoneHigh;
+
+
+            bool priceInsideSupportBand =
+                activeSupport > 0 &&
+                currentPrice >= supportZoneLow &&
+                currentPrice <= supportZoneHigh;
 
 
             bool resistanceAhead =
                 activeResistance > 0 &&
-                activeResistance >
-                    currentPrice;
+                currentPrice < resistanceZoneLow;
 
 
             bool supportAhead =
                 activeSupport > 0 &&
-                activeSupport <
-                    currentPrice;
+                currentPrice > supportZoneHigh;
 
 
+            double distToResistance =
+                activeResistance <= 0
+                    ? double.MaxValue
+                    : priceInsideResistanceBand
+                        ? 0.0
+                        : currentPrice < resistanceZoneLow
+                            ? (resistanceZoneLow - currentPrice) / atr
+                            : (currentPrice - resistanceZoneHigh) / atr;
+
+
+            double distToSupport =
+                activeSupport <= 0
+                    ? double.MaxValue
+                    : priceInsideSupportBand
+                        ? 0.0
+                        : currentPrice > supportZoneHigh
+                            ? (currentPrice - supportZoneHigh) / atr
+                            : (supportZoneLow - currentPrice) / atr;
+
+
+            // A wall is only considered crossed AFTER price clears the
+            // outer edge of its band.
             bool resistanceRecentlyCrossed =
                 activeResistance > 0 &&
-                activeResistance <
-                    currentPrice &&
+                currentPrice > resistanceZoneHigh &&
                 distToResistance <=
                     crossedWallMemory;
 
 
             bool supportRecentlyCrossed =
                 activeSupport > 0 &&
-                activeSupport >
-                    currentPrice &&
+                currentPrice < supportZoneLow &&
                 distToSupport <=
                     crossedWallMemory;
 
@@ -893,10 +1518,42 @@ namespace MetaTrader.Services
                     : 0;
 
 
+            // Freeze the exact directional S/R context used by this decision.
+            // BUY  -> resistance wall / clearance to resistance zone.
+            // SELL -> support wall / clearance to support zone.
+            if (action == TradeAction.EnterBuy)
+            {
+                diagnostics.Wall = activeResistance;
+                diagnostics.ClearanceAtr =
+                    activeResistance > 0 ? distToResistance : 0.0;
+                diagnostics.WallAhead = resistanceAhead;
+            }
+            else if (action == TradeAction.EnterSell)
+            {
+                diagnostics.Wall = activeSupport;
+                diagnostics.ClearanceAtr =
+                    activeSupport > 0 ? distToSupport : 0.0;
+                diagnostics.WallAhead = supportAhead;
+            }
+
+            diagnostics.Ema9DistanceAtr = distFromEma;
+
+
             double maxEmaDistance =
                 GetMaxEmaDistanceAtr(
                     symbol
                 );
+
+            // An armed GOLD structural break is allowed a little more
+            // room than a normal fresh impulse.  This is NOT a global
+            // relaxation: it only applies after a previously-valid gold
+            // impulse was hard-blocked by the exact SR band that has now
+            // failed.
+            double effectiveMaxEmaDistance =
+                isArmedBreakdownTrigger &&
+                IsGold(symbol)
+                    ? GoldBreakMaxEmaDistanceAtr
+                    : maxEmaDistance;
 
 
             // ========================================================
@@ -916,31 +1573,125 @@ namespace MetaTrader.Services
                 );
 
 
-            // Use the RETAINED wall for breakout confirmation.
+            // ========================================================
+            // STRUCTURAL BREAKOUT CLEARANCE
             //
-            // A breakout is only confirmed when:
-            // 1) price has genuinely crossed the wall,
-            // 2) it has cleared the wall by a meaningful ATR amount,
-            // 3) momentum is strong enough.
+            // IMPORTANT:
+            //
+            // This answers ONLY whether price has genuinely cleared
+            // the retained support/resistance wall by the required ATR
+            // distance.  It intentionally does NOT require strong
+            // momentum.
+            //
+            // This prevents a valid break from being labelled
+            // "only just crossed" simply because hybrid momentum has
+            // not reached the stronger SR override threshold.
+            // ========================================================
+
+            bool breakoutCleared =
+                action ==
+                TradeAction.EnterBuy
+
+                    ? resistanceRecentlyCrossed &&
+                      currentPrice >=
+                          resistanceZoneHigh +
+                          atr *
+                          breakoutClearance
+
+                    : supportRecentlyCrossed &&
+                      currentPrice <=
+                          supportZoneLow -
+                          atr *
+                          breakoutClearance;
+
+
+            // ========================================================
+            // CONFIRMED STRONG BREAKOUT
+            //
+            // Keep strong momentum as a separate concept.
+            //
+            // This remains useful when a trade must override another
+            // SR restriction such as limited runway ahead.
+            // ========================================================
+
+            // For Gold, geometric clearance of the remembered wall is the
+            // breakout confirmation; the originating impulse engine already
+            // assessed momentum. Do not introduce a second 1.35 veto.
+            // Other assets retain the original momentum-backed definition.
             bool confirmedBreakout =
-                strongMomentum &&
-                (
-                    action ==
-                    TradeAction.EnterBuy
+                breakoutCleared &&
+                (IsGold(symbol) || strongMomentum);
 
-                        ? resistanceRecentlyCrossed &&
-                          currentPrice >=
-                              activeResistance +
-                              atr *
-                              breakoutClearance
 
-                        : supportRecentlyCrossed &&
-                          currentPrice <=
-                              activeSupport -
-                              atr *
-                              breakoutClearance
-                );
+            // GOLD ONLY: a normal fresh impulse still requires the existing
+            // structural-clearance AND strong-momentum confirmation here.
+            // However, an armed Gold breakout has ALREADY passed the separate
+            // TryTriggerArmedGoldBreakdown() verification (zone-edge clearance,
+            // directional EMA, >= 0.45 momentum and <= 1.10 ATR EMA distance).
+            // Do not reapply the unrelated 1.35 momentum threshold to that
+            // already-confirmed armed trigger. All subsequent SR/next-wall and
+            // EMA-distance checks remain in effect.
+            if (IsGold(symbol) &&
+                ((action == TradeAction.EnterBuy && resistanceRecentlyCrossed) ||
+                 (action == TradeAction.EnterSell && supportRecentlyCrossed)) &&
+                !confirmedBreakout &&
+                !isArmedBreakdownTrigger)
+            {
+                LogFile.Write($"[{symbol}] GOLD SR UNCONFIRMED CROSS BLOCK | " +
+                    $"action={action} | price={currentPrice:F5} | " +
+                    $"wall={(action == TradeAction.EnterBuy ? activeResistance : activeSupport):F5} | " +
+                    $"breakoutCleared={breakoutCleared} | strongMomentum={strongMomentum} | " +
+                    $"confirmedBreakout={confirmedBreakout}");
+                return true;
+            }
 
+            // GOLD ONLY: check the NEXT untouched overhead/underlying H1
+            // structure, not just the nearest crossed wall. Multiple local
+            // highs/lows may be inside the last 12 completed H1 candles.
+            if (IsGold(symbol) && rates != null && rates.Length >= Lookback + 2)
+            {
+                double nearestNextWall = 0.0;
+                double nearestNextRoom = double.MaxValue;
+                for (int i = 2; i < Lookback + 2 && i < rates.Length; i++)
+                {
+                    double level = action == TradeAction.EnterBuy ? rates[^i].high : rates[^i].low;
+                    double room = action == TradeAction.EnterBuy
+                        ? (level - zoneHalfWidthPrice - currentPrice) / atr
+                        : (currentPrice - (level + zoneHalfWidthPrice)) / atr;
+                    // Only unbroken walls in the direction of the trade.
+                    if (room >= 0 && room < nearestNextRoom)
+                    {
+                        nearestNextRoom = room;
+                        nearestNextWall = level;
+                    }
+                }
+                if (nearestNextWall > 0 && nearestNextRoom < minimumSpace)
+                {
+                    LogFile.Write($"[{symbol}] GOLD NEXT SR WALL BLOCK | " +
+                        $"action={action} | nextWall={nearestNextWall:F5} | " +
+                        $"runwayATR={nearestNextRoom:F2} | requiredATR={minimumSpace:F2}");
+
+                    // A genuine impulse that is blocked by the NEXT untouched H1
+                    // wall must not be forgotten. Retain this exact wall and allow
+                    // TryTriggerArmedGoldBreakdown() to check a later real break.
+                    // This DOES NOT authorize an entry into the wall.
+                    if (isImpulseEntry &&
+                        (action == TradeAction.EnterBuy || action == TradeAction.EnterSell) &&
+                        Math.Abs(momentum) >= GoldBreakArmMinMomentum &&
+                        distFromEma <= GoldBreakMaxEmaDistanceAtr)
+                    {
+                        ArmGoldBreakdownWatch(
+                            symbol,
+                            action,
+                            nearestNextWall,
+                            nearestNextWall - zoneHalfWidthPrice,
+                            nearestNextWall + zoneHalfWidthPrice,
+                            currentPrice);
+                    }
+
+                    return true;
+                }
+            }
 
             // ========================================================
             // BUY
@@ -956,19 +1707,43 @@ namespace MetaTrader.Services
                 // ----------------------------------------------------
 
                 if (
-                    resistanceAhead &&
+                    (resistanceAhead ||
+                     priceInsideResistanceBand) &&
                     distToResistance <
                         criticalSpace
                 )
                 {
                     LogFile.Write(
                         $"[{symbol}] ⛔ HARD SR BLOCK BUY | " +
-                        $"spaceATR={distToResistance:F2} | " +
+                        $"spaceATR={(activeResistance > 0 ? distToResistance.ToString("F2") : "NO_WALL")} | " +
                         $"critical={criticalSpace:F2} | " +
                         $"resistance={activeResistance:F5} | " +
+                        $"zoneLow={resistanceZoneLow:F5} | " +
+                        $"zoneHigh={resistanceZoneHigh:F5} | " +
+                        $"insideBand={priceInsideResistanceBand} | " +
                         $"price={currentPrice:F5} | " +
                         $"touches={resistanceShelf.Touches}"
                     );
+
+                    // Retain the originally blocked wall even when price is
+                    // just AHEAD of its band (not only already inside it).
+                    // The current entry stays blocked until a separate, confirmed
+                    // structural-break trigger qualifies on a later evaluation.
+                    if (IsGold(symbol) &&
+                        isImpulseEntry &&
+                        Math.Abs(momentum) >= GoldBreakArmMinMomentum &&
+                        distFromEma <= GoldBreakMaxEmaDistanceAtr &&
+                        (priceInsideResistanceBand || resistanceAhead))
+                    {
+                        ArmGoldBreakdownWatch(
+                            symbol,
+                            TradeAction.EnterBuy,
+                            activeResistance,
+                            resistanceZoneLow,
+                            resistanceZoneHigh,
+                            currentPrice
+                        );
+                    }
 
                     return true;
                 }
@@ -983,15 +1758,18 @@ namespace MetaTrader.Services
 
                 if (
                     resistanceRecentlyCrossed &&
-                    !confirmedBreakout
+                    !breakoutCleared &&
+                    !isArmedBreakdownTrigger
                 )
                 {
                     LogFile.Write(
                         $"[{symbol}] ⛔ BUY BLOCKED: resistance only just crossed | " +
                         $"wall={activeResistance:F5} | " +
+                        $"zoneHigh={resistanceZoneHigh:F5} | " +
                         $"price={currentPrice:F5} | " +
-                        $"clearanceATR={distToResistance:F2} | " +
+                        $"clearanceBeyondBandATR={distToResistance:F2} | " +
                         $"requiredBreakATR={breakoutClearance:F2} | " +
+                        $"breakoutCleared={breakoutCleared} | " +
                         $"strongMomentum={strongMomentum}"
                     );
 
@@ -1006,7 +1784,8 @@ namespace MetaTrader.Services
                 // ----------------------------------------------------
 
                 if (
-                    resistanceAhead &&
+                    (resistanceAhead ||
+                     priceInsideResistanceBand) &&
                     distToResistance <
                         minimumSpace &&
                     !confirmedBreakout
@@ -1014,10 +1793,12 @@ namespace MetaTrader.Services
                 {
                     LogFile.Write(
                         $"[{symbol}] ❌ Buy blocked: no space above | " +
-                        $"spaceATR={distToResistance:F2} | " +
+                        $"spaceATR={(activeResistance > 0 ? distToResistance.ToString("F2") : "NO_WALL")} | " +
                         $"required={minimumSpace:F2} | " +
                         $"critical={criticalSpace:F2} | " +
                         $"resistance={activeResistance:F5} | " +
+                        $"zoneLow={resistanceZoneLow:F5} | " +
+                        $"zoneHigh={resistanceZoneHigh:F5} | " +
                         $"price={currentPrice:F5}"
                     );
 
@@ -1032,13 +1813,13 @@ namespace MetaTrader.Services
                 if (
                     ema9 > 0 &&
                     distFromEma >
-                        maxEmaDistance
+                        effectiveMaxEmaDistance
                 )
                 {
                     LogFile.Write(
                         $"[{symbol}] ❌ Buy blocked: too far from EMA9 | " +
                         $"distATR={distFromEma:F2} | " +
-                        $"max={maxEmaDistance:F2} | " +
+                        $"max={effectiveMaxEmaDistance:F2} | " +
                         $"ema9={ema9:F5} | " +
                         $"price={currentPrice:F5}"
                     );
@@ -1049,9 +1830,12 @@ namespace MetaTrader.Services
 
                 LogFile.Write(
                     $"[{symbol}] ✅ Buy allowed | " +
-                    $"spaceATR={distToResistance:F2} | " +
+                    $"spaceATR={(activeResistance > 0 ? distToResistance.ToString("F2") : "NO_WALL")} | " +
                     $"resistanceAhead={resistanceAhead} | " +
                     $"activeResistance={activeResistance:F5} | " +
+                    $"resistanceZoneLow={resistanceZoneLow:F5} | " +
+                    $"resistanceZoneHigh={resistanceZoneHigh:F5} | " +
+                    $"insideBand={priceInsideResistanceBand} | " +
                     $"recentHigh={recentHigh:F5} | " +
                     $"emaDist={distFromEma:F2} | " +
                     $"strongMomentum={strongMomentum} | " +
@@ -1076,19 +1860,43 @@ namespace MetaTrader.Services
                 // ----------------------------------------------------
 
                 if (
-                    supportAhead &&
+                    (supportAhead ||
+                     priceInsideSupportBand) &&
                     distToSupport <
                         criticalSpace
                 )
                 {
                     LogFile.Write(
                         $"[{symbol}] ⛔ HARD SR BLOCK SELL | " +
-                        $"spaceATR={distToSupport:F2} | " +
+                        $"spaceATR={(activeSupport > 0 ? distToSupport.ToString("F2") : "NO_WALL")} | " +
                         $"critical={criticalSpace:F2} | " +
                         $"support={activeSupport:F5} | " +
+                        $"zoneLow={supportZoneLow:F5} | " +
+                        $"zoneHigh={supportZoneHigh:F5} | " +
+                        $"insideBand={priceInsideSupportBand} | " +
                         $"price={currentPrice:F5} | " +
                         $"touches={supportShelf.Touches}"
                     );
+
+                    // Retain the originally blocked wall even when price is
+                    // just AHEAD of its band (not only already inside it).
+                    // The current entry stays blocked until a separate, confirmed
+                    // structural-break trigger qualifies on a later evaluation.
+                    if (IsGold(symbol) &&
+                        isImpulseEntry &&
+                        Math.Abs(momentum) >= GoldBreakArmMinMomentum &&
+                        distFromEma <= GoldBreakMaxEmaDistanceAtr &&
+                        (priceInsideSupportBand || supportAhead))
+                    {
+                        ArmGoldBreakdownWatch(
+                            symbol,
+                            TradeAction.EnterSell,
+                            activeSupport,
+                            supportZoneLow,
+                            supportZoneHigh,
+                            currentPrice
+                        );
+                    }
 
                     return true;
                 }
@@ -1103,15 +1911,18 @@ namespace MetaTrader.Services
 
                 if (
                     supportRecentlyCrossed &&
-                    !confirmedBreakout
+                    !breakoutCleared &&
+                    !isArmedBreakdownTrigger
                 )
                 {
                     LogFile.Write(
                         $"[{symbol}] ⛔ SELL BLOCKED: support only just crossed | " +
                         $"wall={activeSupport:F5} | " +
+                        $"zoneLow={supportZoneLow:F5} | " +
                         $"price={currentPrice:F5} | " +
-                        $"clearanceATR={distToSupport:F2} | " +
+                        $"clearanceBeyondBandATR={distToSupport:F2} | " +
                         $"requiredBreakATR={breakoutClearance:F2} | " +
+                        $"breakoutCleared={breakoutCleared} | " +
                         $"strongMomentum={strongMomentum}"
                     );
 
@@ -1124,7 +1935,8 @@ namespace MetaTrader.Services
                 // ----------------------------------------------------
 
                 if (
-                    supportAhead &&
+                    (supportAhead ||
+                     priceInsideSupportBand) &&
                     distToSupport <
                         minimumSpace &&
                     !confirmedBreakout
@@ -1132,10 +1944,12 @@ namespace MetaTrader.Services
                 {
                     LogFile.Write(
                         $"[{symbol}] ❌ Sell blocked: no space below | " +
-                        $"spaceATR={distToSupport:F2} | " +
+                        $"spaceATR={(activeSupport > 0 ? distToSupport.ToString("F2") : "NO_WALL")} | " +
                         $"required={minimumSpace:F2} | " +
                         $"critical={criticalSpace:F2} | " +
                         $"support={activeSupport:F5} | " +
+                        $"zoneLow={supportZoneLow:F5} | " +
+                        $"zoneHigh={supportZoneHigh:F5} | " +
                         $"price={currentPrice:F5}"
                     );
 
@@ -1150,13 +1964,13 @@ namespace MetaTrader.Services
                 if (
                     ema9 > 0 &&
                     distFromEma >
-                        maxEmaDistance
+                        effectiveMaxEmaDistance
                 )
                 {
                     LogFile.Write(
                         $"[{symbol}] ❌ Sell blocked: too far from EMA9 | " +
                         $"distATR={distFromEma:F2} | " +
-                        $"max={maxEmaDistance:F2} | " +
+                        $"max={effectiveMaxEmaDistance:F2} | " +
                         $"ema9={ema9:F5} | " +
                         $"price={currentPrice:F5}"
                     );
@@ -1167,16 +1981,18 @@ namespace MetaTrader.Services
 
                 LogFile.Write(
                     $"[{symbol}] ✅ Sell allowed | " +
-                    $"spaceATR={distToSupport:F2} | " +
+                    $"spaceATR={(activeSupport > 0 ? distToSupport.ToString("F2") : "NO_WALL")} | " +
                     $"supportAhead={supportAhead} | " +
                     $"activeSupport={activeSupport:F5} | " +
+                    $"supportZoneLow={supportZoneLow:F5} | " +
+                    $"supportZoneHigh={supportZoneHigh:F5} | " +
+                    $"insideBand={priceInsideSupportBand} | " +
                     $"recentLow={recentLow:F5} | " +
                     $"emaDist={distFromEma:F2} | " +
                     $"strongMomentum={strongMomentum} | " +
                     $"supportRecentlyCrossed={supportRecentlyCrossed} | " +
                     $"confirmedBreakout={confirmedBreakout}"
                 );
-
 
                 return false;
             }

@@ -44,7 +44,6 @@ namespace MetaTrader
                     services.AddSingleton<TradeStateStore>();
                     services.AddSingleton<TradeCoordinator>();
                     services.AddSingleton<INotificationService, NotificationService>();
-                    services.AddSingleton<ITradingPairProperties, TradingPairProperties>();
                     services.AddScoped<IMetaTraderConnectionService, MetaTraderConnectionService>();
                     services.AddSingleton<IBotBroadcaster, BotBroadcaster>();
                     services.AddHostedService<MetaTraderConnectionService>();

@@ -22,7 +22,6 @@ namespace MetaTrader.Services
     {
         private readonly ILogger<MetaTraderConnectionService> _logger;
         private readonly TradeServiceEngine _tradeService;
-        private readonly ITradingPairProperties _tradingPairProperties;
         private readonly TradeStateStore _stateStore;
         private readonly IHubContext<ChatHub> _chatHub;
 
@@ -34,13 +33,11 @@ namespace MetaTrader.Services
 
         private TcpListener _listener;
         public MetaTraderConnectionService(
-            ITradingPairProperties tradingPairProperties,
             ILogger<MetaTraderConnectionService> logger,
             TradeServiceEngine tradeService, TradeStateStore stateStore, MtApi5Client client,
             IHubContext<ChatHub> chatHub)
         {
             _client = client;
-            _tradingPairProperties = tradingPairProperties;
             _logger = logger;
             _stateStore = stateStore;
             _tradeService = tradeService;

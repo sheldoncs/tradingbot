@@ -96,8 +96,27 @@
 
             private class Profile
             {
-                // Absolute dollar loss per trade.
+                // Absolute minimum dollar loss per trade.
+                // For most asset classes this remains the actual hard-loss threshold.
                 public double HardLossUsd;
+
+                // Optional volatility-aware hard-loss floor.
+                //
+                // When > 0, the engine converts ATR * HardLossAtrFloor into USD
+                // using the symbol tick size/value and the actual trade volume.
+                //
+                // The effective hard-loss threshold becomes:
+                //
+                // max(HardLossUsd, ATR-based USD loss)
+                //
+                // and is then capped by MaxHardLossUsd when that value is > 0.
+                //
+                // This is currently enabled only for Gold.
+                public double HardLossAtrFloor;
+
+                // Optional absolute ceiling for the volatility-aware hard loss.
+                // 0 = no additional ceiling.
+                public double MaxHardLossUsd;
 
                 // Structural failure protection.
                 public double StructuralAdverseAtr;
@@ -166,6 +185,19 @@
                 public double FollowThroughEma9FailureAtr;
 
 
+                // ========================================================
+                // GOLD EARLY TRANSITION FAILURE
+                //
+                // Optional Gold-only protection for a BreakoutContinuation
+                // trade that fails very early after entry. Zero values disable
+                // the rule for all other profiles.
+                // ========================================================
+                public int GoldEarlyFailureMaxBars;
+                public double GoldEarlyFailureMaxPeakProfitUsd;
+                public double GoldEarlyFailureAdverseAtr;
+                public double GoldEarlyFailureEma9FailureAtr;
+
+
                 // Minimum SL distance from current market.
                 public double MinStopDistanceAtr;
 
@@ -179,6 +211,19 @@
                 // If false, the early dollar floor will NOT force a software close.
                 // Protection is handled by the wider broker-side stop instead.
                 public bool EnableEarlySoftwareClose = true;
+
+
+                // ========================================================
+                // GOLD EARLY WINNER SAFETY FLOOR
+                //
+                // Gold needs more breathing room than other assets, but once
+                // a trade has demonstrated meaningful profit it should not
+                // remain protected only by the original losing SL.
+                // ========================================================
+                public double GoldEarlyWinnerArmUsd;
+                public double GoldEarlyWinnerLockPercent;
+                public double GoldEarlyWinnerMinLockUsd;
+                public double GoldEarlyWinnerMaxLockUsd;
             }
 
 
@@ -302,18 +347,116 @@
 
 
                 // ========================================================
-                // 3. HARD DOLLAR LOSS
+                // GOLD $8-$9 PROOF GAP: DEMO-ONLY RETURN-TO-ENTRY EXIT
+                // ========================================================
+                // The Protected stage starts at $8, but Gold Proof V3 only
+                // arms its broker profit stop at $9. A trade peaking between
+                // $8 and $9 can otherwise reverse into the hard-loss limit.
+                // This covers ONLY that gap: do not change $9+ proof bands,
+                // $18+ runners, or the existing initial-entry risk policy.
+                // A software close is requested if profit falls to $0.50
+                // after a demonstrated $8-$9 peak; broker execution can slip.
+                // Backtest on demo before enabling in production.
+                if (IsGold(s) &&
+                    peakProfit >= 8.00 &&
+                    peakProfit < 9.00 &&
+                    currentProfit <= 0.50)
+                {
+                    string reason =
+                        $"Gold $8-$9 proof gap exit | " +
+                        $"peak={peakProfit:F2} | profit={currentProfit:F2} | " +
+                        "floor=0.50 | software close (execution may slip)";
+                    LogClose(trade, stage, reason);
+                    return RiskDecision.Close(stage, reason);
+                }
+
+                // ========================================================
+                // 3. HARD LOSS
                 //
-                // Absolute emergency loss limit.
+                // Most symbols continue to use the fixed HardLossUsd value.
+                //
+                // GOLD is allowed to breathe with H1 volatility:
+                //
+                // effective loss =
+                //     MAX(fixed dollar floor, ATR-based dollar loss)
+                //
+                // then capped by MaxHardLossUsd.
+                //
+                // Example Gold profile:
+                //
+                // HardLossUsd      = $6
+                // HardLossAtrFloor = 0.55 ATR
+                // MaxHardLossUsd   = $10
+                //
+                // If 0.55 ATR is worth $8.20 for the actual trade volume,
+                // the hard loss becomes $8.20.
+                //
+                // If 0.55 ATR is worth $13, the hard loss is capped at $10.
+                //
+                // IMPORTANT:
+                // If tick metadata is unavailable, the engine safely falls
+                // back to the original fixed HardLossUsd value.
                 // ========================================================
 
+                double effectiveHardLossUsd =
+                    profile.HardLossUsd;
+
+
+                double atrBasedHardLossUsd =
+                    0.0;
+
+
+                if (profile.HardLossAtrFloor > 0 &&
+                    tickSize > 0 &&
+                    tickValue > 0 &&
+                    trade.Volume > 0)
+                {
+                    double hardLossPriceMove =
+                        atr *
+                        profile.HardLossAtrFloor;
+
+
+                    atrBasedHardLossUsd =
+                        PriceMoveToUsd(
+                            trade,
+                            hardLossPriceMove,
+                            tickSize,
+                            tickValue
+                        );
+
+
+                    if (atrBasedHardLossUsd > 0)
+                    {
+                        effectiveHardLossUsd =
+                            Math.Max(
+                                effectiveHardLossUsd,
+                                atrBasedHardLossUsd
+                            );
+                    }
+                }
+
+
+                if (profile.MaxHardLossUsd > 0)
+                {
+                    effectiveHardLossUsd =
+                        Math.Min(
+                            effectiveHardLossUsd,
+                            profile.MaxHardLossUsd
+                        );
+                }
+
+
                 if (currentProfit <=
-                    -profile.HardLossUsd)
+                    -effectiveHardLossUsd)
                 {
                     string reason =
                         $"Hard loss limit | " +
                         $"profit={currentProfit:F2} | " +
-                        $"limit=-{profile.HardLossUsd:F2}";
+                        $"effectiveLimit=-{effectiveHardLossUsd:F2} | " +
+                        $"fixedFloor={profile.HardLossUsd:F2} | " +
+                        $"atrFloor={profile.HardLossAtrFloor:F2} | " +
+                        $"atrBasedUsd={atrBasedHardLossUsd:F2} | " +
+                        $"maxCap={profile.MaxHardLossUsd:F2}";
 
 
                     LogClose(
@@ -440,7 +583,14 @@
                     0.0;
 
 
+                // Generic fixed peak protection remains active for non-Gold assets.
+                //
+                // Gold uses the health-aware winner-management logic later in this
+                // method so that a structurally healthy H1 runner is not forced out
+                // simply because a fixed percentage-of-peak floor was touched.
                 bool peakProtectionArmed =
+                    !IsGold(s) &&
+                    !IsBnb(s) &&
                     peakProfit >=
                         profile.ProtectAtProfitUsd &&
                     (
@@ -550,6 +700,36 @@
                         : ask;
 
                 // ========================================================
+                // 5A. GOLD EARLY WINNER SAFETY FLOOR - DISABLED
+                //
+                // IMPORTANT LIVE-MARKET CORRECTION:
+                //
+                // Do NOT move Gold/XAU to a small positive stop merely because
+                // peak profit reaches approximately $5-$8.
+                //
+                // A healthy H1 Gold continuation can make an initial push,
+                // retrace deeply enough to revisit a small profit/breakeven
+                // area, and then resume the trend. The former early-winner
+                // floor could therefore stop a structurally healthy trade
+                // before continuation.
+                //
+                // Gold protection remains controlled by:
+                //
+                //   1. hard-loss protection,
+                //   2. failed-follow-through / early transition failure,
+                //   3. EMA9 / EMA21 / adverse-candle structural evidence,
+                //   4. Gold Proof V3 once the trade has genuinely proved
+                //      itself,
+                //   5. the later Gold runner/trailing stage.
+                //
+                // The profile fields are intentionally retained for source
+                // compatibility, but the Gold profile sets them to zero.
+                // There is intentionally NO automatic $5 early broker SL or
+                // software-close floor here.
+                // ========================================================
+
+
+                // ========================================================
                 // 5B. EARLY BROKER-SIDE PROFIT PROTECTION
                 //
                 // If early profit protection is armed, convert the
@@ -558,7 +738,8 @@
                 // This runs while stage is still Developing.
                 // ========================================================
 
-                if (earlyProtectionArmed &&
+                if (!IsGold(s) &&
+                    earlyProtectionArmed &&
                     earlyProtectedProfitUsd > 0 &&
                     tickSize > 0 &&
                     tickValue > 0 &&
@@ -607,10 +788,55 @@
                         );
 
 
-                    if (ShouldImproveStop(
-                            trade,
-                            validEarlySL,
-                            tickSize))
+                    // ========================================================
+                    // GOLD EARLY-PROTECTION BREAKEVEN GUARD
+                    //
+                    // Once Gold has reached the early-profit protection stage,
+                    // do NOT place a new broker-side stop on the losing side
+                    // of the entry price.
+                    //
+                    // Why:
+                    // Gold's EarlyBrokerMinDistanceAtr can force a requested
+                    // profit-lock stop farther away from market. On H1 Gold,
+                    // that can move the validated stop below entry for BUYs
+                    // or above entry for SELLs.
+                    //
+                    // In that case we simply WAIT. The trade keeps breathing
+                    // until price has moved far enough that the broker allows
+                    // a breakeven-or-better stop.
+                    //
+                    // This guard is Gold-specific. Other asset classes retain
+                    // their existing early-protection behavior.
+                    // ========================================================
+
+                    bool goldEarlyStopWouldLockLoss =
+                        IsGold(s) &&
+                        (
+                            (trade.Side == TradeSide.Buy &&
+                             validEarlySL < trade.EntryPrice)
+                            ||
+                            (trade.Side == TradeSide.Sell &&
+                             validEarlySL > trade.EntryPrice)
+                        );
+
+
+                    if (goldEarlyStopWouldLockLoss)
+                    {
+                        LogFile.Write(
+                            $"[{trade.Symbol}] 🟡 GOLD EARLY SL DEFERRED | " +
+                            $"side={trade.Side} | " +
+                            $"entry={trade.EntryPrice:F5} | " +
+                            $"candidateSL={validEarlySL:F5} | " +
+                            $"peak={peakProfit:F2} | " +
+                            $"profit={currentProfit:F2} | " +
+                            $"reason=validated early SL would still lock a loss; " +
+                            $"waiting for breakeven-or-better broker stop"
+                        );
+                    }
+                    else if (ShouldImproveStop(
+                                 trade,
+                                 validEarlySL,
+                                 tickSize))
                     {
                         string reason =
                             $"Early profit lock | " +
@@ -788,6 +1014,100 @@
 
 
                 // ========================================================
+                // 10B. GOLD TRADE-HEALTH CLASSIFICATION
+                //
+                // The Gold winner manager is deliberately structure-aware.
+                //
+                // HEALTHY:
+                // - executable price remains on the correct side of EMA9
+                // - price remains on the correct side of EMA21
+                // - EMA9 slope still agrees with the trade
+                // - no strong opposite candle evidence is present
+                //
+                // WEAKENING:
+                // - EMA9 alignment/slope deteriorates OR
+                // - strong opposite candle evidence appears
+                //
+                // A decisive EMA21/structural failure is still handled by the
+                // existing structural-failure logic below.
+                // ========================================================
+
+                bool isGold =
+                    IsGold(s);
+
+
+                double previousEma9 =
+                    emaFast.Length >= 2
+                        ? emaFast[^2]
+                        : ema9;
+
+
+                bool ema9SlopeAligned =
+                    trade.Side == TradeSide.Buy
+                        ? ema9 >= previousEma9
+                        : ema9 <= previousEma9;
+
+
+                bool priceOnCorrectSideOfEma9 =
+                    trade.Side == TradeSide.Buy
+                        ? currentPrice >= ema9
+                        : currentPrice <= ema9;
+
+
+                bool priceOnCorrectSideOfEma21 =
+                    trade.Side == TradeSide.Buy
+                        ? currentPrice >= ema21
+                        : currentPrice <= ema21;
+
+
+                bool goldHealthyRunner =
+                    isGold &&
+                    priceOnCorrectSideOfEma9 &&
+                    priceOnCorrectSideOfEma21 &&
+                    ema9SlopeAligned &&
+                    !adverseCandleEvidence;
+
+
+                bool goldWeakeningRunner =
+                    isGold &&
+                    !goldHealthyRunner &&
+                    (
+                        !priceOnCorrectSideOfEma9 ||
+                        !ema9SlopeAligned ||
+                        adverseCandleEvidence
+                    );
+
+
+                // ========================================================
+                // BNB TRADE-HEALTH CLASSIFICATION
+                //
+                // BNB uses the same structural definition of "healthy" as
+                // Gold, but with BNB-specific proof / runner thresholds.
+                // ========================================================
+
+                bool isBnb =
+                    IsBnb(s);
+
+
+                bool bnbHealthyRunner =
+                    isBnb &&
+                    priceOnCorrectSideOfEma9 &&
+                    priceOnCorrectSideOfEma21 &&
+                    ema9SlopeAligned &&
+                    !adverseCandleEvidence;
+
+
+                bool bnbWeakeningRunner =
+                    isBnb &&
+                    !bnbHealthyRunner &&
+                    (
+                        !priceOnCorrectSideOfEma9 ||
+                        !ema9SlopeAligned ||
+                        adverseCandleEvidence
+                    );
+
+
+                // ========================================================
                 // 11. FAILED FOLLOW-THROUGH PROTECTION
                 //
                 // Continuation trades should make progress reasonably
@@ -902,6 +1222,128 @@
                         stage,
                         reason
                     );
+                }
+
+
+                // ========================================================
+                // 11A. GOLD EARLY TRANSITION FAILURE
+                //
+                // The Jan -> Sep Gold replay showed that some losing Gold
+                // transition/continuation entries reveal failure early:
+                //
+                // - they never develop meaningful peak profit,
+                // - they move materially adverse,
+                // - executable price fails EMA9, and
+                // - an opposite-direction candle is already visible.
+                //
+                // IMPORTANT:
+                // The impulse/transition entry path currently reaches the trade
+                // tracker as BreakoutContinuation, so this rule is deliberately
+                // limited to that model, Gold, and the first two H1 bars.
+                // It does NOT tighten Gold entries and does NOT alter mature
+                // winner/runner management.
+                // ========================================================
+
+                bool goldEarlyFailureEnabled =
+                    isGold &&
+                    profile.GoldEarlyFailureMaxBars > 0 &&
+                    profile.GoldEarlyFailureMaxPeakProfitUsd > 0 &&
+                    profile.GoldEarlyFailureAdverseAtr > 0 &&
+                    profile.GoldEarlyFailureEma9FailureAtr > 0;
+
+
+                bool goldTransitionLikeModel =
+                    trade.Model ==
+                        EntryModel.BreakoutContinuation;
+
+
+                bool goldEarlyTransitionFailure =
+                    goldEarlyFailureEnabled &&
+                    goldTransitionLikeModel &&
+                    trade.CandlesSinceEntry <=
+                        profile.GoldEarlyFailureMaxBars &&
+                    peakProfit <
+                        profile.GoldEarlyFailureMaxPeakProfitUsd &&
+                    adverseAtr >=
+                        profile.GoldEarlyFailureAdverseAtr &&
+                    ema9FailureAtr >=
+                        profile.GoldEarlyFailureEma9FailureAtr &&
+                    adverseCandleEvidence;
+
+
+                if (goldEarlyTransitionFailure)
+                {
+                    string reason =
+                        $"Gold early transition failure | " +
+                        $"bars={trade.CandlesSinceEntry}/" +
+                        $"{profile.GoldEarlyFailureMaxBars} | " +
+                        $"peak=${peakProfit:F2}/" +
+                        $"${profile.GoldEarlyFailureMaxPeakProfitUsd:F2} | " +
+                        $"adverseATR={adverseAtr:F2}/" +
+                        $"{profile.GoldEarlyFailureAdverseAtr:F2} | " +
+                        $"ema9FailureATR={ema9FailureAtr:F2}/" +
+                        $"{profile.GoldEarlyFailureEma9FailureAtr:F2} | " +
+                        $"oppositeEvidence={adverseCandleEvidence}";
+
+
+                    LogClose(
+                        trade,
+                        stage,
+                        reason
+                    );
+
+
+                    return RiskDecision.Close(
+                        stage,
+                        reason
+                    );
+                }
+
+
+                // ========================================================
+                // 11A2. GOLD FAST FAILURE - UNRESTRICTED S/R DEMO STUDY
+                // ========================================================
+                // A GOLD BreakoutContinuation entry with little/no favorable
+                // progress may fail promptly when S/R is observation-only.
+                // Do not wait for the existing 0.35 ATR early transition rule
+                // if all independent failure evidence is already present.
+                //
+                // Scope is intentionally narrow:
+                // - GOLD only; BreakoutContinuation only
+                // - first H1 entry bar (CandlesSinceEntry 0 or 1)
+                // - peak profit under $3 and trade currently losing
+                // - adverse excursion at least 0.25 ATR
+                // - executable price beyond EMA9 against the trade by 0.12 ATR
+                // - strong opposite candle (closed or live)
+                //
+                // Existing hard loss, normal exits and winner management
+                // are unchanged. This does not depend on new TrackedTrade
+                // properties or change the public Evaluate signature.
+                // ========================================================
+
+                bool goldFastFailure =
+                    isGold &&
+                    goldTransitionLikeModel &&
+                    trade.CandlesSinceEntry <= 1 &&
+                    peakProfit < 3.00 &&
+                    currentProfit < 0.0 &&
+                    adverseAtr >= 0.25 &&
+                    ema9FailureAtr >= 0.12 &&
+                    adverseCandleEvidence;
+
+                if (goldFastFailure)
+                {
+                    string reason =
+                        $"Gold fast failure (S/R observation study) | " +
+                        $"bars={trade.CandlesSinceEntry} | " +
+                        $"peak=${peakProfit:F2}/$3.00 | " +
+                        $"profit=${currentProfit:F2} | " +
+                        $"adverseATR={adverseAtr:F2}/0.25 | " +
+                        $"ema9FailureATR={ema9FailureAtr:F2}/0.12 | " +
+                        $"oppositeCandle={adverseCandleEvidence}";
+
+                    LogClose(trade, stage, reason);
+                    return RiskDecision.Close(stage, reason);
                 }
 
 
@@ -1142,15 +1584,513 @@
                 // ========================================================
                 // 16. PROTECTED STAGE
                 //
-                // Dollar peak protection is ALREADY ACTIVE above.
+                // GOLD:
+                // Winner management is health-aware.
                 //
-                // This section creates a broker-side profit stop as an
-                // additional protection layer.
+                // Healthy Gold trade:
+                // - NO broker-side profit stop in the $8-$18 proof stage
+                // - allow normal H1 Gold pullbacks
+                //
+                // Weakening Gold trade:
+                // - existing structural / EMA failure logic remains active
+                // - after a $12+ peak, a deterioration back to roughly
+                //   breakeven can close the trade before it becomes a hard loss
+                //
+                // Other assets:
+                // - retain the original fixed protection behaviour.
                 // ========================================================
 
                 if (stage ==
                     RiskStage.Protected)
                 {
+                    // ====================================================
+                    // GOLD HEALTH-AWARE PROTECTED STAGE
+                    // ====================================================
+
+                    if (isGold)
+                    {
+                        // ====================================================
+                        // GOLD PROOF STAGE V3
+                        //
+                        // GOAL:
+                        // Keep Gold's H1 breathing room, but never allow a
+                        // meaningful winner to remain protected only by the
+                        // original losing SL.
+                        //
+                        // Behaviour:
+                        //
+                        // 1. Peak < $9
+                        //      No broker profit stop is forced here.
+                        //
+                        // 2. Peak >= $9
+                        //      Arm a meaningful stepped broker-side floor.
+                        //      Healthy trades move through $3 / $5 / $7.50
+                        //      proof bands rather than micro-ratcheting.
+                        //
+                        // 3. Weakening trades
+                        //      Protect a little more aggressively.
+                        //
+                        // 4. Peak >= $12 and weakening back to approximately
+                        //      breakeven
+                        //      Keep the existing proof-stage failure exit.
+                        //
+                        // 5. The $18+ runner stage below still owns the wider
+                        //      ATR trail and large-winner logic.
+                        //
+                        // This fixes the live failure observed on ticket
+                        // 109375398, where Gold reached > $11 peak profit while
+                        // the broker SL remained at the original losing level.
+                        // ====================================================
+
+                        const double proofBrokerProtectionArmUsd =
+                            9.00;
+
+                        // ----------------------------------------------------
+                        // GOLD PROOF-STAGE STEP FLOORS
+                        //
+                        // Do not micro-ratchet the broker SL on every few cents
+                        // of new peak profit.  Healthy Gold now advances through
+                        // meaningful proof bands:
+                        //
+                        //   $9.00  - $11.99 peak -> protect $3.00
+                        //   $12.00 - $14.99 peak -> protect $5.00
+                        //   $15.00 - $17.99 peak -> protect $7.50
+                        //
+                        // At $18 the existing Gold runner stage takes over.
+                        //
+                        // This directly corrects the live XAUEUR case where a
+                        // $13.58 peak protected only about $2.04.
+                        // ----------------------------------------------------
+                        const double proofBand1PeakUsd =
+                            9.00;
+
+                        const double proofBand1LockUsd =
+                            3.00;
+
+                        const double proofBand2PeakUsd =
+                            12.00;
+
+                        const double proofBand2LockUsd =
+                            5.00;
+
+                        const double proofBand3PeakUsd =
+                            15.00;
+
+                        const double proofBand3LockUsd =
+                            7.50;
+
+                        // If Gold is weakening during the proof stage, protect
+                        // at least half of the demonstrated peak, while the
+                        // healthy runner continues to use the stepped floors.
+                        const double proofWeakeningLockPercent =
+                            0.60;
+
+                        // ----------------------------------------------------
+                        // GOLD MID-WINNER CAPTURE CORRECTION
+                        //
+                        // The latest Gold continuation reached +$13.62 MFE but
+                        // the fixed $5 proof-band floor allowed the realized
+                        // result to fall back to about +$5.02.
+                        //
+                        // Keep the $9-$11.99 band unchanged for breathing room.
+                        // Once peak >= $12, a healthy Gold winner has proved
+                        // enough continuation to protect at least 50% of peak.
+                        // If structure is weakening, protect at least 60%.
+                        //
+                        // This is deliberately below the later $18 runner stage
+                        // and does not alter entry logic or hard-loss behavior.
+                        // ----------------------------------------------------
+                        const double proofHealthyMidWinnerLockPercent =
+                            0.50;
+
+                        const double proofWeakeningMidWinnerLockPercent =
+                            0.60;
+
+                        const double proofFailureArmUsd =
+                            12.00;
+
+                        const double proofFailureFloorUsd =
+                            0.50;
+
+
+                        bool proofBrokerProtectionArmed =
+                            peakProfit >=
+                            proofBrokerProtectionArmUsd;
+
+
+                        bool proofFailureProtectionArmed =
+                            peakProfit >=
+                            proofFailureArmUsd;
+
+
+                        bool proofStageFailedBackToBreakeven =
+                            proofFailureProtectionArmed &&
+                            goldWeakeningRunner &&
+                            currentProfit <=
+                                proofFailureFloorUsd;
+
+
+                        if (proofStageFailedBackToBreakeven)
+                        {
+                            string reason =
+                                $"Gold proof-stage failure exit | " +
+                                $"peak={peakProfit:F2} | " +
+                                $"profit={currentProfit:F2} | " +
+                                $"arm={proofFailureArmUsd:F2} | " +
+                                $"floor={proofFailureFloorUsd:F2} | " +
+                                $"healthy={goldHealthyRunner} | " +
+                                $"weakening={goldWeakeningRunner} | " +
+                                $"ema9Aligned={priceOnCorrectSideOfEma9} | " +
+                                $"ema9SlopeAligned={ema9SlopeAligned} | " +
+                                $"oppositeEvidence={adverseCandleEvidence}";
+
+
+                            LogClose(
+                                trade,
+                                stage,
+                                reason
+                            );
+
+
+                            return RiskDecision.Close(
+                                stage,
+                                reason
+                            );
+                        }
+
+
+                        // ----------------------------------------------------
+                        // POSITIVE BROKER-SIDE FLOOR AFTER GOLD HAS PROVED ITSELF
+                        // ----------------------------------------------------
+
+                        if (proofBrokerProtectionArmed &&
+                            tickSize > 0 &&
+                            tickValue > 0 &&
+                            trade.Volume > 0)
+                        {
+                            // Healthy Gold uses discrete proof bands rather
+                            // than a continuously changing percentage.  This
+                            // prevents broker-stop micro-ratcheting while still
+                            // banking meaningful profit once the trade proves
+                            // itself.
+                            double goldProofLockUsd =
+                                proofBand1LockUsd;
+
+
+                            if (peakProfit >= proofBand3PeakUsd)
+                            {
+                                goldProofLockUsd =
+                                    proofBand3LockUsd;
+                            }
+                            else if (peakProfit >= proofBand2PeakUsd)
+                            {
+                                goldProofLockUsd =
+                                    proofBand2LockUsd;
+                            }
+                            else if (peakProfit >= proofBand1PeakUsd)
+                            {
+                                goldProofLockUsd =
+                                    proofBand1LockUsd;
+                            }
+
+
+                            // ====================================================
+                            // ADAPTIVE MID-WINNER CAPTURE
+                            //
+                            // Peak $9-$11.99:
+                            //   retain the original fixed $3 proof floor.
+                            //
+                            // Peak $12-$17.99 and HEALTHY:
+                            //   protect the stronger of the proof band or 50% peak.
+                            //
+                            // Peak $12-$17.99 and WEAKENING:
+                            //   protect the stronger of the proof band or 60% peak.
+                            //
+                            // This prevents a proven $12-$18 Gold winner from
+                            // surrendering most of its MFE while still leaving
+                            // substantially more breathing room than a tight trail.
+                            // ====================================================
+                            if (peakProfit >= proofBand2PeakUsd)
+                            {
+                                double midWinnerLockPercent =
+                                    goldWeakeningRunner
+                                        ? proofWeakeningMidWinnerLockPercent
+                                        : proofHealthyMidWinnerLockPercent;
+
+                                goldProofLockUsd =
+                                    Math.Max(
+                                        goldProofLockUsd,
+                                        peakProfit *
+                                        midWinnerLockPercent
+                                    );
+                            }
+
+                            // Weakening Gold below the $12 mid-winner threshold
+                            // still retains the existing health-aware protection.
+                            if (goldWeakeningRunner)
+                            {
+                                goldProofLockUsd =
+                                    Math.Max(
+                                        goldProofLockUsd,
+                                        peakProfit *
+                                        proofWeakeningLockPercent
+                                    );
+                            }
+
+
+                            double goldProofDollarSL =
+                                ProfitUsdToStopPrice(
+                                    trade,
+                                    goldProofLockUsd,
+                                    tickSize,
+                                    tickValue
+                                );
+
+
+                            double validGoldProofSL =
+                                ValidateStopLoss(
+                                    trade,
+                                    goldProofDollarSL,
+                                    bid,
+                                    ask,
+                                    minimumStopDistance
+                                );
+
+
+                            validGoldProofSL =
+                                NormalizeStopLossToTick(
+                                    trade,
+                                    validGoldProofSL,
+                                    tickSize
+                                );
+
+
+                            bool goldProofStopWouldLockLoss =
+                                (trade.Side == TradeSide.Buy &&
+                                 validGoldProofSL <= trade.EntryPrice)
+                                ||
+                                (trade.Side == TradeSide.Sell &&
+                                 validGoldProofSL >= trade.EntryPrice);
+
+
+                            if (!goldProofStopWouldLockLoss &&
+                                ShouldImproveStop(
+                                    trade,
+                                    validGoldProofSL,
+                                    tickSize))
+                            {
+                                string reason =
+                                    $"Gold proof-stage positive SL | " +
+                                    $"peak={peakProfit:F2} | " +
+                                    $"profit={currentProfit:F2} | " +
+                                    $"healthy={goldHealthyRunner} | " +
+                                    $"weakening={goldWeakeningRunner} | " +
+                                    $"lockUsd={goldProofLockUsd:F2} | " +
+                                    $"midWinner={(peakProfit >= proofBand2PeakUsd)} | " +
+                                    $"rawDollarSL={goldProofDollarSL:F5} | " +
+                                    $"validatedSL={validGoldProofSL:F5} | " +
+                                    $"arm={proofBrokerProtectionArmUsd:F2}";
+
+
+                                LogMoveSL(
+                                    trade,
+                                    stage,
+                                    validGoldProofSL,
+                                    reason
+                                );
+
+
+                                return RiskDecision.MoveSL(
+                                    stage,
+                                    validGoldProofSL,
+                                    reason
+                                );
+                            }
+
+
+                            if (goldProofStopWouldLockLoss)
+                            {
+                                LogFile.Write(
+                                    $"[{trade.Symbol}] 🟡 GOLD PROOF SL DEFERRED | " +
+                                    $"side={trade.Side} | " +
+                                    $"entry={trade.EntryPrice:F5} | " +
+                                    $"candidateSL={validGoldProofSL:F5} | " +
+                                    $"peak={peakProfit:F2} | " +
+                                    $"profit={currentProfit:F2} | " +
+                                    $"lockUsd={goldProofLockUsd:F2} | " +
+                                    $"reason=broker minimum distance would place stop " +
+                                    $"at breakeven-or-worse"
+                                );
+                            }
+                        }
+
+
+                        LogHold(
+                            trade,
+                            stage,
+                            currentPrice,
+                            atr,
+                            adverseAtr,
+                            ema21FailureAtr,
+                            closedBodyRatio,
+                            liveBodyRatio,
+                            closedOppositeStrongCandle,
+                            liveOppositeStrongCandle,
+                            peakProfit,
+                            giveback,
+                            proofBrokerProtectionArmed
+                                ? goldHealthyRunner
+                                    ? "Gold proof stage V3 - healthy, positive broker floor armed"
+                                    : "Gold proof stage V3 - weakening, stronger positive broker floor armed"
+                                : goldHealthyRunner
+                                    ? "Gold proof stage V3 - healthy, waiting for $9 proof"
+                                    : "Gold proof stage V3 - weakening, structure logic remains in control"
+                        );
+
+
+                        return RiskDecision.Hold(
+                            stage,
+                            proofBrokerProtectionArmed
+                                ? goldHealthyRunner
+                                    ? "Gold healthy proof stage V3 - positive floor armed"
+                                    : "Gold weakening proof stage V3 - positive floor armed"
+                                : goldHealthyRunner
+                                    ? "Gold healthy proof stage V3"
+                                    : "Gold weakening proof stage V3"
+                        );
+                    }
+
+
+                    // ====================================================
+                    // BNB PROTECTED STAGE
+                    //
+                    // Data from Aug 3 -> Sep 18 showed that BNB still benefits
+                    // from early profit protection, unlike Gold, but a 35% lock
+                    // was too aggressive.  Once the trade reaches the $7
+                    // protected stage, use only a small positive structural stop
+                    // while it remains healthy.  If it weakens, tighten modestly.
+                    // ====================================================
+
+                    if (isBnb)
+                    {
+                        double bnbBaseLockAtr =
+                            0.03;
+
+
+                        double bnbProposedSL =
+                            trade.Side == TradeSide.Buy
+                                ? trade.EntryPrice +
+                                  atr *
+                                  bnbBaseLockAtr
+                                : trade.EntryPrice -
+                                  atr *
+                                  bnbBaseLockAtr;
+
+
+                        if (bnbWeakeningRunner)
+                        {
+                            double bnbWeakeningDistance =
+                                atr *
+                                0.40;
+
+
+                            double bnbWeakeningSL =
+                                trade.Side == TradeSide.Buy
+                                    ? currentPrice -
+                                      bnbWeakeningDistance
+                                    : currentPrice +
+                                      bnbWeakeningDistance;
+
+
+                            if (trade.Side == TradeSide.Buy)
+                            {
+                                bnbProposedSL =
+                                    Math.Max(
+                                        bnbProposedSL,
+                                        bnbWeakeningSL
+                                    );
+                            }
+                            else
+                            {
+                                bnbProposedSL =
+                                    Math.Min(
+                                        bnbProposedSL,
+                                        bnbWeakeningSL
+                                    );
+                            }
+                        }
+
+
+                        double validBnbSL =
+                            ValidateStopLoss(
+                                trade,
+                                bnbProposedSL,
+                                bid,
+                                ask,
+                                minimumStopDistance
+                            );
+
+
+                        validBnbSL =
+                            NormalizeStopLossToTick(
+                                trade,
+                                validBnbSL,
+                                tickSize
+                            );
+
+
+                        bool bnbStopWouldLockLoss =
+                            (trade.Side == TradeSide.Buy &&
+                             validBnbSL < trade.EntryPrice)
+                            ||
+                            (trade.Side == TradeSide.Sell &&
+                             validBnbSL > trade.EntryPrice);
+
+
+                        if (!bnbStopWouldLockLoss &&
+                            ShouldImproveStop(
+                                trade,
+                                validBnbSL,
+                                tickSize))
+                        {
+                            string reason =
+                                $"BNB protected-stage SL | " +
+                                $"peak={peakProfit:F2} | " +
+                                $"profit={currentProfit:F2} | " +
+                                $"healthy={bnbHealthyRunner} | " +
+                                $"weakening={bnbWeakeningRunner} | " +
+                                $"newSL={validBnbSL:F5}";
+
+
+                            LogMoveSL(
+                                trade,
+                                stage,
+                                validBnbSL,
+                                reason
+                            );
+
+
+                            return RiskDecision.MoveSL(
+                                stage,
+                                validBnbSL,
+                                reason
+                            );
+                        }
+
+
+                        return RiskDecision.Hold(
+                            stage,
+                            bnbHealthyRunner
+                                ? "BNB healthy protected stage"
+                                : "BNB weakening protected stage"
+                        );
+                    }
+
+
+                    // ====================================================
+                    // ORIGINAL NON-GOLD PROTECTED STAGE
+                    // ====================================================
+
                     double lockDistance =
                         atr *
                         profile.ProfitLockAtr;
@@ -1165,16 +2105,6 @@
                             : trade.EntryPrice -
                               lockDistance;
 
-
-                    // ====================================================
-                    // If dollar protection is available, convert the
-                    // protected dollar floor into a real SL price too.
-                    //
-                    // This gives Protected stage BOTH:
-                    //
-                    // 1. Software close protection
-                    // 2. Broker-side dollar floor where possible
-                    // ====================================================
 
                     bool canCalculateDollarSL =
                         peakProtectionArmed &&
@@ -1216,18 +2146,6 @@
                                     dollarProfitFloorSL
                                 );
                         }
-
-
-                        LogFile.Write(
-                            $"[{trade.Symbol}] 💵 Protected dollar SL | " +
-                            $"ticket={trade.Ticket} | " +
-                            $"peak={peakProfit:F2} | " +
-                            $"protectedUsd={protectedProfitUsd:F2} | " +
-                            $"volume={trade.Volume:F2} | " +
-                            $"tickSize={tickSize:F8} | " +
-                            $"tickValue={tickValue:F5} | " +
-                            $"rawDollarSL={dollarProfitFloorSL:F5}"
-                        );
                     }
 
 
@@ -1240,18 +2158,6 @@
                             minimumStopDistance
                         );
 
-
-                    // ====================================================
-                    // NORMALIZE TO REAL BROKER TICK
-                    //
-                    // BUY:
-                    // round DOWN so SL cannot accidentally become too
-                    // close to BID.
-                    //
-                    // SELL:
-                    // round UP so SL cannot accidentally become too
-                    // close to ASK.
-                    // ====================================================
 
                     validSL =
                         NormalizeStopLossToTick(
@@ -1292,25 +2198,6 @@
                     }
 
 
-                    LogHold(
-                        trade,
-                        stage,
-                        currentPrice,
-                        atr,
-                        adverseAtr,
-                        ema21FailureAtr,
-                        closedBodyRatio,
-                        liveBodyRatio,
-                        closedOppositeStrongCandle,
-                        liveOppositeStrongCandle,
-                        peakProfit,
-                        giveback,
-                        peakProtectionArmed
-                            ? $"Protected - dollar floor=${protectedProfitUsd:F2}"
-                            : "Protected - existing SL sufficient"
-                    );
-
-
                     return RiskDecision.Hold(
                         stage,
                         "Protected"
@@ -1321,17 +2208,508 @@
                 // ========================================================
                 // 17. TRAILING STAGE
                 //
-                // At this stage:
+                // GOLD HEALTH-AWARE RUNNER:
                 //
-                // 1. Dollar peak protection is already active.
-                // 2. ATR runner trailing now becomes active too.
+                // Healthy:
+                // - wide 0.90 ATR trail
+                // - no fixed 60%-of-peak floor
+                // - minimum small positive floor only
+                //
+                // Weakening:
+                // - tighten to 0.45 ATR
+                // - protect the stronger of:
+                //      60% of peak
+                //      peak - $7
+                //
+                // This allows strong moves to breathe while still defending
+                // accumulated profit when structure deteriorates.
                 // ========================================================
 
                 if (stage ==
                     RiskStage.Trailing)
                 {
+                    if (isGold)
+                    {
+                        // ====================================================
+                        // GOLD RUNNER STAGE
+                        //
+                        // Runner begins only after the trade has demonstrated
+                        // meaningful continuation.
+                        //
+                        // Healthy runner:
+                        //   - wide 0.90 ATR trail
+                        //
+                        // Weakening runner:
+                        //   - tighten to 0.45 ATR
+                        //
+                        // LARGE WINNER:
+                        // Once peak >= $29, protect meaningful profit:
+                        //
+                        //   floor = max($20, peak - $10)
+                        //
+                        // Examples:
+                        //   peak $29 -> floor $20
+                        //   peak $40 -> floor $30
+                        //   peak $60 -> floor $50
+                        //
+                        // This deliberately avoids choking the move before the
+                        // trade has demonstrated true runner behaviour.
+                        // ====================================================
+
+                        double goldTrailAtr =
+                            goldHealthyRunner
+                                ? 0.90
+                                : 0.45;
+
+
+                        double goldTrailingDistance =
+                            atr *
+                            goldTrailAtr;
+
+
+                        double goldTrailingSL =
+                            trade.Side == TradeSide.Buy
+                                ? currentPrice -
+                                  goldTrailingDistance
+                                : currentPrice +
+                                  goldTrailingDistance;
+
+
+                        // Mature runner should never be intentionally protected
+                        // on the losing side of entry.
+                        double breakevenPlusSL =
+                            trade.Side == TradeSide.Buy
+                                ? trade.EntryPrice +
+                                  atr *
+                                  0.03
+                                : trade.EntryPrice -
+                                  atr *
+                                  0.03;
+
+
+                        double goldProposedSL =
+                            trade.Side == TradeSide.Buy
+                                ? Math.Max(
+                                    goldTrailingSL,
+                                    breakevenPlusSL
+                                  )
+                                : Math.Min(
+                                    goldTrailingSL,
+                                    breakevenPlusSL
+                                  );
+
+
+                        // ====================================================
+                        // LARGE-WINNER PROFIT FLOOR
+                        // ====================================================
+
+                        const double largeWinnerTriggerUsd =
+                            29.00;
+
+
+                        const double largeWinnerMinimumFloorUsd =
+                            20.00;
+
+
+                        const double largeWinnerMaxGivebackUsd =
+                            10.00;
+
+
+                        bool largeWinnerArmed =
+                            peakProfit >=
+                            largeWinnerTriggerUsd;
+
+
+                        double largeWinnerFloorUsd =
+                            0.0;
+
+
+                        if (largeWinnerArmed)
+                        {
+                            largeWinnerFloorUsd =
+                                Math.Max(
+                                    largeWinnerMinimumFloorUsd,
+                                    peakProfit -
+                                    largeWinnerMaxGivebackUsd
+                                );
+
+
+                            // Software emergency protection in case price gaps
+                            // through a requested broker stop.
+                            if (currentProfit <=
+                                largeWinnerFloorUsd)
+                            {
+                                string reason =
+                                    $"Gold large-winner protection | " +
+                                    $"peak={peakProfit:F2} | " +
+                                    $"profit={currentProfit:F2} | " +
+                                    $"floor={largeWinnerFloorUsd:F2} | " +
+                                    $"trigger={largeWinnerTriggerUsd:F2} | " +
+                                    $"maxGiveback={largeWinnerMaxGivebackUsd:F2}";
+
+
+                                LogClose(
+                                    trade,
+                                    stage,
+                                    reason
+                                );
+
+
+                                return RiskDecision.Close(
+                                    stage,
+                                    reason
+                                );
+                            }
+
+
+                            if (tickSize > 0 &&
+                                tickValue > 0 &&
+                                trade.Volume > 0)
+                            {
+                                double largeWinnerDollarSL =
+                                    ProfitUsdToStopPrice(
+                                        trade,
+                                        largeWinnerFloorUsd,
+                                        tickSize,
+                                        tickValue
+                                    );
+
+
+                                if (trade.Side == TradeSide.Buy)
+                                {
+                                    goldProposedSL =
+                                        Math.Max(
+                                            goldProposedSL,
+                                            largeWinnerDollarSL
+                                        );
+                                }
+                                else
+                                {
+                                    goldProposedSL =
+                                        Math.Min(
+                                            goldProposedSL,
+                                            largeWinnerDollarSL
+                                        );
+                                }
+                            }
+                        }
+
+
+                        double validGoldSL =
+                            ValidateStopLoss(
+                                trade,
+                                goldProposedSL,
+                                bid,
+                                ask,
+                                minimumStopDistance
+                            );
+
+
+                        validGoldSL =
+                            NormalizeStopLossToTick(
+                                trade,
+                                validGoldSL,
+                                tickSize
+                            );
+
+
+                        bool goldStopWouldLockLoss =
+                            (trade.Side == TradeSide.Buy &&
+                             validGoldSL < trade.EntryPrice)
+                            ||
+                            (trade.Side == TradeSide.Sell &&
+                             validGoldSL > trade.EntryPrice);
+
+
+                        if (!goldStopWouldLockLoss &&
+                            ShouldImproveStop(
+                                trade,
+                                validGoldSL,
+                                tickSize))
+                        {
+                            string reason =
+                                $"Gold proof-runner trail | " +
+                                $"peak={peakProfit:F2} | " +
+                                $"profit={currentProfit:F2} | " +
+                                $"healthy={goldHealthyRunner} | " +
+                                $"weakening={goldWeakeningRunner} | " +
+                                $"trailATR={goldTrailAtr:F2} | " +
+                                $"largeWinner={largeWinnerArmed} | " +
+                                $"largeFloor={largeWinnerFloorUsd:F2} | " +
+                                $"newSL={validGoldSL:F5}";
+
+
+                            LogMoveSL(
+                                trade,
+                                stage,
+                                validGoldSL,
+                                reason
+                            );
+
+
+                            return RiskDecision.MoveSL(
+                                stage,
+                                validGoldSL,
+                                reason
+                            );
+                        }
+
+
+                        LogHold(
+                            trade,
+                            stage,
+                            currentPrice,
+                            atr,
+                            adverseAtr,
+                            ema21FailureAtr,
+                            closedBodyRatio,
+                            liveBodyRatio,
+                            closedOppositeStrongCandle,
+                            liveOppositeStrongCandle,
+                            peakProfit,
+                            giveback,
+                            largeWinnerArmed
+                                ? $"Gold runner - large winner floor=${largeWinnerFloorUsd:F2}"
+                                : goldHealthyRunner
+                                    ? "Gold runner healthy - wide 0.90 ATR trail"
+                                    : "Gold runner weakening - 0.45 ATR trail"
+                        );
+
+
+                        return RiskDecision.Hold(
+                            stage,
+                            largeWinnerArmed
+                                ? "Gold large winner"
+                                : goldHealthyRunner
+                                    ? "Gold healthy runner"
+                                    : "Gold weakening runner"
+                        );
+                    }
+
+
                     // ====================================================
-                    // 17A. ATR RUNNER TRAILING STOP
+                    // BNB HEALTH-AWARE RUNNER
+                    //
+                    // Runner begins at $12 peak profit.
+                    //
+                    // Healthy BNB runner:
+                    //   - 0.90 ATR trail
+                    //
+                    // Weakening BNB runner:
+                    //   - 0.50 ATR trail
+                    //
+                    // Large BNB winner:
+                    //   - arm at $15 peak
+                    //   - protect max($9, peak - $6)
+                    //
+                    // This preserves more of BNB's occasional large trend moves
+                    // without changing the $6 hard-loss ceiling.
+                    // ====================================================
+
+                    if (isBnb)
+                    {
+                        double bnbTrailAtr =
+                            bnbHealthyRunner
+                                ? 0.90
+                                : 0.50;
+
+
+                        double bnbTrailingDistance =
+                            atr *
+                            bnbTrailAtr;
+
+
+                        double bnbTrailingSL =
+                            trade.Side == TradeSide.Buy
+                                ? currentPrice -
+                                  bnbTrailingDistance
+                                : currentPrice +
+                                  bnbTrailingDistance;
+
+
+                        double bnbBreakevenPlusSL =
+                            trade.Side == TradeSide.Buy
+                                ? trade.EntryPrice +
+                                  atr *
+                                  0.03
+                                : trade.EntryPrice -
+                                  atr *
+                                  0.03;
+
+
+                        double bnbProposedSL =
+                            trade.Side == TradeSide.Buy
+                                ? Math.Max(
+                                    bnbTrailingSL,
+                                    bnbBreakevenPlusSL
+                                  )
+                                : Math.Min(
+                                    bnbTrailingSL,
+                                    bnbBreakevenPlusSL
+                                  );
+
+
+                        const double bnbLargeWinnerTriggerUsd =
+                            15.00;
+
+
+                        const double bnbLargeWinnerMinimumFloorUsd =
+                            9.00;
+
+
+                        const double bnbLargeWinnerMaxGivebackUsd =
+                            6.00;
+
+
+                        bool bnbLargeWinnerArmed =
+                            peakProfit >=
+                            bnbLargeWinnerTriggerUsd;
+
+
+                        double bnbLargeWinnerFloorUsd =
+                            0.0;
+
+
+                        if (bnbLargeWinnerArmed)
+                        {
+                            bnbLargeWinnerFloorUsd =
+                                Math.Max(
+                                    bnbLargeWinnerMinimumFloorUsd,
+                                    peakProfit -
+                                    bnbLargeWinnerMaxGivebackUsd
+                                );
+
+
+                            if (currentProfit <=
+                                bnbLargeWinnerFloorUsd)
+                            {
+                                string reason =
+                                    $"BNB large-winner protection | " +
+                                    $"peak={peakProfit:F2} | " +
+                                    $"profit={currentProfit:F2} | " +
+                                    $"floor={bnbLargeWinnerFloorUsd:F2}";
+
+
+                                LogClose(
+                                    trade,
+                                    stage,
+                                    reason
+                                );
+
+
+                                return RiskDecision.Close(
+                                    stage,
+                                    reason
+                                );
+                            }
+
+
+                            if (tickSize > 0 &&
+                                tickValue > 0 &&
+                                trade.Volume > 0)
+                            {
+                                double bnbLargeWinnerDollarSL =
+                                    ProfitUsdToStopPrice(
+                                        trade,
+                                        bnbLargeWinnerFloorUsd,
+                                        tickSize,
+                                        tickValue
+                                    );
+
+
+                                if (trade.Side == TradeSide.Buy)
+                                {
+                                    bnbProposedSL =
+                                        Math.Max(
+                                            bnbProposedSL,
+                                            bnbLargeWinnerDollarSL
+                                        );
+                                }
+                                else
+                                {
+                                    bnbProposedSL =
+                                        Math.Min(
+                                            bnbProposedSL,
+                                            bnbLargeWinnerDollarSL
+                                        );
+                                }
+                            }
+                        }
+
+
+                        double validBnbSL =
+                            ValidateStopLoss(
+                                trade,
+                                bnbProposedSL,
+                                bid,
+                                ask,
+                                minimumStopDistance
+                            );
+
+
+                        validBnbSL =
+                            NormalizeStopLossToTick(
+                                trade,
+                                validBnbSL,
+                                tickSize
+                            );
+
+
+                        bool bnbStopWouldLockLoss =
+                            (trade.Side == TradeSide.Buy &&
+                             validBnbSL < trade.EntryPrice)
+                            ||
+                            (trade.Side == TradeSide.Sell &&
+                             validBnbSL > trade.EntryPrice);
+
+
+                        if (!bnbStopWouldLockLoss &&
+                            ShouldImproveStop(
+                                trade,
+                                validBnbSL,
+                                tickSize))
+                        {
+                            string reason =
+                                $"BNB health-aware runner | " +
+                                $"peak={peakProfit:F2} | " +
+                                $"profit={currentProfit:F2} | " +
+                                $"healthy={bnbHealthyRunner} | " +
+                                $"weakening={bnbWeakeningRunner} | " +
+                                $"trailATR={bnbTrailAtr:F2} | " +
+                                $"largeWinner={bnbLargeWinnerArmed} | " +
+                                $"largeFloor={bnbLargeWinnerFloorUsd:F2} | " +
+                                $"newSL={validBnbSL:F5}";
+
+
+                            LogMoveSL(
+                                trade,
+                                stage,
+                                validBnbSL,
+                                reason
+                            );
+
+
+                            return RiskDecision.MoveSL(
+                                stage,
+                                validBnbSL,
+                                reason
+                            );
+                        }
+
+
+                        return RiskDecision.Hold(
+                            stage,
+                            bnbLargeWinnerArmed
+                                ? "BNB large winner"
+                                : bnbHealthyRunner
+                                    ? "BNB healthy runner"
+                                    : "BNB weakening runner"
+                        );
+                    }
+
+
+                    // ====================================================
+                    // ORIGINAL NON-GOLD TRAILING STAGE
                     // ====================================================
 
                     double trailingDistance =
@@ -1349,10 +2727,6 @@
                               trailingDistance;
 
 
-                    // ====================================================
-                    // 17B. ATR MINIMUM PROFIT FLOOR
-                    // ====================================================
-
                     double atrProfitFloorSL =
                         trade.Side == TradeSide.Buy
 
@@ -1364,10 +2738,6 @@
                               atr *
                               profile.ProfitLockAtr;
 
-
-                    // ====================================================
-                    // 17C. CONVERT PROTECTED USD FLOOR TO PRICE
-                    // ====================================================
 
                     bool canCalculateDollarSL =
                         peakProtectionArmed &&
@@ -1390,30 +2760,8 @@
                                 tickSize,
                                 tickValue
                             );
-
-
-                        LogFile.Write(
-                            $"[{trade.Symbol}] 💵 Dollar protection SL | " +
-                            $"ticket={trade.Ticket} | " +
-                            $"peak={peakProfit:F2} | " +
-                            $"protectedUsd={protectedProfitUsd:F2} | " +
-                            $"volume={trade.Volume:F2} | " +
-                            $"tickSize={tickSize:F8} | " +
-                            $"tickValue={tickValue:F5} | " +
-                            $"rawDollarSL={dollarProfitFloorSL:F5}"
-                        );
                     }
 
-
-                    // ====================================================
-                    // 17D. CHOOSE STRONGEST PROTECTIVE STOP
-                    //
-                    // BUY:
-                    // higher = stronger
-                    //
-                    // SELL:
-                    // lower = stronger
-                    // ====================================================
 
                     double proposedSL;
 
@@ -1459,10 +2807,6 @@
                     }
 
 
-                    // ====================================================
-                    // 17E. VALIDATE AGAINST CURRENT MARKET
-                    // ====================================================
-
                     double validSL =
                         ValidateStopLoss(
                             trade,
@@ -1472,10 +2816,6 @@
                             minimumStopDistance
                         );
 
-
-                    // ====================================================
-                    // 17F. NORMALIZE TO REAL TICK SIZE
-                    // ====================================================
 
                     validSL =
                         NormalizeStopLossToTick(
@@ -1517,25 +2857,6 @@
                     }
 
 
-                    LogHold(
-                        trade,
-                        stage,
-                        currentPrice,
-                        atr,
-                        adverseAtr,
-                        ema21FailureAtr,
-                        closedBodyRatio,
-                        liveBodyRatio,
-                        closedOppositeStrongCandle,
-                        liveOppositeStrongCandle,
-                        peakProfit,
-                        giveback,
-                        peakProtectionArmed
-                            ? $"Runner - protected dollar floor=${protectedProfitUsd:F2}"
-                            : "Runner - ATR trailing only"
-                    );
-
-
                     return RiskDecision.Hold(
                         stage,
                         "Runner"
@@ -1547,6 +2868,50 @@
                     stage,
                     "No risk action"
                 );
+            }
+
+
+            // ============================================================
+            // CONVERT A PRICE MOVE INTO USD FOR THE ACTUAL TRADE VOLUME
+            //
+            // Used by the volatility-aware hard-loss calculation.
+            //
+            // TickValue = account-currency value of one TickSize move
+            //             for ONE LOT.
+            // ============================================================
+
+            private static double PriceMoveToUsd(
+                TrackedTrade trade,
+                double priceMove,
+                double tickSize,
+                double tickValue)
+            {
+                if (trade == null)
+                    return 0;
+
+
+                if (priceMove <= 0 ||
+                    tickSize <= 0 ||
+                    tickValue <= 0 ||
+                    trade.Volume <= 0)
+                {
+                    return 0;
+                }
+
+
+                double ticks =
+                    priceMove /
+                    tickSize;
+
+
+                double usdPerTick =
+                    tickValue *
+                    trade.Volume;
+
+
+                return
+                    ticks *
+                    usdPerTick;
             }
 
 
@@ -1778,10 +3143,13 @@
                 //
                 // IMPORTANT:
                 //
-                // $9:
-                // Peak-dollar protection activates.
+                // $8:
+                // Protected stage begins.
                 //
-                // $15:
+                // $9:
+                // Gold Proof V3 arms a small positive broker-side floor.
+                //
+                // $18:
                 // ATR runner activates.
                 // ========================================================
 
@@ -1789,7 +3157,21 @@
                 {
                     return new Profile
                     {
+                        // ----------------------------------------------------
+                        // GOLD VOLATILITY-AWARE HARD LOSS
+                        //
+                        // Keep $6 as the minimum emergency loss threshold, but
+                        // do not force-close a normal H1 Gold pullback merely
+                        // because $6 was reached before structure actually failed.
+                        //
+                        // Allow up to 0.55 ATR of adverse movement, converted to
+                        // USD using the real tick value and actual trade volume.
+                        //
+                        // Absolute safety ceiling: $10.
+                        // ----------------------------------------------------
                         HardLossUsd = 6.00,
+                        HardLossAtrFloor = 0.55,
+                        MaxHardLossUsd = 10.00,
 
                         StructuralAdverseAtr = 0.65,
 
@@ -1798,14 +3180,20 @@
                         OppositeBodyRatio = 0.62,
 
 
-                        ProtectAtProfitUsd = 9.00,
+                        // Protected stage begins at $8, but Gold Proof V3
+                        // does not force a positive broker floor until peak >= $9.
+                        ProtectAtProfitUsd = 8.00,
 
-                        ProfitLockAtr = 0.05,
+                        ProfitLockAtr = 0.02,
 
 
-                        TrailAtProfitUsd = 15.00,
+                        // True runner stage begins only after meaningful
+                        // continuation has developed.
+                        TrailAtProfitUsd = 18.00,
 
-                        TrailDistanceAtr = 0.70,
+                        // Healthy Gold runners use the custom 0.90 ATR trail
+                        // in the Gold-specific runner logic.
+                        TrailDistanceAtr = 0.90,
 
 
                         // Keep at least 60% of peak profit.
@@ -1824,17 +3212,55 @@
                         FollowThroughEma9FailureAtr = 0.12,
 
 
+                        // Gold-only early transition failure protection.
+                        // Evidence-gated so normal pullbacks and mature runners
+                        // are not touched.
+                        GoldEarlyFailureMaxBars = 1,
+                        GoldEarlyFailureMaxPeakProfitUsd = 10.00,
+                        GoldEarlyFailureAdverseAtr = 0.35,
+                        GoldEarlyFailureEma9FailureAtr = 0.12,
+
+
                         MinStopDistanceAtr = 0.10,
 
+                        // ====================================================
+                        // GENERIC EARLY PROTECTION
+                        //
+                        // Gold continues to bypass the generic early software
+                        // close / broker stop. Gold uses its own modest early
+                        // winner safety floor below.
+                        // ====================================================
                         EarlyProtectAtProfitUsd = 3.00,
                         EarlyLockPercent = 0.35,
 
-                        // Give Gold more room during early profit protection.
-                        // The broker-side stop must remain at least 0.35 ATR
-                        // from the live market, and ordinary early giveback
-                        // must not force an immediate software close.
                         EarlyBrokerMinDistanceAtr = 0.35,
-                        EnableEarlySoftwareClose = false
+                        EnableEarlySoftwareClose = false,
+
+                        // ====================================================
+                        // GOLD EARLY WINNER SAFETY
+                        //
+                        // Arm only after Gold has demonstrated at least $5.
+                        // Lock 20% of peak, with a minimum $1 floor and a
+                        // maximum $2 floor before normal Gold protection.
+                        //
+                        // Examples:
+                        //   Peak $5.00  -> lock $1.00
+                        //   Peak $6.75  -> lock $1.35
+                        //   Peak $7.50  -> lock $1.50
+                        //
+                        // ProtectAtProfitUsd ($8) and Gold Proof V3 ($9)
+                        // continue to own the later stages.
+                        // ====================================================
+                        // DISABLED:
+                        // Live Gold showed that a healthy H1 continuation can
+                        // reach roughly +$5/+6, retrace normally, and then resume.
+                        // Do not force a positive broker stop merely because a
+                        // small early profit peak was reached.
+                        GoldEarlyWinnerArmUsd = 0.00,
+                        GoldEarlyWinnerLockPercent = 0.00,
+                        GoldEarlyWinnerMinLockUsd = 0.00,
+                        GoldEarlyWinnerMaxLockUsd = 0.00,
+
                     };
                 }
 
@@ -1862,7 +3288,7 @@
 
                         TrailAtProfitUsd = 15.00,
 
-                        TrailDistanceAtr = 0.80,
+                        TrailDistanceAtr = 1.00,
 
                         PeakProfitLockPercent = 0.00,
 
@@ -1893,7 +3319,66 @@
 
 
                 // ========================================================
-                // BNB / SOL / XRP / ADA / OTHER CRYPTO
+                // BNB
+                //
+                // Aug 3 -> Sep 18 BNB replay:
+                // - keep the $6 hard-loss ceiling
+                // - delay early protection slightly to $3
+                // - reduce early lock from 35% to 25%
+                // - protected stage remains $7
+                // - runner stage remains $12
+                // - runner management is handled by the BNB-specific
+                //   health-aware branch above.
+                // ========================================================
+
+                if (IsBnb(s))
+                {
+                    return new Profile
+                    {
+                        HardLossUsd = 6.00,
+
+                        StructuralAdverseAtr = 0.75,
+
+                        Ema21FailureAtr = 0.18,
+
+                        OppositeBodyRatio = 0.60,
+
+                        ProtectAtProfitUsd = 7.00,
+
+                        ProfitLockAtr = 0.03,
+
+                        TrailAtProfitUsd = 12.00,
+
+                        TrailDistanceAtr = 0.90,
+
+                        // BNB's fixed percentage peak lock is intentionally
+                        // bypassed.  The BNB runner branch handles healthy vs.
+                        // weakening trades and large-winner protection.
+                        PeakProfitLockPercent = 0.60,
+
+                        MaxGivebackUsd = 6.00,
+
+                        FollowThroughBars = 2,
+
+                        FollowThroughMinPeakProfitUsd = 3.00,
+
+                        FollowThroughEma9FailureAtr = 0.12,
+
+                        EarlyProtectAtProfitUsd = 3.00,
+
+                        EarlyLockPercent = 0.25,
+
+                        EarlyBrokerMinDistanceAtr = 0.30,
+
+                        EnableEarlySoftwareClose = false,
+
+                        MinStopDistanceAtr = 0.10
+                    };
+                }
+
+
+                // ========================================================
+                // SOL / XRP / ADA / OTHER CRYPTO
                 // ========================================================
 
                 if (IsCrypto(s))
@@ -1933,10 +3418,80 @@
                         // stop must stay at least 0.30 ATR away from live price.
                         // The early dollar floor does not force a software close.
                         // ----------------------------------------------------
-                        EarlyProtectAtProfitUsd = 2.50,
+                        EarlyProtectAtProfitUsd = 0.75,
                         EarlyLockPercent = 0.35,
 
                         EarlyBrokerMinDistanceAtr = 0.30,
+                        EnableEarlySoftwareClose = false,
+
+                        MinStopDistanceAtr = 0.10
+                    };
+                }
+
+
+                // ========================================================
+                // CASH INDICES
+                //
+                // Explicit branch for broker symbols such as:
+                // US100.cash, US30.cash, US500.cash, GER40.cash, UK100.cash.
+                //
+                // Starts with the existing validated index profile so CASH
+                // symbols are isolated and can be tuned independently later
+                // without changing FX, Gold, BNB or non-cash indices.
+                // ========================================================
+
+                if (IsCashIndex(s))
+                {
+                    return new Profile
+                    {
+                        // ====================================================
+                        // US100.CASH VALIDATED PROFILE
+                        //
+                        // Aug 3 -> Sep 18 M1/H1 replay:
+                        // - hard-loss ceiling = $1.25
+                        // - protection begins at $0.75
+                        // - runner begins at $1.75
+                        // - runner trail remains 1.00 ATR
+                        // - no early software-profit lock
+                        //
+                        // This profile was selected because it remained
+                        // positive in the earlier and later date splits and
+                        // across 2h / 3h / 4h / 6h holding windows.
+                        // ====================================================
+
+                        HardLossUsd = 1.25,
+
+                        StructuralAdverseAtr = 0.75,
+
+                        Ema21FailureAtr = 0.18,
+
+                        OppositeBodyRatio = 0.60,
+
+                        ProtectAtProfitUsd = 2.50,
+
+                        ProfitLockAtr = 0.05,
+
+                        TrailAtProfitUsd = 1.75,
+
+                        TrailDistanceAtr = 0.80,
+
+                        PeakProfitLockPercent = 0.00,
+
+                        MaxGivebackUsd = 0.00,
+
+                        FollowThroughBars = 2,
+
+                        FollowThroughMinPeakProfitUsd = 1.00,
+
+                        FollowThroughEma9FailureAtr = 0.12,
+
+                        // No early dollar lock for CASH.
+                        EarlyProtectAtProfitUsd = 0.00,
+
+                        EarlyLockPercent = 0.00,
+
+                        EarlyBrokerMinDistanceAtr = 0.10,
+
                         EnableEarlySoftwareClose = false,
 
                         MinStopDistanceAtr = 0.10
@@ -1988,6 +3543,19 @@
 
                 // ========================================================
                 // FX
+                //
+                // EURUSD Aug 3 -> Sep 18 replay validation:
+                // Keep the existing FX profile.
+                //
+                // The provisional FX proof-runner tested:
+                //   early protect $3 / 25%
+                //   protected stage $5
+                //   runner $8
+                //   health-aware 0.65 / 0.35 ATR trail
+                //
+                // It reduced expectancy on the reconstructed EURUSD
+                // Transition sample, so those provisional rules are NOT
+                // enabled here.
                 // ========================================================
 
                 return new Profile
@@ -2041,6 +3609,14 @@
             }
 
 
+            private static bool IsBnb(
+                string symbol)
+            {
+                return
+                    symbol.Contains("BNB");
+            }
+
+
             private static bool IsCrypto(
                 string symbol)
             {
@@ -2058,6 +3634,25 @@
             }
 
 
+            private static bool IsCashIndex(
+                string symbol)
+            {
+                if (string.IsNullOrWhiteSpace(symbol))
+                {
+                    return false;
+                }
+
+
+                string s =
+                    symbol.ToUpperInvariant();
+
+
+                return
+                    s.Contains(".CASH") ||
+                    s.EndsWith("CASH");
+            }
+
+
             private static bool IsIndex(
                 string symbol)
             {
@@ -2071,7 +3666,10 @@
                     symbol.Contains("SPX") ||
                     symbol.Contains("GER") ||
                     symbol.Contains("DAX") ||
-                    symbol.Contains("UK100");
+                    symbol.Contains("UK100") ||
+                    symbol.Contains("JP225") ||
+                    symbol.Contains("INDEX") ||
+                    symbol.Contains(".CASH");
             }
 
 
