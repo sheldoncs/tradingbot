@@ -48,6 +48,144 @@ namespace MetaTrader.Services
         private readonly ITradingDbContext _dbContext;
         private TradingWindow tradingWindow = new TradingWindow();
         private readonly IConfiguration _configuration;
+
+        // UI telemetry is observation-only. Never required for trading to start.
+        private readonly SentinelLiveTelemetry _liveUi;
+
+        private void PublishLive(System.Action<SentinelLiveTelemetry> publish)
+        {
+            if (_liveUi == null) return;
+            try { publish(_liveUi); }
+            catch (System.Exception) { /* Dashboard must never interrupt MT5 logic. */ }
+        }
+
+        // ============================================================
+        // GOLD LIVE ADVERSE-MOVE EXIT ASSESSMENT
+        // Called by the existing position risk loop; never issues broker orders directly.
+        // The unified risk engine keeps priority over this additional early-exit rule.
+        // A high-risk signal must persist across TWO samples (at least 10s apart).
+        // Thresholds are experimental and should be validated against tick replay.
+        // ============================================================
+        private sealed class GoldPredictionSample
+        {
+            public double Price;
+            public DateTime SeenUtc;
+            public DateTime LastEvaluatedUtc;
+            public int ConsecutiveHighRisk;
+        }
+
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, GoldPredictionSample>
+            _goldPredictionSamples = new System.Collections.Concurrent.ConcurrentDictionary<ulong, GoldPredictionSample>();
+        private static readonly TimeSpan _goldPredictionInterval = TimeSpan.FromSeconds(10);
+        private const double GoldPredictionMinimumLossUsd = 1.50;
+
+        private static bool ShouldExitGoldAdverseMove(
+            TrackedTrade trade,
+            double bid,
+            double ask,
+            double atr,
+            MqlRates[] closedH1,
+            double[] ema9,
+            double[] ema21,
+            out string reason)
+        {
+            reason = string.Empty;
+            try
+            {
+                if (trade == null || trade.Ticket == 0 ||
+                    string.IsNullOrWhiteSpace(trade.Symbol) ||
+                    !(trade.Symbol.Contains("XAU", StringComparison.OrdinalIgnoreCase) ||
+                      trade.Symbol.Contains("GOLD", StringComparison.OrdinalIgnoreCase)) ||
+                    trade.Side != TradeSide.Buy && trade.Side != TradeSide.Sell ||
+                    double.IsNaN(trade.ProfitUsd) || double.IsInfinity(trade.ProfitUsd) ||
+                    atr <= 0 || bid <= 0 || ask <= 0 ||
+                    closedH1 == null || closedH1.Length < 2 ||
+                    ema9 == null || ema9.Length < 2 ||
+                    ema21 == null || ema21.Length < 2)
+                    return false;
+
+                DateTime now = DateTime.UtcNow;
+                bool buy = trade.Side == TradeSide.Buy;
+                double executable = buy ? bid : ask;
+                var sample = _goldPredictionSamples.GetOrAdd(trade.Ticket, _ => new GoldPredictionSample
+                {
+                    Price = executable,
+                    SeenUtc = now,
+                    LastEvaluatedUtc = DateTime.MinValue
+                });
+
+                double previousPrice;
+                double elapsedSeconds;
+                lock (sample)
+                {
+                    if (now - sample.LastEvaluatedUtc < _goldPredictionInterval)
+                        return false;
+                    previousPrice = sample.Price;
+                    elapsedSeconds = Math.Max(0.001, (now - sample.SeenUtc).TotalSeconds);
+                    sample.Price = executable;
+                    sample.SeenUtc = now;
+                    sample.LastEvaluatedUtc = now;
+                }
+
+                double adverse = Math.Max(0, buy ? trade.EntryPrice - executable : executable - trade.EntryPrice);
+                double adverseAtr = adverse / atr;
+                double movementAgainst = buy ? previousPrice - executable : executable - previousPrice;
+                double velocityAtrPerMinute = movementAgainst / atr * 60.0 / elapsedSeconds;
+                bool wrongSide9 = buy ? executable < ema9[^1] : executable > ema9[^1];
+                bool wrongSide21 = buy ? executable < ema21[^1] : executable > ema21[^1];
+                bool ema9SlopeAgainst = buy ? ema9[^1] < ema9[^2] : ema9[^1] > ema9[^2];
+                var closed = closedH1[^1];
+                double range = Math.Max(0, closed.high - closed.low);
+                double bodyRatio = range > 0 ? Math.Abs(closed.close - closed.open) / range : 0;
+                bool oppositeStrong =
+                    (buy ? closed.close < closed.open : closed.close > closed.open) &&
+                    bodyRatio >= 0.62;
+                bool adverseAcceleration = adverseAtr >= 0.20 && velocityAtrPerMinute > 0.04;
+                int evidence = (wrongSide9 ? 1 : 0) + (wrongSide21 ? 1 : 0) +
+                               (ema9SlopeAgainst ? 1 : 0) + (oppositeStrong ? 1 : 0) +
+                               (adverseAcceleration ? 1 : 0);
+
+                // This is a rules-based failure assessment, not a calibrated probability.
+                // Do not exit positive trades or repeatedly exit on EMA conditions alone.
+                bool highRisk = trade.ProfitUsd <= -GoldPredictionMinimumLossUsd &&
+                                evidence >= 4 && adverseAtr >= 0.10 &&
+                                (oppositeStrong || adverseAcceleration);
+                int confirmations;
+                lock (sample)
+                {
+                    sample.ConsecutiveHighRisk = highRisk ? sample.ConsecutiveHighRisk + 1 : 0;
+                    confirmations = sample.ConsecutiveHighRisk;
+                }
+                LogFile.Write(
+                    $"[GOLD LIVE PREDICTION] ticket={trade.Ticket} | symbol={trade.Symbol} | " +
+                    $"side={trade.Side} | evidence={evidence}/5 | confirm={confirmations}/2 | " +
+                    $"profitUsd={trade.ProfitUsd:F2} | adverseATR={adverseAtr:F3} | " +
+                    $"velocityATRmin={velocityAtrPerMinute:F3} | " +
+                    $"EMA9Wrong={wrongSide9} | EMA21Wrong={wrongSide21} | " +
+                    $"EMA9SlopeWrong={ema9SlopeAgainst} | oppositeBody={oppositeStrong} | " +
+                    $"accelerating={adverseAcceleration}");
+
+                if (_goldPredictionSamples.Count > 256)
+                    foreach (var item in _goldPredictionSamples)
+                        if (now - item.Value.SeenUtc > TimeSpan.FromHours(12))
+                            _goldPredictionSamples.TryRemove(item.Key, out _);
+
+                if (confirmations < 2) return false;
+                reason = $"GOLD predictive adverse-move exit | evidence={evidence}/5 | " +
+                         $"confirmations={confirmations} | profit={trade.ProfitUsd:F2} | " +
+                         $"adverseATR={adverseAtr:F3} | velocityATRmin={velocityAtrPerMinute:F3}";
+                // Avoid retaining confirmation state after triggering a close request.
+                _goldPredictionSamples.TryRemove(trade.Ticket, out _);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                try { LogFile.Write($"[GOLD LIVE PREDICTION] assessment failed: {ex.Message}"); }
+                catch { }
+                return false; // Existing unified risk handling remains authoritative.
+            }
+        }
+
         private const ENUM_TIMEFRAMES TIMEFRAME = ENUM_TIMEFRAMES.PERIOD_M30;
         private static int MAGIC_NUMBER = 12345;
 
@@ -55,6 +193,25 @@ namespace MetaTrader.Services
 
         //private static Func<Results<T>, Task> _onMessageReceived<T>;
         private static Func<object, Task> _onMessageReceived;
+
+        // UI subscribers are optional: a missing/disconnected subscriber must
+        // never interrupt the MT5 trading or GOLD risk-management loops.
+        private static async Task SendUiUpdateSafeAsync(object message)
+        {
+            var callback = _onMessageReceived; // capture once to avoid a race
+            if (callback == null) return;
+
+            try
+            {
+                await callback(message);
+            }
+            catch (Exception ex)
+            {
+                try { LogFile.Write($"UI callback failed (trading unaffected): {ex.Message}"); }
+                catch { /* Logging must never interrupt trading either. */ }
+            }
+        }
+
         private static Func<object, Task> _logs;
         private static Func<object, Task> _stateUpdate;
 
@@ -321,6 +478,23 @@ namespace MetaTrader.Services
             _tradeCoordinator = tradeCoordinator;
             _notificationService = notificationService;
             _configuration = configuration;
+
+            // Optional read-only publishing; do not prevent MT5 startup on config failure.
+            try
+            {
+                var telemetryUrl = configuration["SentinelTelemetry:ServiceUrl"];
+                var telemetryKey = configuration["SentinelTelemetry:ApiKey"];
+                var alias = configuration["SentinelTelemetry:AccountAlias"];
+                if (!string.IsNullOrWhiteSpace(telemetryUrl) &&
+                    !string.IsNullOrWhiteSpace(telemetryKey))
+                {
+                    _liveUi = new SentinelLiveTelemetry(
+                        telemetryUrl, telemetryKey,
+                        string.IsNullOrWhiteSpace(alias) ? "GOLD" : alias);
+                }
+            }
+            catch (System.Exception) { /* Optional dashboard only. */ }
+
             // GOLD fixed-volume profile; no broker loss calculator configuration gate.
             ConfigureGoldLotRisk();
 
@@ -387,7 +561,7 @@ namespace MetaTrader.Services
                     Data = "Connected to MT5",
                     status = 200
                 };
-                await _onMessageReceived(results);
+                await SendUiUpdateSafeAsync(results);
                 /*
                 _client.BeginConnect("127.0.0.1", 8228);
                   LogFile.Write("Connected to MT5 IIS");
@@ -488,6 +662,10 @@ namespace MetaTrader.Services
                     );
 
                     openTrades.Remove(trade);
+                    // Position no longer exists at broker; do not claim realized P/L
+                    // without broker history verification.
+                    PublishLive(ui => ui.PublishPositionClosed(
+                        trade.Symbol, trade.Ticket.ToString()));
                 }
             }
         }
@@ -750,7 +928,7 @@ namespace MetaTrader.Services
                 status = 200
             };
 
-            await _onMessageReceived(results);
+            await SendUiUpdateSafeAsync(results);
 
             Console.WriteLine("Connecting to MT5...");
             LogFile.Write("Connecting to MT5...");
@@ -765,7 +943,7 @@ namespace MetaTrader.Services
             results.message = "disconnected";
             results.Data = "Disconnected from MT5";
             results.status = 200;
-            _onMessageReceived(results);
+            _ = SendUiUpdateSafeAsync(results);
         }
 
         private void Api_ConnectionStateChanged(object sender, Mt5ConnectionEventArgs e)
@@ -777,7 +955,7 @@ namespace MetaTrader.Services
                 results.message = "connected";
                 results.Data = "Connected to MT5";
                 results.status = 200;
-                _onMessageReceived(results);
+                _ = SendUiUpdateSafeAsync(results);
                 // Refresh GOLD fixed-volume profile after connecting to MT5.
                 ConfigureGoldLotRisk();
                 InitializeTrade();
@@ -832,7 +1010,7 @@ namespace MetaTrader.Services
                 results.message = message;
                 results.Data = data;
                 results.status = 200;
-                await _onMessageReceived(results);
+                await SendUiUpdateSafeAsync(results);
             }
             catch (Exception ex)
             {
@@ -899,6 +1077,8 @@ namespace MetaTrader.Services
 
             DateTime nowUtc = now.ToUniversalTime();
 
+            PublishLive(ui => ui.PublishHeartbeat());
+
             if (TradingWindow.IsTradingWindow(now))
             {
                 Console.WriteLine($"[{now}] In trading window → running trading logic...");
@@ -935,13 +1115,22 @@ namespace MetaTrader.Services
         {
             currentEquity = _client.AccountInfoDouble(ENUM_ACCOUNT_INFO_DOUBLE.ACCOUNT_EQUITY);
 
+            PublishLive(ui => {
+                ui.PublishAccount((decimal)currentEquity);
+                ui.PublishHeartbeat();
+            });
+
             await streamMessage<double>("double", "startingEquity", startingBalance);
             await streamMessage<double>("double", "currentEquity", currentEquity);
 
-            double drop = startingBalance - currentEquity;
+            // openConnection() may inject an already-connected MT5 client without
+            // raising Api_ConnectionStateChanged; avoid reporting a fake huge drop.
+            bool startingBalanceKnown = startingBalance > 0;
+            double drop = startingBalanceKnown ? startingBalance - currentEquity : 0;
+            string dropText = startingBalanceKnown ? drop.ToString("F2") : "N/A (starting balance not initialized)";
 
-            Console.WriteLine($"Equity: {currentEquity:F2}, Drop: {drop:F2}");
-            LogFile.Write($"Equity: {currentEquity:F2}, Drop: {drop:F2}");
+            Console.WriteLine($"Equity: {currentEquity:F2}, Drop: {dropText}");
+            LogFile.Write($"Equity: {currentEquity:F2}, Drop: {dropText}");
             //await streamMessage<string>("string", "output", $"Equity: {currentEquity:F2}, Drop: {drop:F2}");
 
         }
@@ -2287,6 +2476,8 @@ namespace MetaTrader.Services
             // 🛡️ EQUITY PROTECTION (ACCOUNT LEVEL – FIRST)
             // =========================================================
             double accountEquity = _client.AccountInfoDouble(ENUM_ACCOUNT_INFO_DOUBLE.ACCOUNT_EQUITY);
+            // Fresh broker equity during the normal trading cycle (no extra MT5 call).
+            PublishLive(ui => { ui.PublishAccount((decimal)accountEquity); ui.PublishHeartbeat(); });
             var trackedTrade = openTrades.FirstOrDefault();
 
             if (trackedTrade != null)
@@ -2436,7 +2627,7 @@ namespace MetaTrader.Services
                 Data = "Connected to MT5",
                 status = 200
             };
-            await _onMessageReceived(results);
+            await SendUiUpdateSafeAsync(results);
 
 
 
@@ -2568,7 +2759,8 @@ namespace MetaTrader.Services
                     ctx,
                     momentum,
                     currentSignal == "BUY" ? true :
-                    currentSignal == "SELL" ? false : null
+                    currentSignal == "SELL" ? false : null,
+                    PublishLive
                 );
 
                 double emaCurrentFast = emaFast1H[^1];
@@ -2941,6 +3133,15 @@ namespace MetaTrader.Services
                 // ============================================================
                 var entryStudyDiagnostics =
                     FastEntryEngine.ConsumeApprovedEntryDiagnostics();
+
+                // Actual observed hybrid momentum and ATR. Market label is not fabricated.
+                PublishLive(ui => ui.PublishMarket(
+                    SYMBOL, "Evaluated", (decimal)earlyMomentum.Hybrid, (decimal)atrRaw));
+
+                // Observation only: actual FastEntry decision, BEFORE downstream gates.
+                PublishLive(ui => ui.PublishSignal(
+                    SYMBOL, fastAction.ToString(), fastModel.ToString(),
+                    "FastEntry evaluation (candidate; not broker-confirmed execution)"));
 
                 // Record only directional Holds; this does not change FastEntryEngine behavior.
                 if (fastAction != TradeAction.EnterBuy && fastAction != TradeAction.EnterSell)
@@ -4516,6 +4717,17 @@ namespace MetaTrader.Services
                     openTrades.Add(tracked);
                 }
 
+                // Confirmed broker position ticket and broker-read parameters.
+                PublishLive(ui => {
+                    ui.PublishExecution(tracked.Symbol, tracked.Ticket.ToString(),
+                        tracked.Side.ToString(), "accepted", "MT5 position confirmed");
+                    ui.PublishPosition(tracked.Symbol, tracked.Ticket.ToString(),
+                        tracked.Side.ToString(), (decimal)tracked.Volume,
+                        (decimal)tracked.EntryPrice, (decimal)tracked.StopLoss,
+                        (decimal)tracked.TakeProfit, (decimal)tracked.ProfitUsd,
+                        (decimal)tracked.MaxProfitUsd, "Initial");
+                });
+
                 // ====================================================
                 // PERFORMANCE STUDY - REGISTER ACTUAL MT5 POSITION
                 //
@@ -5281,7 +5493,8 @@ namespace MetaTrader.Services
         MqlRates[] rates1Hr,
         SymbolContext ctx,
         MomentumResult momentumResult,
-        bool? isBuy = null)
+        bool? isBuy = null,
+        System.Action<System.Action<SentinelLiveTelemetry>> publishLive = null)
         {
             double atr =
                 CalculateATR(
@@ -5848,6 +6061,33 @@ namespace MetaTrader.Services
                         tickValue
                     );
 
+                // LIVE GOLD predictive early-exit assessment.
+                // Unified close decisions always take precedence. Any additional
+                // close uses the SAME existing broker-ticket execution switch below.
+                if (riskDecision.Action == UnifiedRiskManagementEngine.RiskAction.Hold &&
+                    ShouldExitGoldAdverseMove(t, tradeBid, tradeAsk, atr,
+                        rates1Hr, emaFast1H, emaSlow1H, out var predictorReason))
+                {
+                    riskDecision = UnifiedRiskManagementEngine.RiskDecision.Close(
+                        riskDecision.Stage, predictorReason);
+                }
+
+                // Position snapshot from the broker values read in this management cycle.
+                // P/L, SL, TP and volume are refreshed above before Evaluate().
+                publishLive?.Invoke(ui => ui.PublishPosition(
+                    t.Symbol, t.Ticket.ToString(), t.Side.ToString(),
+                    (decimal)t.Volume, (decimal)t.EntryPrice,
+                    (decimal)t.StopLoss, (decimal)t.TakeProfit,
+                    (decimal)t.ProfitUsd, (decimal)t.MaxProfitUsd,
+                    riskDecision.Stage.ToString()));
+
+                // Actual risk-engine decision, not a command from the dashboard.
+                publishLive?.Invoke(ui => ui.PublishRisk(
+                    t.Symbol, t.Ticket.ToString(), riskDecision.Action.ToString(),
+                    riskDecision.Stage.ToString(), riskDecision.Reason,
+                    (decimal)t.ProfitUsd, (decimal)t.MaxProfitUsd,
+                    riskDecision.Action == UnifiedRiskManagementEngine.RiskAction.MoveStopLoss
+                        ? (decimal?)riskDecision.NewStopLoss : null));
 
                 LogFile.Write(
                     $"[{t.Symbol}] Unified Risk Decision | " +

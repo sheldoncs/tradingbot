@@ -6,18 +6,17 @@
 
   <ItemGroup>
     <Compile Remove="NewFolder1\**" />
-    <Compile Remove="NewFolder\**" />
     <Content Remove="NewFolder1\**" />
-    <Content Remove="NewFolder\**" />
     <EmbeddedResource Remove="NewFolder1\**" />
-    <EmbeddedResource Remove="NewFolder\**" />
     <None Remove="NewFolder1\**" />
-    <None Remove="NewFolder\**" />
   </ItemGroup>
 
   <ItemGroup>
     <Reference Include="MtApi5">
       <HintPath>libs\MtApi5.dll</HintPath>
+    </Reference>
+    <Reference Include="SentinelFX.Telemetry">
+      <HintPath>Dll\SentinelFX.Telemetry.dll</HintPath>
     </Reference>
   </ItemGroup>
 

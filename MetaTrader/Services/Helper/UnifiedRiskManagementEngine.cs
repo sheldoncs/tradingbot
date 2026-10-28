@@ -185,19 +185,6 @@
                 public double FollowThroughEma9FailureAtr;
 
 
-                // ========================================================
-                // GOLD EARLY TRANSITION FAILURE
-                //
-                // Optional Gold-only protection for a BreakoutContinuation
-                // trade that fails very early after entry. Zero values disable
-                // the rule for all other profiles.
-                // ========================================================
-                public int GoldEarlyFailureMaxBars;
-                public double GoldEarlyFailureMaxPeakProfitUsd;
-                public double GoldEarlyFailureAdverseAtr;
-                public double GoldEarlyFailureEma9FailureAtr;
-
-
                 // Minimum SL distance from current market.
                 public double MinStopDistanceAtr;
 
@@ -211,19 +198,6 @@
                 // If false, the early dollar floor will NOT force a software close.
                 // Protection is handled by the wider broker-side stop instead.
                 public bool EnableEarlySoftwareClose = true;
-
-
-                // ========================================================
-                // GOLD EARLY WINNER SAFETY FLOOR
-                //
-                // Gold needs more breathing room than other assets, but once
-                // a trade has demonstrated meaningful profit it should not
-                // remain protected only by the original losing SL.
-                // ========================================================
-                public double GoldEarlyWinnerArmUsd;
-                public double GoldEarlyWinnerLockPercent;
-                public double GoldEarlyWinnerMinLockUsd;
-                public double GoldEarlyWinnerMaxLockUsd;
             }
 
 
@@ -252,6 +226,37 @@
                     );
                 }
 
+
+                // ========================================================
+                // GOLD EMERGENCY HARD-LOSS FAILSAFE
+                // ========================================================
+                // Evaluate this BEFORE the indicator-data guard. Missing H1
+                // rates or EMA arrays must not disable the existing absolute
+                // GOLD loss ceiling. This does not change entries, normal
+                // movement tolerance, structure rules or runner trailing.
+                //
+                // Use the position P/L already supplied by the caller.
+                // Broker-side SL and verified order risk remain essential:
+                // software closes can slip or fail during disconnection.
+                if (IsGold(symbol) &&
+                    !double.IsNaN(trade.ProfitUsd) &&
+                    !double.IsInfinity(trade.ProfitUsd))
+                {
+                    Profile goldSafetyProfile = GetProfile(symbol);
+                    double emergencyLossLimit = goldSafetyProfile.MaxHardLossUsd;
+
+                    if (emergencyLossLimit > 0 &&
+                        trade.ProfitUsd <= -emergencyLossLimit)
+                    {
+                        string emergencyReason =
+                            $"GOLD emergency loss failsafe (independent of indicator data) | " +
+                            $"profit={trade.ProfitUsd:F2} | " +
+                            $"ceiling=-{emergencyLossLimit:F2}";
+
+                        LogClose(trade, RiskStage.Initial, emergencyReason);
+                        return RiskDecision.Close(RiskStage.Initial, emergencyReason);
+                    }
+                }
 
                 if (atr <= 0 ||
                     rates == null ||
@@ -345,30 +350,6 @@
                         RiskStage.Initial;
                 }
 
-
-                // ========================================================
-                // GOLD $8-$9 PROOF GAP: DEMO-ONLY RETURN-TO-ENTRY EXIT
-                // ========================================================
-                // The Protected stage starts at $8, but Gold Proof V3 only
-                // arms its broker profit stop at $9. A trade peaking between
-                // $8 and $9 can otherwise reverse into the hard-loss limit.
-                // This covers ONLY that gap: do not change $9+ proof bands,
-                // $18+ runners, or the existing initial-entry risk policy.
-                // A software close is requested if profit falls to $0.50
-                // after a demonstrated $8-$9 peak; broker execution can slip.
-                // Backtest on demo before enabling in production.
-                if (IsGold(s) &&
-                    peakProfit >= 8.00 &&
-                    peakProfit < 9.00 &&
-                    currentProfit <= 0.50)
-                {
-                    string reason =
-                        $"Gold $8-$9 proof gap exit | " +
-                        $"peak={peakProfit:F2} | profit={currentProfit:F2} | " +
-                        "floor=0.50 | software close (execution may slip)";
-                    LogClose(trade, stage, reason);
-                    return RiskDecision.Close(stage, reason);
-                }
 
                 // ========================================================
                 // 3. HARD LOSS
@@ -698,36 +679,6 @@
                     trade.Side == TradeSide.Buy
                         ? bid
                         : ask;
-
-                // ========================================================
-                // 5A. GOLD EARLY WINNER SAFETY FLOOR - DISABLED
-                //
-                // IMPORTANT LIVE-MARKET CORRECTION:
-                //
-                // Do NOT move Gold/XAU to a small positive stop merely because
-                // peak profit reaches approximately $5-$8.
-                //
-                // A healthy H1 Gold continuation can make an initial push,
-                // retrace deeply enough to revisit a small profit/breakeven
-                // area, and then resume the trend. The former early-winner
-                // floor could therefore stop a structurally healthy trade
-                // before continuation.
-                //
-                // Gold protection remains controlled by:
-                //
-                //   1. hard-loss protection,
-                //   2. failed-follow-through / early transition failure,
-                //   3. EMA9 / EMA21 / adverse-candle structural evidence,
-                //   4. Gold Proof V3 once the trade has genuinely proved
-                //      itself,
-                //   5. the later Gold runner/trailing stage.
-                //
-                // The profile fields are intentionally retained for source
-                // compatibility, but the Gold profile sets them to zero.
-                // There is intentionally NO automatic $5 early broker SL or
-                // software-close floor here.
-                // ========================================================
-
 
                 // ========================================================
                 // 5B. EARLY BROKER-SIDE PROFIT PROTECTION
@@ -1191,6 +1142,36 @@
                     profile.FollowThroughEma9FailureAtr;
 
 
+                // ========================================================
+                // CASH DEMO: FIRST-BAR FAST FAILURE
+                // The SR observation trial permits more entries. Exit an
+                // unproven CASH momentum/continuation trade only when price,
+                // EMA9 and an opposite candle ALL confirm failure.
+                // Original hard loss and winner/trailing rules remain intact.
+                // ========================================================
+                bool cashFastFailure =
+                    IsCashIndex(s) &&
+                    usesFastFollowThroughProtection &&
+                    trade.CandlesSinceEntry <= 1 &&
+                    peakProfit < 0.40 &&
+                    currentProfit < 0.0 &&
+                    adverseAtr >= 0.25 &&
+                    ema9FailureAtr >= 0.12 &&
+                    adverseCandleEvidence;
+
+                if (cashFastFailure)
+                {
+                    string reason =
+                        $"CASH fast failure (demo) | model={entryModelName} | " +
+                        $"bars={trade.CandlesSinceEntry} | " +
+                        $"profit={currentProfit:F2} | peak={peakProfit:F2} | " +
+                        $"adverseATR={adverseAtr:F2}/0.25 | " +
+                        $"ema9FailureATR={ema9FailureAtr:F2}/0.12 | " +
+                        $"oppositeCandle={adverseCandleEvidence}";
+                    LogClose(trade, stage, reason);
+                    return RiskDecision.Close(stage, reason);
+                }
+
                 bool failedFollowThrough =
                     usesFastFollowThroughProtection &&
                     enoughBarsElapsed &&
@@ -1222,128 +1203,6 @@
                         stage,
                         reason
                     );
-                }
-
-
-                // ========================================================
-                // 11A. GOLD EARLY TRANSITION FAILURE
-                //
-                // The Jan -> Sep Gold replay showed that some losing Gold
-                // transition/continuation entries reveal failure early:
-                //
-                // - they never develop meaningful peak profit,
-                // - they move materially adverse,
-                // - executable price fails EMA9, and
-                // - an opposite-direction candle is already visible.
-                //
-                // IMPORTANT:
-                // The impulse/transition entry path currently reaches the trade
-                // tracker as BreakoutContinuation, so this rule is deliberately
-                // limited to that model, Gold, and the first two H1 bars.
-                // It does NOT tighten Gold entries and does NOT alter mature
-                // winner/runner management.
-                // ========================================================
-
-                bool goldEarlyFailureEnabled =
-                    isGold &&
-                    profile.GoldEarlyFailureMaxBars > 0 &&
-                    profile.GoldEarlyFailureMaxPeakProfitUsd > 0 &&
-                    profile.GoldEarlyFailureAdverseAtr > 0 &&
-                    profile.GoldEarlyFailureEma9FailureAtr > 0;
-
-
-                bool goldTransitionLikeModel =
-                    trade.Model ==
-                        EntryModel.BreakoutContinuation;
-
-
-                bool goldEarlyTransitionFailure =
-                    goldEarlyFailureEnabled &&
-                    goldTransitionLikeModel &&
-                    trade.CandlesSinceEntry <=
-                        profile.GoldEarlyFailureMaxBars &&
-                    peakProfit <
-                        profile.GoldEarlyFailureMaxPeakProfitUsd &&
-                    adverseAtr >=
-                        profile.GoldEarlyFailureAdverseAtr &&
-                    ema9FailureAtr >=
-                        profile.GoldEarlyFailureEma9FailureAtr &&
-                    adverseCandleEvidence;
-
-
-                if (goldEarlyTransitionFailure)
-                {
-                    string reason =
-                        $"Gold early transition failure | " +
-                        $"bars={trade.CandlesSinceEntry}/" +
-                        $"{profile.GoldEarlyFailureMaxBars} | " +
-                        $"peak=${peakProfit:F2}/" +
-                        $"${profile.GoldEarlyFailureMaxPeakProfitUsd:F2} | " +
-                        $"adverseATR={adverseAtr:F2}/" +
-                        $"{profile.GoldEarlyFailureAdverseAtr:F2} | " +
-                        $"ema9FailureATR={ema9FailureAtr:F2}/" +
-                        $"{profile.GoldEarlyFailureEma9FailureAtr:F2} | " +
-                        $"oppositeEvidence={adverseCandleEvidence}";
-
-
-                    LogClose(
-                        trade,
-                        stage,
-                        reason
-                    );
-
-
-                    return RiskDecision.Close(
-                        stage,
-                        reason
-                    );
-                }
-
-
-                // ========================================================
-                // 11A2. GOLD FAST FAILURE - UNRESTRICTED S/R DEMO STUDY
-                // ========================================================
-                // A GOLD BreakoutContinuation entry with little/no favorable
-                // progress may fail promptly when S/R is observation-only.
-                // Do not wait for the existing 0.35 ATR early transition rule
-                // if all independent failure evidence is already present.
-                //
-                // Scope is intentionally narrow:
-                // - GOLD only; BreakoutContinuation only
-                // - first H1 entry bar (CandlesSinceEntry 0 or 1)
-                // - peak profit under $3 and trade currently losing
-                // - adverse excursion at least 0.25 ATR
-                // - executable price beyond EMA9 against the trade by 0.12 ATR
-                // - strong opposite candle (closed or live)
-                //
-                // Existing hard loss, normal exits and winner management
-                // are unchanged. This does not depend on new TrackedTrade
-                // properties or change the public Evaluate signature.
-                // ========================================================
-
-                bool goldFastFailure =
-                    isGold &&
-                    goldTransitionLikeModel &&
-                    trade.CandlesSinceEntry <= 1 &&
-                    peakProfit < 3.00 &&
-                    currentProfit < 0.0 &&
-                    adverseAtr >= 0.25 &&
-                    ema9FailureAtr >= 0.12 &&
-                    adverseCandleEvidence;
-
-                if (goldFastFailure)
-                {
-                    string reason =
-                        $"Gold fast failure (S/R observation study) | " +
-                        $"bars={trade.CandlesSinceEntry} | " +
-                        $"peak=${peakProfit:F2}/$3.00 | " +
-                        $"profit=${currentProfit:F2} | " +
-                        $"adverseATR={adverseAtr:F2}/0.25 | " +
-                        $"ema9FailureATR={ema9FailureAtr:F2}/0.12 | " +
-                        $"oppositeCandle={adverseCandleEvidence}";
-
-                    LogClose(trade, stage, reason);
-                    return RiskDecision.Close(stage, reason);
                 }
 
 
@@ -1610,112 +1469,47 @@
                     if (isGold)
                     {
                         // ====================================================
-                        // GOLD PROOF STAGE V3
+                        // GOLD PROOF STAGE V2
                         //
-                        // GOAL:
-                        // Keep Gold's H1 breathing room, but never allow a
-                        // meaningful winner to remain protected only by the
-                        // original losing SL.
+                        // DATA-DRIVEN CHANGE:
                         //
-                        // Behaviour:
+                        // The extended Aug 3 -> Sep 18 replay showed that a
+                        // breakeven/small-positive broker SL in the $8-$18
+                        // proof stage was eliminating a number of trades that
+                        // later became $29+ runners.
                         //
-                        // 1. Peak < $9
-                        //      No broker profit stop is forced here.
+                        // Therefore:
                         //
-                        // 2. Peak >= $9
-                        //      Arm a meaningful stepped broker-side floor.
-                        //      Healthy trades move through $3 / $5 / $7.50
-                        //      proof bands rather than micro-ratcheting.
+                        // 1. DO NOT move a broker-side profit stop merely
+                        //    because peak profit reached $8.
                         //
-                        // 3. Weakening trades
-                        //      Protect a little more aggressively.
+                        // 2. Healthy Gold proof-stage trades receive full
+                        //    breathing room until the $18 runner stage.
                         //
-                        // 4. Peak >= $12 and weakening back to approximately
-                        //      breakeven
-                        //      Keep the existing proof-stage failure exit.
+                        // 3. Existing failed-follow-through, EMA9 reversal,
+                        //    EMA21 structural-failure and hard-loss logic
+                        //    remain responsible for genuinely bad trades.
                         //
-                        // 5. The $18+ runner stage below still owns the wider
-                        //      ATR trail and large-winner logic.
+                        // 4. Once a trade has shown a meaningful peak
+                        //    ($12+) and subsequently deteriorates all the way
+                        //    back to approximately breakeven while the Gold
+                        //    health classifier is WEAKENING, close it rather
+                        //    than allowing an established winner to become a
+                        //    full hard-loss.
                         //
-                        // This fixes the live failure observed on ticket
-                        // 109375398, where Gold reached > $11 peak profit while
-                        // the broker SL remained at the original losing level.
+                        // This specifically targets the observed:
+                        //
+                        //   +$9..+$17 -> tiny broker stop -> exit -> +$29+
+                        //
+                        // failure mode without loosening the initial hard-loss.
                         // ====================================================
-
-                        const double proofBrokerProtectionArmUsd =
-                            9.00;
-
-                        // ----------------------------------------------------
-                        // GOLD PROOF-STAGE STEP FLOORS
-                        //
-                        // Do not micro-ratchet the broker SL on every few cents
-                        // of new peak profit.  Healthy Gold now advances through
-                        // meaningful proof bands:
-                        //
-                        //   $9.00  - $11.99 peak -> protect $3.00
-                        //   $12.00 - $14.99 peak -> protect $5.00
-                        //   $15.00 - $17.99 peak -> protect $7.50
-                        //
-                        // At $18 the existing Gold runner stage takes over.
-                        //
-                        // This directly corrects the live XAUEUR case where a
-                        // $13.58 peak protected only about $2.04.
-                        // ----------------------------------------------------
-                        const double proofBand1PeakUsd =
-                            9.00;
-
-                        const double proofBand1LockUsd =
-                            3.00;
-
-                        const double proofBand2PeakUsd =
-                            12.00;
-
-                        const double proofBand2LockUsd =
-                            5.00;
-
-                        const double proofBand3PeakUsd =
-                            15.00;
-
-                        const double proofBand3LockUsd =
-                            7.50;
-
-                        // If Gold is weakening during the proof stage, protect
-                        // at least half of the demonstrated peak, while the
-                        // healthy runner continues to use the stepped floors.
-                        const double proofWeakeningLockPercent =
-                            0.60;
-
-                        // ----------------------------------------------------
-                        // GOLD MID-WINNER CAPTURE CORRECTION
-                        //
-                        // The latest Gold continuation reached +$13.62 MFE but
-                        // the fixed $5 proof-band floor allowed the realized
-                        // result to fall back to about +$5.02.
-                        //
-                        // Keep the $9-$11.99 band unchanged for breathing room.
-                        // Once peak >= $12, a healthy Gold winner has proved
-                        // enough continuation to protect at least 50% of peak.
-                        // If structure is weakening, protect at least 60%.
-                        //
-                        // This is deliberately below the later $18 runner stage
-                        // and does not alter entry logic or hard-loss behavior.
-                        // ----------------------------------------------------
-                        const double proofHealthyMidWinnerLockPercent =
-                            0.50;
-
-                        const double proofWeakeningMidWinnerLockPercent =
-                            0.60;
 
                         const double proofFailureArmUsd =
                             12.00;
 
+
                         const double proofFailureFloorUsd =
                             0.50;
-
-
-                        bool proofBrokerProtectionArmed =
-                            peakProfit >=
-                            proofBrokerProtectionArmUsd;
 
 
                         bool proofFailureProtectionArmed =
@@ -1759,172 +1553,6 @@
                         }
 
 
-                        // ----------------------------------------------------
-                        // POSITIVE BROKER-SIDE FLOOR AFTER GOLD HAS PROVED ITSELF
-                        // ----------------------------------------------------
-
-                        if (proofBrokerProtectionArmed &&
-                            tickSize > 0 &&
-                            tickValue > 0 &&
-                            trade.Volume > 0)
-                        {
-                            // Healthy Gold uses discrete proof bands rather
-                            // than a continuously changing percentage.  This
-                            // prevents broker-stop micro-ratcheting while still
-                            // banking meaningful profit once the trade proves
-                            // itself.
-                            double goldProofLockUsd =
-                                proofBand1LockUsd;
-
-
-                            if (peakProfit >= proofBand3PeakUsd)
-                            {
-                                goldProofLockUsd =
-                                    proofBand3LockUsd;
-                            }
-                            else if (peakProfit >= proofBand2PeakUsd)
-                            {
-                                goldProofLockUsd =
-                                    proofBand2LockUsd;
-                            }
-                            else if (peakProfit >= proofBand1PeakUsd)
-                            {
-                                goldProofLockUsd =
-                                    proofBand1LockUsd;
-                            }
-
-
-                            // ====================================================
-                            // ADAPTIVE MID-WINNER CAPTURE
-                            //
-                            // Peak $9-$11.99:
-                            //   retain the original fixed $3 proof floor.
-                            //
-                            // Peak $12-$17.99 and HEALTHY:
-                            //   protect the stronger of the proof band or 50% peak.
-                            //
-                            // Peak $12-$17.99 and WEAKENING:
-                            //   protect the stronger of the proof band or 60% peak.
-                            //
-                            // This prevents a proven $12-$18 Gold winner from
-                            // surrendering most of its MFE while still leaving
-                            // substantially more breathing room than a tight trail.
-                            // ====================================================
-                            if (peakProfit >= proofBand2PeakUsd)
-                            {
-                                double midWinnerLockPercent =
-                                    goldWeakeningRunner
-                                        ? proofWeakeningMidWinnerLockPercent
-                                        : proofHealthyMidWinnerLockPercent;
-
-                                goldProofLockUsd =
-                                    Math.Max(
-                                        goldProofLockUsd,
-                                        peakProfit *
-                                        midWinnerLockPercent
-                                    );
-                            }
-
-                            // Weakening Gold below the $12 mid-winner threshold
-                            // still retains the existing health-aware protection.
-                            if (goldWeakeningRunner)
-                            {
-                                goldProofLockUsd =
-                                    Math.Max(
-                                        goldProofLockUsd,
-                                        peakProfit *
-                                        proofWeakeningLockPercent
-                                    );
-                            }
-
-
-                            double goldProofDollarSL =
-                                ProfitUsdToStopPrice(
-                                    trade,
-                                    goldProofLockUsd,
-                                    tickSize,
-                                    tickValue
-                                );
-
-
-                            double validGoldProofSL =
-                                ValidateStopLoss(
-                                    trade,
-                                    goldProofDollarSL,
-                                    bid,
-                                    ask,
-                                    minimumStopDistance
-                                );
-
-
-                            validGoldProofSL =
-                                NormalizeStopLossToTick(
-                                    trade,
-                                    validGoldProofSL,
-                                    tickSize
-                                );
-
-
-                            bool goldProofStopWouldLockLoss =
-                                (trade.Side == TradeSide.Buy &&
-                                 validGoldProofSL <= trade.EntryPrice)
-                                ||
-                                (trade.Side == TradeSide.Sell &&
-                                 validGoldProofSL >= trade.EntryPrice);
-
-
-                            if (!goldProofStopWouldLockLoss &&
-                                ShouldImproveStop(
-                                    trade,
-                                    validGoldProofSL,
-                                    tickSize))
-                            {
-                                string reason =
-                                    $"Gold proof-stage positive SL | " +
-                                    $"peak={peakProfit:F2} | " +
-                                    $"profit={currentProfit:F2} | " +
-                                    $"healthy={goldHealthyRunner} | " +
-                                    $"weakening={goldWeakeningRunner} | " +
-                                    $"lockUsd={goldProofLockUsd:F2} | " +
-                                    $"midWinner={(peakProfit >= proofBand2PeakUsd)} | " +
-                                    $"rawDollarSL={goldProofDollarSL:F5} | " +
-                                    $"validatedSL={validGoldProofSL:F5} | " +
-                                    $"arm={proofBrokerProtectionArmUsd:F2}";
-
-
-                                LogMoveSL(
-                                    trade,
-                                    stage,
-                                    validGoldProofSL,
-                                    reason
-                                );
-
-
-                                return RiskDecision.MoveSL(
-                                    stage,
-                                    validGoldProofSL,
-                                    reason
-                                );
-                            }
-
-
-                            if (goldProofStopWouldLockLoss)
-                            {
-                                LogFile.Write(
-                                    $"[{trade.Symbol}] 🟡 GOLD PROOF SL DEFERRED | " +
-                                    $"side={trade.Side} | " +
-                                    $"entry={trade.EntryPrice:F5} | " +
-                                    $"candidateSL={validGoldProofSL:F5} | " +
-                                    $"peak={peakProfit:F2} | " +
-                                    $"profit={currentProfit:F2} | " +
-                                    $"lockUsd={goldProofLockUsd:F2} | " +
-                                    $"reason=broker minimum distance would place stop " +
-                                    $"at breakeven-or-worse"
-                                );
-                            }
-                        }
-
-
                         LogHold(
                             trade,
                             stage,
@@ -1938,25 +1566,19 @@
                             liveOppositeStrongCandle,
                             peakProfit,
                             giveback,
-                            proofBrokerProtectionArmed
-                                ? goldHealthyRunner
-                                    ? "Gold proof stage V3 - healthy, positive broker floor armed"
-                                    : "Gold proof stage V3 - weakening, stronger positive broker floor armed"
-                                : goldHealthyRunner
-                                    ? "Gold proof stage V3 - healthy, waiting for $9 proof"
-                                    : "Gold proof stage V3 - weakening, structure logic remains in control"
+                            goldHealthyRunner
+                                ? "Gold proof stage V2 - healthy, no broker profit stop"
+                                : proofFailureProtectionArmed
+                                    ? "Gold proof stage V2 - weakening, watching breakeven failure"
+                                    : "Gold proof stage V2 - weakening, structure logic remains in control"
                         );
 
 
                         return RiskDecision.Hold(
                             stage,
-                            proofBrokerProtectionArmed
-                                ? goldHealthyRunner
-                                    ? "Gold healthy proof stage V3 - positive floor armed"
-                                    : "Gold weakening proof stage V3 - positive floor armed"
-                                : goldHealthyRunner
-                                    ? "Gold healthy proof stage V3"
-                                    : "Gold weakening proof stage V3"
+                            goldHealthyRunner
+                                ? "Gold healthy proof stage V2"
+                                : "Gold weakening proof stage V2"
                         );
                     }
 
@@ -2228,6 +1850,24 @@
                 if (stage ==
                     RiskStage.Trailing)
                 {
+                    // CASH-only: a trade that previously qualified as a runner
+                    // must not begin a NEW trailing-stop modification after
+                    // its entire unrealized profit has disappeared.
+                    // Request a software close instead; a broker-side stop
+                    // remains the fallback if the close cannot be filled.
+                    if (IsCashIndex(s) &&
+                        peakProfit >= profile.TrailAtProfitUsd &&
+                        currentProfit <= 0.0)
+                    {
+                        string reason =
+                            $"CASH runner profit fully reversed | " +
+                            $"peak={peakProfit:F2} | profit={currentProfit:F2} | " +
+                            $"giveback={giveback:F2} | " +
+                            $"trailArm={profile.TrailAtProfitUsd:F2}";
+                        LogClose(trade, stage, reason);
+                        return RiskDecision.Close(stage, reason);
+                    }
+
                     if (isGold)
                     {
                         // ====================================================
@@ -3143,13 +2783,10 @@
                 //
                 // IMPORTANT:
                 //
-                // $8:
-                // Protected stage begins.
-                //
                 // $9:
-                // Gold Proof V3 arms a small positive broker-side floor.
+                // Peak-dollar protection activates.
                 //
-                // $18:
+                // $15:
                 // ATR runner activates.
                 // ========================================================
 
@@ -3180,8 +2817,8 @@
                         OppositeBodyRatio = 0.62,
 
 
-                        // Protected stage begins at $8, but Gold Proof V3
-                        // does not force a positive broker floor until peak >= $9.
+                        // Gold must prove the move before profit protection
+                        // starts interfering with normal H1 pullbacks.
                         ProtectAtProfitUsd = 8.00,
 
                         ProfitLockAtr = 0.02,
@@ -3212,54 +2849,16 @@
                         FollowThroughEma9FailureAtr = 0.12,
 
 
-                        // Gold-only early transition failure protection.
-                        // Evidence-gated so normal pullbacks and mature runners
-                        // are not touched.
-                        GoldEarlyFailureMaxBars = 1,
-                        GoldEarlyFailureMaxPeakProfitUsd = 10.00,
-                        GoldEarlyFailureAdverseAtr = 0.35,
-                        GoldEarlyFailureEma9FailureAtr = 0.12,
-
-
                         MinStopDistanceAtr = 0.10,
 
-                        // ====================================================
-                        // GENERIC EARLY PROTECTION
-                        //
-                        // Gold continues to bypass the generic early software
-                        // close / broker stop. Gold uses its own modest early
-                        // winner safety floor below.
-                        // ====================================================
+                        // Retained for profile compatibility, but Gold's
+                        // early broker-side profit stop is intentionally bypassed.
+                        // Gold must first prove itself at ProtectAtProfitUsd.
                         EarlyProtectAtProfitUsd = 3.00,
                         EarlyLockPercent = 0.35,
 
                         EarlyBrokerMinDistanceAtr = 0.35,
                         EnableEarlySoftwareClose = false,
-
-                        // ====================================================
-                        // GOLD EARLY WINNER SAFETY
-                        //
-                        // Arm only after Gold has demonstrated at least $5.
-                        // Lock 20% of peak, with a minimum $1 floor and a
-                        // maximum $2 floor before normal Gold protection.
-                        //
-                        // Examples:
-                        //   Peak $5.00  -> lock $1.00
-                        //   Peak $6.75  -> lock $1.35
-                        //   Peak $7.50  -> lock $1.50
-                        //
-                        // ProtectAtProfitUsd ($8) and Gold Proof V3 ($9)
-                        // continue to own the later stages.
-                        // ====================================================
-                        // DISABLED:
-                        // Live Gold showed that a healthy H1 continuation can
-                        // reach roughly +$5/+6, retrace normally, and then resume.
-                        // Do not force a positive broker stop merely because a
-                        // small early profit peak was reached.
-                        GoldEarlyWinnerArmUsd = 0.00,
-                        GoldEarlyWinnerLockPercent = 0.00,
-                        GoldEarlyWinnerMinLockUsd = 0.00,
-                        GoldEarlyWinnerMaxLockUsd = 0.00,
 
                     };
                 }

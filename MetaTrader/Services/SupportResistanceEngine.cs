@@ -184,8 +184,10 @@ namespace MetaTrader.Services
 
         private static double GetMinimumSpaceAtr(string symbol)
         {
+            // GOLD: slightly more permissive normal runway (was 0.40 ATR).
+            // Critical 0.25 ATR no-space protection remains unchanged.
             if (IsGold(symbol))
-                return 0.40;
+                return 0.30;
 
             if (IsCrypto(symbol))
                 return 0.60;
