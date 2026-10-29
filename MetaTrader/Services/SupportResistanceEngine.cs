@@ -1389,6 +1389,35 @@ namespace MetaTrader.Services
                 );
 
 
+            // Keep an ARMED gold release tied to the ORIGINAL frozen wall.
+            // A fresh price-relative nearest-wall lookup can switch levels on
+            // adjacent ticks, even though the watch was armed for one wall.
+            // This applies ONLY after TryTriggerArmedGoldBreakdown succeeded;
+            // normal GOLD entries retain their original nearest-wall logic.
+            if (isArmedBreakdownTrigger && IsGold(symbol))
+            {
+                GoldBreakdownWatch frozen;
+                lock (GoldBreakdownWatchLock)
+                {
+                    GoldBreakdownWatches.TryGetValue(symbol, out frozen);
+                }
+
+                if (frozen != null && frozen.Action == action &&
+                    DateTime.UtcNow - frozen.ArmedAtUtc <=
+                        TimeSpan.FromMinutes(GoldBreakWatchMinutes))
+                {
+                    if (action == TradeAction.EnterSell)
+                        activeSupport = frozen.Wall;
+                    else if (action == TradeAction.EnterBuy)
+                        activeResistance = frozen.Wall;
+
+                    LogFile.Write($"[{symbol}] GOLD ARMED SR ORIGINAL WALL | " +
+                        $"action={action} | frozenWall={frozen.Wall:F5} | " +
+                        $"zoneLow={frozen.ZoneLow:F5} | zoneHigh={frozen.ZoneHigh:F5} | " +
+                        $"price={currentPrice:F5} | source=ARMED_WATCH");
+                }
+            }
+
             // ========================================================
             // SR BAND GEOMETRY
             // ========================================================
