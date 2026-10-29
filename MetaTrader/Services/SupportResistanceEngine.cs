@@ -66,7 +66,10 @@ namespace MetaTrader.Services
         // Preserve an already-approved GOLD acceleration impulse when SR blocks it.
         // This arms MEMORY only; it does NOT permit an entry or lower release requirements.
         private const double GoldBreakArmMinMomentum = 0.30;
-        private const double GoldBreakMinMomentum = 0.45;
+        // Match the qualified GOLD acceleration floor for an ALREADY-ARMED
+        // support/resistance break. This does not relax first-entry detection,
+        // zone clearance, EMA direction, anti-chase or other S/R protections.
+        private const double GoldBreakMinMomentum = 0.30;
 
         // Armed Gold SR breaks must obey the same hard anti-chase distance
         // as the final Gold entry-location gate in LiveImpulseEntryEngine.
