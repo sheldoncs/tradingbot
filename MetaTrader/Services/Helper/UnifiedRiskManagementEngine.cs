@@ -201,6 +201,54 @@
             }
 
 
+            // Diagnostic-only, per tracked trade. Weak keys avoid retaining closed trades.
+            private sealed class GoldStudyState
+            {
+                public int MilestoneMask;
+                public bool ReturnedBelowZero;
+            }
+
+            private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<
+                TrackedTrade, GoldStudyState> GoldStudyStates =
+                new System.Runtime.CompilerServices.ConditionalWeakTable<TrackedTrade, GoldStudyState>();
+
+            private static void RecordGoldProfitStudy(TrackedTrade trade)
+            {
+                if (trade == null || !IsGold(trade.Symbol)) return;
+                double peak = trade.MaxProfitUsd;
+                double profit = trade.ProfitUsd;
+                if (double.IsNaN(peak) || double.IsInfinity(peak) ||
+                    double.IsNaN(profit) || double.IsInfinity(profit)) return;
+
+                GoldStudyState state = GoldStudyStates.GetValue(trade, _ => new GoldStudyState());
+                lock (state)
+                {
+                    double[] milestones = { 2.0, 3.0, 5.0, 8.0 };
+                    for (int i = 0; i < milestones.Length; i++)
+                    {
+                        int flag = 1 << i;
+                        if (peak >= milestones[i] && (state.MilestoneMask & flag) == 0)
+                        {
+                            state.MilestoneMask |= flag;
+                            LogFile.Write($"[{trade.Symbol}] GOLD PROFIT STUDY | " +
+                                $"event=PEAK_MILESTONE | thresholdUsd={milestones[i]:F2} | " +
+                                $"side={trade.Side} | entry={trade.EntryPrice:F5} | " +
+                                $"volume={trade.Volume:F2} | peakUsd={peak:F2} | " +
+                                $"currentUsd={profit:F2}");
+                        }
+                    }
+                    if (!state.ReturnedBelowZero && peak >= 2.0 && profit < 0.0)
+                    {
+                        state.ReturnedBelowZero = true;
+                        LogFile.Write($"[{trade.Symbol}] GOLD PROFIT STUDY | " +
+                            $"event=RETURNED_BELOW_ZERO | side={trade.Side} | " +
+                            $"entry={trade.EntryPrice:F5} | volume={trade.Volume:F2} | " +
+                            $"peakUsd={peak:F2} | currentUsd={profit:F2} | " +
+                            $"givebackUsd={(peak - profit):F2}");
+                    }
+                }
+            }
+
             // ============================================================
             // MAIN RISK EVALUATION
             // ============================================================
@@ -296,6 +344,9 @@
                         trade.ProfitUsd
                     );
 
+
+                // Record peak milestones without influencing any risk decision.
+                RecordGoldProfitStudy(trade);
 
                 double peakProfit =
                     trade.MaxProfitUsd;

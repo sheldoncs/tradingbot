@@ -767,6 +767,22 @@ namespace MetaTrader.Services.Helper
 
                     if (goldAccelerationBuy)
                     {
+                        // STUDY ONLY: snapshot the exact approved acceleration inputs.
+                        // PreviousMomentum is not supplied to TryEnter, so no trend
+                        // assumption is made here. The calling engine can supply it
+                        // in its own diagnostic log without changing this signature.
+                        LogFile.Write(
+                            $"[{symbol}] GOLD ACCELERATION STUDY | action=EnterBuy | " +
+                            $"momentum={momentum:F4} | previousMomentum=unavailable | " +
+                            $"bodyATR={bodyAtrBuy:F4} | emaDistanceATR={distFromEmaBuy:F4} | " +
+                            $"emaSpreadATR={goldAccelerationEmaSpreadAtr:F4} | " +
+                            $"ema9SlopeATR={goldAccelerationEma9SlopeAtr:F4} | " +
+                            $"breakoutATR={breakoutDistanceBuy:F4} | " +
+                            $"bid={bid:F5} | ask={ask:F5} | atr={atr:F5} | " +
+                            $"ema9={ema9:F5} | ema21={ema21:F5} | " +
+                            $"recentHigh={recentHigh:F5} | recentLow={recentLow:F5} | " +
+                            $"liveOpen={liveCandle.open:F5} | liveHigh={liveCandle.high:F5} | " +
+                            $"liveLow={liveCandle.low:F5} | liveClose={liveCandle.close:F5}");
                         action =
                             TradeAction.EnterBuy;
 
@@ -815,6 +831,22 @@ namespace MetaTrader.Services.Helper
 
                     if (goldAccelerationSell)
                     {
+                        // STUDY ONLY: snapshot the exact approved acceleration inputs.
+                        // PreviousMomentum is not supplied to TryEnter, so no trend
+                        // assumption is made here. The calling engine can supply it
+                        // in its own diagnostic log without changing this signature.
+                        LogFile.Write(
+                            $"[{symbol}] GOLD ACCELERATION STUDY | action=EnterSell | " +
+                            $"momentum={momentum:F4} | previousMomentum=unavailable | " +
+                            $"bodyATR={bodyAtrSell:F4} | emaDistanceATR={distFromEmaSell:F4} | " +
+                            $"emaSpreadATR={goldAccelerationEmaSpreadAtr:F4} | " +
+                            $"ema9SlopeATR={goldAccelerationEma9SlopeAtr:F4} | " +
+                            $"breakoutATR={breakoutDistanceSell:F4} | " +
+                            $"bid={bid:F5} | ask={ask:F5} | atr={atr:F5} | " +
+                            $"ema9={ema9:F5} | ema21={ema21:F5} | " +
+                            $"recentHigh={recentHigh:F5} | recentLow={recentLow:F5} | " +
+                            $"liveOpen={liveCandle.open:F5} | liveHigh={liveCandle.high:F5} | " +
+                            $"liveLow={liveCandle.low:F5} | liveClose={liveCandle.close:F5}");
                         action =
                             TradeAction.EnterSell;
 
