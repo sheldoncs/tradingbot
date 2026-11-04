@@ -295,7 +295,12 @@ namespace MetaTrader.Services
                 _fastEntryReservations.Remove(symbol);
         }
 
-        private static DateTime _lastOrderCandleTime = DateTime.MinValue;
+        // GOLD: per-symbol candle entry history, independent of symbol priority.
+        private static readonly System.Collections.Generic.Dictionary<string, DateTime>
+            _lastGoldOrderCandleBySymbol = new System.Collections.Generic.Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        // Serialize the shared-symbol strategy engine; MT5 management and signals must not mix symbols.
+        private static readonly System.Threading.SemaphoreSlim _goldCycleGate =
+            new System.Threading.SemaphoreSlim(1, 1);
         private readonly TradeCoordinator _tradeCoordinator;
         private readonly TimeframeDiversityExecutor _tfExecutor;
         private readonly M15ConfirmationService _m15Service;
@@ -2442,7 +2447,74 @@ namespace MetaTrader.Services
 
             return shouldBlock;
         }
+        // Scan all configured Gold symbols rather than letting the coordinator's
+        // preferred symbol suppress other valid FastEntry opportunities.
+        // This service has shared SYMBOL, ctx, bid/ask fields, so cycles MUST be serialized.
         public async Task RunParallelStrategy(CancellationToken ct)
+        {
+            if (!await _goldCycleGate.WaitAsync(0, ct).ConfigureAwait(false))
+            {
+                LogFile.Write("[GOLD MULTI-SCAN] previous strategy cycle in progress; duplicate timer tick skipped");
+                return;
+            }
+
+            try
+            {
+                string positionOwner = null;
+                lock (_openTradesSync)
+                {
+                    positionOwner = openTrades.FirstOrDefault(t => t != null && t.Ticket != 0)?.Symbol;
+                }
+
+                // Continue managing the current trade using its ACTUAL symbol.
+                // Never change ownership to the highest-ranked opportunity.
+                var scanSymbols = string.IsNullOrWhiteSpace(positionOwner)
+                    ? symbolsToTrade.Where(s => !string.IsNullOrWhiteSpace(s))
+                        .Distinct(StringComparer.OrdinalIgnoreCase).ToList()
+                    : new List<string> { positionOwner };
+
+                foreach (string goldScanSymbol in scanSymbols)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    SYMBOL = goldScanSymbol;
+                    if (!_contexts.TryGetValue(goldScanSymbol, out ctx))
+                    {
+                        ctx = new SymbolContext(goldScanSymbol);
+                        _contexts[goldScanSymbol] = ctx;
+                    }
+                    bid = _client.SymbolInfoDouble(goldScanSymbol, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_BID);
+                    ask = _client.SymbolInfoDouble(goldScanSymbol, ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_ASK);
+                    if (bid <= 0 || ask < bid)
+                    {
+                        LogFile.Write($"[GOLD MULTI-SCAN] {goldScanSymbol} invalid quote; scanning next symbol");
+                        continue;
+                    }
+
+                    LogFile.Write($"[GOLD MULTI-SCAN] evaluating {goldScanSymbol}");
+                    try
+                    {
+                        await RunGoldSymbolCycle(ct);
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                    catch (Exception ex)
+                    {
+                        LogFile.Write($"[GOLD MULTI-SCAN] {goldScanSymbol} evaluation failed: {ex}");
+                    }
+
+                    // One position maximum under the existing execution policy.
+                    // Never submit another order after the first confirmed entry.
+                    if (!string.IsNullOrWhiteSpace(positionOwner) ||
+                        HasAnyOpenPositionBySymbol(goldScanSymbol))
+                        break;
+                }
+            }
+            finally
+            {
+                _goldCycleGate.Release();
+            }
+        }
+
+        private async Task RunGoldSymbolCycle(CancellationToken ct)
         {
             // =========================================================
             // 📈 MARKET DATA + INDICATORS
@@ -2453,6 +2525,11 @@ namespace MetaTrader.Services
             ProbeCurrentXauH1Once();
             _client.CopyRates(SYMBOL, ENUM_TIMEFRAMES.PERIOD_H4, 1, BarsToFetch, out var rates4H);
 
+            if (rates1H == null || rates1H.Length < 22 || rates4H == null || rates4H.Length < 22)
+            {
+                LogFile.Write($"[GOLD MULTI-SCAN] {SYMBOL} insufficient H1/H4 rates");
+                return;
+            }
             var currentCandleTime = rates1H[^1].time;
 
             var emaFast1H = CalculateEMA(rates1H, 9);
@@ -2833,10 +2910,10 @@ namespace MetaTrader.Services
                     _contexts
                 );
 
-                SYMBOL = coordinator.ScanAndSelectSymbol();
-
-                if (string.IsNullOrWhiteSpace(SYMBOL))
-                    return;
+                // Update THIS symbol's state; do not select a single winner.
+                // Every configured metal receives its own independent entry evaluation.
+                coordinator.UpdateSingleSymbol(SYMBOL);
+                LogFile.Write($"[GOLD MULTI-SCAN] {SYMBOL} state updated; independent FastEntry evaluation follows");
 
                 // =========================================================
                 // ✅ RELOAD ALL MARKET DATA FOR THE NEWLY SELECTED SYMBOL
@@ -3191,9 +3268,10 @@ namespace MetaTrader.Services
                             fastAction == TradeAction.EnterSell ? true : false);
 
                     // 🚫 BLOCK SAME CANDLE TRADES
-                    if (_lastOrderCandleTime == currentCandleTime)
+                    if (_lastGoldOrderCandleBySymbol.TryGetValue(SYMBOL, out DateTime goldLastOrderCandle) &&
+                        goldLastOrderCandle == currentCandleTime)
                     {
-                        LogFile.Write($"⛔ Skipped: already traded this candle {currentCandleTime}");
+                        LogFile.Write($"[{SYMBOL}] ⛔ Skipped: already traded this candle {currentCandleTime}");
                         return;
                     }
                     LogFile.Write($"⚡ FAST ENGINE: {fastAction} detected on {SYMBOL} with model {fastModel} IN progress ${_fastOrderInProgress}");
@@ -3377,7 +3455,7 @@ namespace MetaTrader.Services
                             // Leave GlobalTradeManager's account lock unchanged while a position exists.
                             _fastOrderInProgress = false;
                             if (isImpulse) ctx.ImpulseConsumed = true;
-                            _lastOrderCandleTime = currentCandleTime;
+                            _lastGoldOrderCandleBySymbol[reservedFastSymbol] = currentCandleTime;
                             await _notificationService.sendNotification(
                                 $"{fastAction} - {fastModel} — MT5 position confirmed - {reservedFastSymbol}",
                                 _configuration["CHAT_ID"],
