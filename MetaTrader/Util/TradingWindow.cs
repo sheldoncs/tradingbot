@@ -29,7 +29,7 @@ namespace MetaTrader.Util
             // ❌ FRIDAY: Stop completely after 12PM AST
             // --------------------------------------------------
             if (day == DayOfWeek.Friday)
-                return time < TimeSpan.FromHours(17);
+                return time < TimeSpan.FromHours(12);
 
             // --------------------------------------------------
             // ❌ MONDAY–THURSDAY: Block 2PM–6PM AST
@@ -39,7 +39,7 @@ namespace MetaTrader.Util
                 day == DayOfWeek.Wednesday ||
                 day == DayOfWeek.Thursday)
             {
-                if (time >= TimeSpan.FromHours(17) && time < TimeSpan.FromHours(18))
+                if (time >= TimeSpan.FromHours(18) && time < TimeSpan.FromHours(19))
                     return false;
 
                 return true;
