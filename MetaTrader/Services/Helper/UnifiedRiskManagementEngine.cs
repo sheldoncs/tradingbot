@@ -201,6 +201,18 @@
             }
 
 
+            // GOLD profit preservation policy (account currency USD assumed).
+            // The levels are based on observed PEAK profit, not current profit.
+            // The broker SL is requested separately; software closes are a fallback.
+            private static double GoldProfitFloorUsd(double peakUsd)
+            {
+                if (peakUsd >= 18.00) return Math.Max(10.00, peakUsd - 8.00);
+                if (peakUsd >= 13.00) return 6.00;
+                if (peakUsd >= 10.00) return 4.00;
+                if (peakUsd >= 8.00) return 2.00;
+                return 0.00;
+            }
+
             // Diagnostic-only, per tracked trade. Weak keys avoid retaining closed trades.
             private sealed class GoldStudyState
             {
@@ -304,6 +316,16 @@
                         LogClose(trade, RiskStage.Initial, emergencyReason);
                         return RiskDecision.Close(RiskStage.Initial, emergencyReason);
                     }
+                }
+
+                // GOLD profit milestones are used to request broker-side SL only.
+                // Do NOT software-close merely because observed profit crossed a floor.
+                // The existing hard-loss and structural-failure exits are unchanged.
+                if (IsGold(symbol) &&
+                    !double.IsNaN(trade.ProfitUsd) &&
+                    !double.IsInfinity(trade.ProfitUsd))
+                {
+                    trade.MaxProfitUsd = Math.Max(trade.MaxProfitUsd, trade.ProfitUsd);
                 }
 
                 if (atr <= 0 ||
@@ -1497,14 +1519,10 @@
                 // GOLD:
                 // Winner management is health-aware.
                 //
-                // Healthy Gold trade:
-                // - NO broker-side profit stop in the $8-$18 proof stage
-                // - allow normal H1 Gold pullbacks
-                //
-                // Weakening Gold trade:
-                // - existing structural / EMA failure logic remains active
-                // - after a $12+ peak, a deterioration back to roughly
-                //   breakeven can close the trade before it becomes a hard loss
+                // Gold peak-profit floors: $8->$2, $10->$4, $13->$6,
+                // $18->$10, then peak-$8. Broker SL must be accepted and
+                // verified by the calling executor. Software fallback closes
+                // once observed profit falls through the armed floor.
                 //
                 // Other assets:
                 // - retain the original fixed protection behaviour.
@@ -1519,118 +1537,52 @@
 
                     if (isGold)
                     {
-                        // ====================================================
-                        // GOLD PROOF STAGE V2
-                        //
-                        // DATA-DRIVEN CHANGE:
-                        //
-                        // The extended Aug 3 -> Sep 18 replay showed that a
-                        // breakeven/small-positive broker SL in the $8-$18
-                        // proof stage was eliminating a number of trades that
-                        // later became $29+ runners.
-                        //
-                        // Therefore:
-                        //
-                        // 1. DO NOT move a broker-side profit stop merely
-                        //    because peak profit reached $8.
-                        //
-                        // 2. Healthy Gold proof-stage trades receive full
-                        //    breathing room until the $18 runner stage.
-                        //
-                        // 3. Existing failed-follow-through, EMA9 reversal,
-                        //    EMA21 structural-failure and hard-loss logic
-                        //    remain responsible for genuinely bad trades.
-                        //
-                        // 4. Once a trade has shown a meaningful peak
-                        //    ($12+) and subsequently deteriorates all the way
-                        //    back to approximately breakeven while the Gold
-                        //    health classifier is WEAKENING, close it rather
-                        //    than allowing an established winner to become a
-                        //    full hard-loss.
-                        //
-                        // This specifically targets the observed:
-                        //
-                        //   +$9..+$17 -> tiny broker stop -> exit -> +$29+
-                        //
-                        // failure mode without loosening the initial hard-loss.
-                        // ====================================================
+                        double floorUsd = GoldProfitFloorUsd(peakProfit);
+                        bool hasTickValue = tickSize > 0 && tickValue > 0 && trade.Volume > 0;
 
-                        const double proofFailureArmUsd =
-                            12.00;
-
-
-                        const double proofFailureFloorUsd =
-                            0.50;
-
-
-                        bool proofFailureProtectionArmed =
-                            peakProfit >=
-                            proofFailureArmUsd;
-
-
-                        bool proofStageFailedBackToBreakeven =
-                            proofFailureProtectionArmed &&
-                            goldWeakeningRunner &&
-                            currentProfit <=
-                                proofFailureFloorUsd;
-
-
-                        if (proofStageFailedBackToBreakeven)
+                        if (!hasTickValue)
                         {
-                            string reason =
-                                $"Gold proof-stage failure exit | " +
-                                $"peak={peakProfit:F2} | " +
-                                $"profit={currentProfit:F2} | " +
-                                $"arm={proofFailureArmUsd:F2} | " +
-                                $"floor={proofFailureFloorUsd:F2} | " +
-                                $"healthy={goldHealthyRunner} | " +
-                                $"weakening={goldWeakeningRunner} | " +
-                                $"ema9Aligned={priceOnCorrectSideOfEma9} | " +
-                                $"ema9SlopeAligned={ema9SlopeAligned} | " +
-                                $"oppositeEvidence={adverseCandleEvidence}";
-
-
-                            LogClose(
-                                trade,
-                                stage,
-                                reason
-                            );
-
-
-                            return RiskDecision.Close(
-                                stage,
-                                reason
-                            );
+                            LogFile.Write($"[{trade.Symbol}] GOLD PROFIT SL NOT CALCULABLE | " +
+                                $"peak={peakProfit:F2} | floor={floorUsd:F2} | " +
+                                $"tickSize={tickSize} | tickValue={tickValue} | volume={trade.Volume} | " +
+                                "software floor remains active; check broker SL manually");
+                            return RiskDecision.Hold(stage, "Gold profit floor active; broker tick metadata unavailable");
                         }
 
-
-                        LogHold(
+                        double requestedSL = ProfitUsdToStopPrice(
+                            trade, floorUsd, tickSize, tickValue);
+                        double goldProtectedValidSL = NormalizeStopLossToTick(
                             trade,
-                            stage,
-                            currentPrice,
-                            atr,
-                            adverseAtr,
-                            ema21FailureAtr,
-                            closedBodyRatio,
-                            liveBodyRatio,
-                            closedOppositeStrongCandle,
-                            liveOppositeStrongCandle,
-                            peakProfit,
-                            giveback,
-                            goldHealthyRunner
-                                ? "Gold proof stage V2 - healthy, no broker profit stop"
-                                : proofFailureProtectionArmed
-                                    ? "Gold proof stage V2 - weakening, watching breakeven failure"
-                                    : "Gold proof stage V2 - weakening, structure logic remains in control"
-                        );
+                            ValidateStopLoss(trade, requestedSL, bid, ask, minimumStopDistance),
+                            tickSize);
 
+                        // Never claim a dollar floor is guaranteed if broker stop
+                        // rules force the actual stop below the requested price.
+                        bool stillInProfit = trade.Side == TradeSide.Buy
+                            ? goldProtectedValidSL > trade.EntryPrice
+                            : goldProtectedValidSL < trade.EntryPrice;
+                        bool meetsRequestedFloor = trade.Side == TradeSide.Buy
+                            ? goldProtectedValidSL + tickSize * 0.001 >= requestedSL
+                            : goldProtectedValidSL - tickSize * 0.001 <= requestedSL;
 
-                        return RiskDecision.Hold(
-                            stage,
-                            goldHealthyRunner
-                                ? "Gold healthy proof stage V2"
-                                : "Gold weakening proof stage V2"
-                        );
+                        if (stillInProfit && ShouldImproveStop(trade, goldProtectedValidSL, tickSize))
+                        {
+                            string reason = $"GOLD PROTECTED PEAK FLOOR - REQUEST BROKER SL | " +
+                                $"peak={peakProfit:F2} | profit={currentProfit:F2} | " +
+                                $"targetUsd={floorUsd:F2} | requestedSL={requestedSL:F5} | " +
+                                $"validatedSL={goldProtectedValidSL:F5} | fullFloorPossible={meetsRequestedFloor}";
+                            LogMoveSL(trade, stage, goldProtectedValidSL, reason);
+                            return RiskDecision.MoveSL(stage, goldProtectedValidSL, reason);
+                        }
+
+                        if (!stillInProfit || !meetsRequestedFloor)
+                            LogFile.Write($"[{trade.Symbol}] GOLD PROFIT FLOOR SL CONSTRAINED | " +
+                                $"peak={peakProfit:F2} | targetUsd={floorUsd:F2} | " +
+                                $"requestedSL={requestedSL:F5} | goldProtectedValidSL={goldProtectedValidSL:F5} | " +
+                                $"currentProfit={currentProfit:F2} | minimumDistance={minimumStopDistance:F5}");
+
+                        return RiskDecision.Hold(stage,
+                            "Gold profit floor active; retain existing better SL or await broker distance");
                     }
 
 
@@ -2025,33 +1977,9 @@
                                 );
 
 
-                            // Software emergency protection in case price gaps
-                            // through a requested broker stop.
-                            if (currentProfit <=
-                                largeWinnerFloorUsd)
-                            {
-                                string reason =
-                                    $"Gold large-winner protection | " +
-                                    $"peak={peakProfit:F2} | " +
-                                    $"profit={currentProfit:F2} | " +
-                                    $"floor={largeWinnerFloorUsd:F2} | " +
-                                    $"trigger={largeWinnerTriggerUsd:F2} | " +
-                                    $"maxGiveback={largeWinnerMaxGivebackUsd:F2}";
-
-
-                                LogClose(
-                                    trade,
-                                    stage,
-                                    reason
-                                );
-
-
-                                return RiskDecision.Close(
-                                    stage,
-                                    reason
-                                );
-                            }
-
+                            // Preserve the user's preference for broker-side stop movement.
+                            // Do not software-close on peak-profit giveback alone.
+                            // Existing structural / hard-loss exits remain active.
 
                             if (tickSize > 0 &&
                                 tickValue > 0 &&
@@ -2085,6 +2013,23 @@
                             }
                         }
 
+
+                        // Preserve the same GOLD peak-profit floor above $18.
+                        // Healthy runner trailing cannot silently bypass it.
+                        if (tickSize > 0 && tickValue > 0 && trade.Volume > 0)
+                        {
+                            double runnerFloorSL = ProfitUsdToStopPrice(
+                                trade, GoldProfitFloorUsd(peakProfit), tickSize, tickValue);
+                            goldProposedSL = trade.Side == TradeSide.Buy
+                                ? Math.Max(goldProposedSL, runnerFloorSL)
+                                : Math.Min(goldProposedSL, runnerFloorSL);
+                        }
+                        else
+                        {
+                            LogFile.Write($"[{trade.Symbol}] GOLD RUNNER FLOOR SL NOT CALCULABLE | " +
+                                $"peak={peakProfit:F2} | profit={currentProfit:F2} | " +
+                                "software floor remains active; verify broker SL");
+                        }
 
                         double validGoldSL =
                             ValidateStopLoss(
@@ -2868,8 +2813,8 @@
                         OppositeBodyRatio = 0.62,
 
 
-                        // Gold must prove the move before profit protection
-                        // starts interfering with normal H1 pullbacks.
+                        // Gold broker-side peak-profit floor begins at $8.
+                        // At $13 peak, target at least $6 profit.
                         ProtectAtProfitUsd = 8.00,
 
                         ProfitLockAtr = 0.02,

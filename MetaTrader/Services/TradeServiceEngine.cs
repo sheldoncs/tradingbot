@@ -3269,6 +3269,9 @@ namespace MetaTrader.Services
                         LogFile.Write($"[{reservedFastSymbol}] FAST ENTRY DUPLICATE RESERVATION BLOCK");
                         return;
                     }
+                    // True only for the invocation that actually sets the fast-order flag.
+                    // Other overlapping cycles must never clear an owner's flag.
+                    bool ownsFastAttempt = false;
                     try
                     {
                         if (!_fastOrderInProgress)
@@ -3314,8 +3317,9 @@ namespace MetaTrader.Services
 
 
 
-                            // 🔥 ONLY SET HERE
+                            // 🔥 ONLY SET HERE. The reservation remains held through broker reconciliation.
                             _fastOrderInProgress = true;
+                            ownsFastAttempt = true;
 
                             // --------------------------------------------------
                             // 🚫 LAST DEFENCE AGAINST DUPLICATE ENTRIES
@@ -3369,6 +3373,9 @@ namespace MetaTrader.Services
                             }
 
                             // Commit consumption only after the broker has an actual position.
+                            // This flag describes an order attempt, NOT an open MT5 position.
+                            // Leave GlobalTradeManager's account lock unchanged while a position exists.
+                            _fastOrderInProgress = false;
                             if (isImpulse) ctx.ImpulseConsumed = true;
                             _lastOrderCandleTime = currentCandleTime;
                             await _notificationService.sendNotification(
@@ -3377,9 +3384,22 @@ namespace MetaTrader.Services
                                 _configuration["BOT_TOKEN"]);
                             return;
                         }
+                        else
+                        {
+                            LogFile.Write($"[{reservedFastSymbol}] FAST ENTRY FLAG BUSY | " +
+                                "another execution is active or the legacy flag was not reset; " +
+                                "no order submitted by this evaluation");
+                        }
                     }
                     finally
                     {
+                        // Ensure a failed/throwing attempt cannot leave the legacy fast flag stuck.
+                        // The per-symbol reservation remains held through broker verification above.
+                        if (ownsFastAttempt)
+                        {
+                            _fastOrderInProgress = false;
+                            LogFile.Write($"[{reservedFastSymbol}] FAST ENTRY ATTEMPT RELEASED | owner=true");
+                        }
                         ReleaseFastEntry(reservedFastSymbol);
                     }
                 }

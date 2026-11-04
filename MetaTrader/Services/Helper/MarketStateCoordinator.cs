@@ -156,7 +156,135 @@ namespace MetaTrader.Services.Helper
                 UpdateSymbolState(symbol);
             }
 
+            // GOLD: inspect executable live impulse candidates BEFORE selecting
+            // a single symbol by market-state score. This does not place orders,
+            // bypass MT5 position locks, or relax anti-chase rules.
+            string goldImpulseCandidate = SelectQualifiedLiveGoldImpulse();
+            if (!string.IsNullOrWhiteSpace(goldImpulseCandidate))
+                return goldImpulseCandidate;
+
             return ChooseBestSymbol();
+        }
+
+        // ================================================================
+        // GOLD LIVE IMPULSE PRESELECTION
+        // ================================================================
+        // The original selector ranked closed-H1 MarketState and freshness.
+        // That could select XAUEUR while XAUUSD already had a valid live
+        // impulse. Evaluate BOTH symbols against the EXISTING impulse rules.
+        // This is selection only: M15/SR/risk/duplicate/MT5 final guards
+        // remain authoritative inside TradeServiceEngine.
+        // ================================================================
+        private string SelectQualifiedLiveGoldImpulse()
+        {
+            string bestSymbol = null;
+            double bestScore = double.NegativeInfinity;
+
+            foreach (string symbol in _symbols)
+            {
+                if (string.IsNullOrWhiteSpace(symbol) ||
+                    !(NormalizeSymbol(symbol).StartsWith("XAU") ||
+                      NormalizeSymbol(symbol).StartsWith("XAG")))
+                    continue;
+
+                try
+                {
+                    _client.CopyRates(symbol, ENUM_TIMEFRAMES.PERIOD_H1,
+                        1, 120, out MqlRates[] closedH1);
+
+                    if (closedH1 == null || closedH1.Length < 30)
+                        continue;
+
+                    double atr = IndicatorEngine.CalculateATR(closedH1, 14);
+                    double[] ema9Values = IndicatorEngine.CalculateEMA(closedH1, 9);
+                    double[] ema21Values = IndicatorEngine.CalculateEMA(closedH1, 21);
+
+                    if (atr <= 0 || ema9Values == null || ema21Values == null ||
+                        ema9Values.Length < 2 || ema21Values.Length < 1)
+                        continue;
+
+                    double bid = _client.SymbolInfoDouble(symbol,
+                        ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_BID);
+                    double ask = _client.SymbolInfoDouble(symbol,
+                        ENUM_SYMBOL_INFO_DOUBLE.SYMBOL_ASK);
+                    if (bid <= 0 || ask <= bid)
+                        continue;
+
+                    // Match the synthetic live-H1 convention currently used
+                    // by the GOLD FastEntry path. No intrabar wick claims.
+                    double liveOpen = closedH1[^1].close;
+                    double liveMid = (bid + ask) / 2.0;
+                    var synthetic = new MqlRates
+                    {
+                        open = liveOpen,
+                        close = liveMid,
+                        high = Math.Max(liveOpen, liveMid),
+                        low = Math.Min(liveOpen, liveMid)
+                    };
+
+                    // Use CLOSED-bar structural reference. Never derive a
+                    // 'recent high' from a live candle that includes the
+                    // current bid/ask.
+                    double recentHigh = double.NegativeInfinity;
+                    double recentLow = double.PositiveInfinity;
+                    int start = Math.Max(0, closedH1.Length - 20);
+                    for (int i = start; i < closedH1.Length; i++)
+                    {
+                        recentHigh = Math.Max(recentHigh, closedH1[i].high);
+                        recentLow = Math.Min(recentLow, closedH1[i].low);
+                    }
+
+                    var momentum = HybridMomentumEngine.CalculateLive(
+                        liveOpen, bid, ask, closedH1[^1], closedH1,
+                        ema9Values, ema21Values, atr, false);
+
+                    // Match the live-EMA convention in the GOLD engine:
+                    // update the last CLOSED EMA with the current live midpoint.
+                    double liveEma9 = ema9Values[^1] +
+                        (2.0 / (9.0 + 1.0)) * (liveMid - ema9Values[^1]);
+                    double liveEma21 = ema21Values[^1] +
+                        (2.0 / (21.0 + 1.0)) * (liveMid - ema21Values[^1]);
+
+                    bool qualified = LiveImpulseEntryEngine.TryEnter(
+                        symbol, synthetic, atr,
+                        liveEma9, ema9Values[^1], liveEma21,
+                        recentHigh, recentLow, bid, ask, momentum.Hybrid,
+                        out TradeAction action);
+
+                    if (!qualified ||
+                        (action != TradeAction.EnterBuy &&
+                         action != TradeAction.EnterSell))
+                        continue;
+
+                    // A valid signal near EMA9 receives priority over a
+                    // similarly qualified but more extended signal.
+                    double executable = action == TradeAction.EnterBuy ? ask : bid;
+                    double distanceAtr = Math.Abs(executable - liveEma9) / atr;
+                    double score = momentum.Hybrid - distanceAtr * 0.30;
+
+                    LogFile.Write($"[{symbol}] GOLD LIVE SELECTION CANDIDATE | " +
+                        $"action={action} | momentum={momentum.Hybrid:F3} | " +
+                        $"emaDistATR={distanceAtr:F3} | score={score:F3}");
+
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestSymbol = symbol;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Candidate scanning must not stop ordinary symbol
+                    // selection if one broker symbol temporarily fails.
+                    LogFile.Write($"[{symbol}] GOLD LIVE SELECTION ERROR | {ex.Message}");
+                }
+            }
+
+            if (!string.IsNullOrEmpty(bestSymbol))
+                LogFile.Write($"[{bestSymbol}] GOLD LIVE SIGNAL PRIORITIZED | " +
+                    $"reason=qualified_impulse_before_state_score | score={bestScore:F3}");
+
+            return bestSymbol;
         }
 
         private void UpdateSymbolState(string marketSymbol)
