@@ -291,19 +291,29 @@
                 // GOLD EMERGENCY HARD-LOSS FAILSAFE
                 // ========================================================
                 // Evaluate this BEFORE the indicator-data guard. Missing H1
-                // rates or EMA arrays must not disable the existing absolute
-                // GOLD loss ceiling. This does not change entries, normal
-                // movement tolerance, structure rules or runner trailing.
+                // rates or EMA arrays must not disable GOLD loss protection.
+                // Request an early software close at $6, rather than waiting
+                // for the absolute $7 risk ceiling. This is intentionally
+                // independent of ATR, structure, and the entry model.
                 //
-                // Use the position P/L already supplied by the caller.
-                // Broker-side SL and verified order risk remain essential:
+                // Use position P/L supplied by the caller. A RiskDecision.Close
+                // is only an instruction to the caller, not a filled order.
+                // Broker-side SL and verified execution remain essential:
                 // software closes can slip or fail during disconnection.
                 if (IsGold(symbol) &&
                     !double.IsNaN(trade.ProfitUsd) &&
                     !double.IsInfinity(trade.ProfitUsd))
                 {
                     Profile goldSafetyProfile = GetProfile(symbol);
-                    double emergencyLossLimit = goldSafetyProfile.MaxHardLossUsd;
+                    // $6 early close request gives a buffer before the $7
+                    // configured ceiling. ATR must never delay this failsafe.
+                    double emergencyLossLimit = goldSafetyProfile.HardLossUsd;
+                    if (goldSafetyProfile.MaxHardLossUsd > 0)
+                    {
+                        emergencyLossLimit = Math.Min(
+                            emergencyLossLimit,
+                            goldSafetyProfile.MaxHardLossUsd);
+                    }
 
                     if (emergencyLossLimit > 0 &&
                         trade.ProfitUsd <= -emergencyLossLimit)
@@ -311,7 +321,8 @@
                         string emergencyReason =
                             $"GOLD emergency loss failsafe (independent of indicator data) | " +
                             $"profit={trade.ProfitUsd:F2} | " +
-                            $"ceiling=-{emergencyLossLimit:F2}";
+                            $"earlyTrigger=-{emergencyLossLimit:F2} | " +
+                            $"configuredCeiling=-{goldSafetyProfile.MaxHardLossUsd:F2}";
 
                         LogClose(trade, RiskStage.Initial, emergencyReason);
                         return RiskDecision.Close(RiskStage.Initial, emergencyReason);
@@ -429,27 +440,16 @@
                 //
                 // Most symbols continue to use the fixed HardLossUsd value.
                 //
-                // GOLD is allowed to breathe with H1 volatility:
+                // Existing ATR-aware calculation is retained for compatibility:
+                // effective loss = MIN(MAX(fixed floor, ATR USD), maximum cap).
                 //
-                // effective loss =
-                //     MAX(fixed dollar floor, ATR-based dollar loss)
+                // GOLD IMPORTANT: the emergency check above is evaluated first
+                // and requests a close at $6, regardless of ATR or indicators.
+                // The profile's configured absolute ceiling is now $7.
+                // Thus this later ATR calculation cannot postpone GOLD's
+                // early emergency close request.
                 //
-                // then capped by MaxHardLossUsd.
-                //
-                // Example Gold profile:
-                //
-                // HardLossUsd      = $6
-                // HardLossAtrFloor = 0.55 ATR
-                // MaxHardLossUsd   = $10
-                //
-                // If 0.55 ATR is worth $8.20 for the actual trade volume,
-                // the hard loss becomes $8.20.
-                //
-                // If 0.55 ATR is worth $13, the hard loss is capped at $10.
-                //
-                // IMPORTANT:
-                // If tick metadata is unavailable, the engine safely falls
-                // back to the original fixed HardLossUsd value.
+                // Other symbols keep their original hard-loss logic.
                 // ========================================================
 
                 double effectiveHardLossUsd =
@@ -2793,18 +2793,16 @@
                         // ----------------------------------------------------
                         // GOLD VOLATILITY-AWARE HARD LOSS
                         //
-                        // Keep $6 as the minimum emergency loss threshold, but
-                        // do not force-close a normal H1 Gold pullback merely
-                        // because $6 was reached before structure actually failed.
-                        //
-                        // Allow up to 0.55 ATR of adverse movement, converted to
-                        // USD using the real tick value and actual trade volume.
-                        //
-                        // Absolute safety ceiling: $10.
+                        // Request emergency software close at -$6, independent
+                        // of indicator readiness or ATR. Configured upper
+                        // ceiling is $7, NOT a guaranteed realized-loss cap.
+                        // Existing ATR parameter is kept for compatibility.
+                        // Broker-side entry SL must be set and verified by
+                        // the order executor for protection during downtime.
                         // ----------------------------------------------------
                         HardLossUsd = 6.00,
                         HardLossAtrFloor = 0.55,
-                        MaxHardLossUsd = 10.00,
+                        MaxHardLossUsd = 7.00,
 
                         StructuralAdverseAtr = 0.65,
 

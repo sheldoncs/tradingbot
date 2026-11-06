@@ -1,5 +1,6 @@
 ﻿using MetaTrader.Data.Entities;
 using MetaTrader.Enums;
+using MetaTrader.Services.Helper.MetaTrader.Services.Helper;
 using MetaTrader.Services.MetaTrader.Services;
 using MetaTrader.Util;
 using MtApi5;
@@ -569,6 +570,37 @@ namespace MetaTrader.Services.Helper
                         $"bearRegime={ema9 < ema21 && ema9 < ema9Previous}");
                 }
 
+                // =========================================================
+                // GOLD LIVE SWING STRUCTURE - ADDITIVE ENTRY PATH
+                // =========================================================
+                // Preserve normal impulse and armed-breakdown candidates.
+                // Only offer an EXTRA live swing-break candidate when neither
+                // existing detector has produced one. This is NOT a veto.
+                // The candidate must still pass the original follow-through,
+                // opposite-H1, GOLD hard-SR, M15, wick and broker entry checks.
+                bool swingStructureCandidate = false;
+                if (!impulseDetected && IsGold(symbol))
+                {
+                    var swingBreak = SwingStructureEngine.TryDetectLiveBreak(
+                        symbol, rates, atr, bid, ask, liveCandle.open,
+                        ema9, ema21, momentum);
+
+                    if (swingBreak.HasSignal)
+                    {
+                        impulseDetected = true;
+                        impulseAction = swingBreak.Action;
+                        swingStructureCandidate = true;
+
+                        LogFile.Write(
+                            $"[{symbol}] GOLD LIVE SWING BREAK CANDIDATE | " +
+                            $"action={impulseAction} | level={swingBreak.BrokenLevel:F5} | " +
+                            $"extensionATR={swingBreak.ExtensionAtr:F2} | " +
+                            $"bodyATR={swingBreak.BodyAtr:F2} | " +
+                            $"structure={swingBreak.Structure?.Direction} | " +
+                            "status=REQUIRES_EXISTING_GOLD_FASTENTRY_GATES");
+                    }
+                }
+
                 LogFile.Write(
                     $"[{symbol}] <<< IMPULSE ENGINE RESULT | " +
                     $"detected={impulseDetected} | " +
@@ -634,10 +666,15 @@ namespace MetaTrader.Services.Helper
                             : 0.0;
 
 
+                    // A live break of a confirmed swing pivot is a valid
+                    // structural breakout even when the pivot differs from
+                    // the rolling ten-bar high/low. Existing impulses keep
+                    // their original breakout calculation unchanged.
                     bool confirmedBreakout =
-                        impulseAction == TradeAction.EnterBuy
+                        swingStructureCandidate ||
+                        (impulseAction == TradeAction.EnterBuy
                             ? ask > recentHigh
-                            : bid < recentLow;
+                            : bid < recentLow);
 
                     bool followThroughAllowed =
                     FollowThroughEntryEngine.AllowEntry(
