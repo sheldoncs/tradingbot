@@ -1,6 +1,5 @@
 ﻿using AutoMapper;
 using chatgptbot.Util;
-using MetaTrader.Data.Database;
 using MetaTrader.Data.Entities;
 using MetaTrader.Dto;
 using MetaTrader.Enums;
@@ -45,7 +44,6 @@ namespace MetaTrader.Services
     {
         private static DateTime _lastSignalCandleTime = DateTime.MinValue;
         private readonly INotificationService _notificationService;
-        private readonly ITradingDbContext _dbContext;
         private TradingWindow tradingWindow = new TradingWindow();
         private readonly IConfiguration _configuration;
 
@@ -305,7 +303,6 @@ namespace MetaTrader.Services
         private readonly TimeframeDiversityExecutor _tfExecutor;
         private readonly M15ConfirmationService _m15Service;
         private readonly PositionManager _positionManager;
-        private readonly IServiceProvider _provider;
         // -------------------------
 
         // local tracking of open trades (because client's API cannot enumerate MT5 positions)
@@ -479,7 +476,6 @@ namespace MetaTrader.Services
             _m15Service = m15Service;
             _tfExecutor = tfExecutor;
             _client = client;
-            _provider = provider;
             _tradeCoordinator = tradeCoordinator;
             _notificationService = notificationService;
             _configuration = configuration;
@@ -1291,9 +1287,6 @@ namespace MetaTrader.Services
 
             if (!HasAnyOpenPositionBySymbol(ctx.Symbol))
             {
-                GlobalTradeManager.ReleaseTradeLock(
-                    _provider
-                );
             }
 
 
@@ -2629,8 +2622,6 @@ namespace MetaTrader.Services
                             openTrades.Remove(trackedTrade);
                         }
 
-                        GlobalTradeManager.ReleaseTradeLock(_provider);
-
                         currentSignal = null;
                         tradeBegun = false;
                         _orderInProgress = false;
@@ -3281,7 +3272,6 @@ namespace MetaTrader.Services
 
                     //    LogFile.Write($"⚡ FAST ENGINE TRIGGERED: {fastAction} {SYMBOL}");
 
-                    //    if (!GlobalTradeManager.TryAcquireTradeLock(_provider))
                     //    {
                     //        LogFile.Write("❌ FAST ENGINE failed to acquire lock");
                     //        return;
@@ -3308,7 +3298,6 @@ namespace MetaTrader.Services
                     //        else
                     //        {
                     //            LogFile.Write($"⚡ FAST ENGINE: impulse location NOT favorable for {fastAction} on {SYMBOL}");
-                    //            GlobalTradeManager.ReleaseTradeLock(_provider);
                     //            _fastOrderInProgress = false;
                     //            return;
                     //        }
@@ -3356,9 +3345,11 @@ namespace MetaTrader.Services
                         {
                             LogFile.Write($"⚡ FAST ENGINE TRIGGERED: {fastAction} {reservedFastSymbol}");
 
-                            if (!GlobalTradeManager.TryAcquireTradeLock(_provider))
+                            // DB-free replacement for the legacy EF trade lock.
+                            // Preserve the one-Gold-position policy using live MT5 positions.
+                            if (HasAnyManagedGoldBrokerPosition())
                             {
-                                LogFile.Write("❌ FAST ENGINE failed to acquire lock");
+                                LogFile.Write($"[{reservedFastSymbol}] FAST ENTRY BLOCKED | existing GOLD broker position");
                                 return;
                             }
 
@@ -3388,7 +3379,6 @@ namespace MetaTrader.Services
                                         recentLow: missedStudyRecentLow,
                                         hasRealIntrabarExtremes: false);
 
-                                    GlobalTradeManager.ReleaseTradeLock(_provider);
                                     return; // 🚫 DO NOT touch _fastOrderInProgress
                                 }
                             }
@@ -3407,7 +3397,6 @@ namespace MetaTrader.Services
                                 LogFile.Write($"⛔ Trade already exists for {SYMBOL}");
                                 _orderInProgress = false;
                                 _fastOrderInProgress = false;
-                                GlobalTradeManager.ReleaseTradeLock(_provider);
                                 return;
                             }
 
@@ -3446,13 +3435,11 @@ namespace MetaTrader.Services
                                     "candle and impulse remain available for a later signal");
                                 _orderInProgress = false;
                                 _fastOrderInProgress = false;
-                                GlobalTradeManager.ReleaseTradeLock(_provider);
                                 return;
                             }
 
                             // Commit consumption only after the broker has an actual position.
                             // This flag describes an order attempt, NOT an open MT5 position.
-                            // Leave GlobalTradeManager's account lock unchanged while a position exists.
                             _fastOrderInProgress = false;
                             if (isImpulse) ctx.ImpulseConsumed = true;
                             _lastGoldOrderCandleBySymbol[reservedFastSymbol] = currentCandleTime;
@@ -3517,6 +3504,34 @@ namespace MetaTrader.Services
             );
 
             return;
+        }
+
+        // DB-free account-wide GOLD duplicate check. Does not affect other bots.
+        // Use the actual broker symbols (including .s) and this EA's magic number.
+        private static bool HasAnyManagedGoldBrokerPosition()
+        {
+            if (_client == null) return false;
+            lock (_mt5PositionSync)
+            {
+                int total = _client.PositionsTotal();
+                for (int i = 0; i < total; i++)
+                {
+                    ulong positionTicket = _client.PositionGetTicket(i);
+                    if (positionTicket == 0 || !_client.PositionSelectByTicket(positionTicket))
+                        continue;
+
+                    string positionSymbol = _client.PositionGetString(
+                        ENUM_POSITION_PROPERTY_STRING.POSITION_SYMBOL);
+                    long positionMagic = _client.PositionGetInteger(
+                        ENUM_POSITION_PROPERTY_INTEGER.POSITION_MAGIC);
+
+                    if (positionMagic == MAGIC_NUMBER &&
+                        !string.IsNullOrWhiteSpace(positionSymbol) &&
+                        positionSymbol.Contains("XAU", StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+            return false;
         }
 
         bool HasAnyOpenPositionBySymbol(string symbol)
@@ -4429,10 +4444,6 @@ namespace MetaTrader.Services
                     _orderInProgress = false;
                     _fastOrderInProgress = false;
 
-                    GlobalTradeManager.ReleaseTradeLock(
-                        _provider
-                    );
-
                     return;
                 }
 
@@ -4461,13 +4472,18 @@ namespace MetaTrader.Services
                     _orderInProgress = false;
                     _fastOrderInProgress = false;
 
-                    GlobalTradeManager.ReleaseTradeLock(
-                        _provider
-                    );
-
                     return;
                 }
 
+
+                // Preserve the existing one-Gold-position policy without an EF database.
+                if (HasAnyManagedGoldBrokerPosition())
+                {
+                    LogFile.Write($"[{SYMBOL}] ORDER CANCELLED - another GOLD MT5 position exists");
+                    _orderInProgress = false;
+                    _fastOrderInProgress = false;
+                    return;
+                }
 
                 // ----------------------------------------------------
                 // 3. UNIFIED FINAL ENTRY GUARD - GOLD ONLY
@@ -4492,7 +4508,6 @@ namespace MetaTrader.Services
                                       $"preparedPrice={price:F5} | currentPrice={freshExecutionPrice:F5}");
                         _orderInProgress = false;
                         _fastOrderInProgress = false;
-                        GlobalTradeManager.ReleaseTradeLock(_provider);
                         return;
                     }
 
@@ -4587,7 +4602,6 @@ namespace MetaTrader.Services
                                       $"preparedLot={request.Volume:F2} | refreshedLot={finalLotDecision.Lot:F2}");
                         _orderInProgress = false;
                         _fastOrderInProgress = false;
-                        GlobalTradeManager.ReleaseTradeLock(_provider);
                         return;
                     }
 

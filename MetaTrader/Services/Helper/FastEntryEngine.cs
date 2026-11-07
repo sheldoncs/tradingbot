@@ -13,6 +13,133 @@ namespace MetaTrader.Services.Helper
 {
     public static class FastEntryEngine
     {
+        // ============================================================
+        // LIVE FAILURE GUARD: FIVE-MINUTE QUOTE HISTORY
+        // ============================================================
+        // Samples one midpoint per 10 seconds, independently per symbol.
+        // Returns null until a real sample from approximately five minutes
+        // earlier is available. Never fabricates a prior price from H1 bars.
+        private sealed class ImpulsePriceSample
+        {
+            public DateTime Utc;
+            public double Mid;
+        }
+
+        private static readonly object ImpulsePriceHistorySync = new object();
+        private static readonly System.Collections.Generic.Dictionary<string,
+            System.Collections.Generic.List<ImpulsePriceSample>> ImpulsePriceHistory =
+                new System.Collections.Generic.Dictionary<string,
+                    System.Collections.Generic.List<ImpulsePriceSample>>(
+                        System.StringComparer.OrdinalIgnoreCase);
+
+        private static double? ObserveFiveMinutePrice(string symbol, double mid)
+        {
+            if (string.IsNullOrWhiteSpace(symbol) || mid <= 0 ||
+                double.IsNaN(mid) || double.IsInfinity(mid)) return null;
+
+            DateTime now = DateTime.UtcNow;
+            lock (ImpulsePriceHistorySync)
+            {
+                System.Collections.Generic.List<ImpulsePriceSample> samples;
+                if (!ImpulsePriceHistory.TryGetValue(symbol, out samples))
+                {
+                    samples = new System.Collections.Generic.List<ImpulsePriceSample>();
+                    ImpulsePriceHistory[symbol] = samples;
+                }
+
+                samples.RemoveAll(s => (now - s.Utc).TotalMinutes > 7.0);
+                if (samples.Count == 0 ||
+                    (now - samples[samples.Count - 1].Utc).TotalSeconds >= 10.0)
+                {
+                    samples.Add(new ImpulsePriceSample { Utc = now, Mid = mid });
+                }
+
+                DateTime target = now.AddMinutes(-5);
+                ImpulsePriceSample closest = null;
+                double smallestGap = double.MaxValue;
+                foreach (ImpulsePriceSample sample in samples)
+                {
+                    double gap = Math.Abs((sample.Utc - target).TotalSeconds);
+                    if (gap < smallestGap)
+                    {
+                        smallestGap = gap;
+                        closest = sample;
+                    }
+                }
+
+                // If the process has just started (or a data gap exists),
+                // report 5-minute movement as UNKNOWN, not zero.
+                return closest != null && smallestGap <= 30.0
+                    ? (double?)closest.Mid : null;
+            }
+        }
+
+        // Evaluate a candidate just before final approval. Return true ONLY for
+        // an observed compound failure pattern; missing observations fail open.
+        // This is a real live veto, not diagnostic/observation mode.
+        private static bool RejectLiveImpulseFailureRisk(
+            string symbol, TradeAction action, double atr,
+            double bid, double ask, double? fiveMinuteMid,
+            ObservedGoldH1 h1, double currentMomentum,
+            double previousMomentum, double closedEma9,
+            double closedEma21,
+            SupportResistanceEngine.SrEntryDiagnostics sr)
+        {
+            if (!IsGold(symbol) || h1 == null ||
+                (action != TradeAction.EnterBuy && action != TradeAction.EnterSell)) return false;
+
+            try
+            {
+                double mid = (bid + ask) / 2.0;
+                // The existing GOLD wick guard observes midpoint highs/lows.
+                // Convert both that midpoint range and the latest quote to
+                // the same price convention for internal wick geometry.
+                // There is no invented OHLC from synthetic endpoint candles.
+                var snapshot = new LiveImpulseFailurePredictor.Snapshot
+                {
+                    Symbol = symbol,
+                    Side = action == TradeAction.EnterBuy
+                        ? LiveImpulseFailurePredictor.Direction.Buy
+                        : LiveImpulseFailurePredictor.Direction.Sell,
+                    TimestampUtc = DateTime.UtcNow,
+                    Atr = atr,
+                    Bid = mid,
+                    Ask = mid,
+                    LiveOpen = h1.Open,
+                    LiveHigh = Math.Max(h1.High, mid),
+                    LiveLow = Math.Min(h1.Low, mid),
+                    CurrentMomentum = Math.Abs(currentMomentum),
+                    PreviousMomentum = Math.Abs(previousMomentum),
+                    CompletedH1Ema9 = closedEma9,
+                    CompletedH1Ema21 = closedEma21,
+                    PriceFiveMinutesAgo = fiveMinuteMid,
+                    // A rolling ten-H1 high/low is not necessarily a
+                    // compression boundary. Leave unknown until a genuine
+                    // compression detector provides this measurement.
+                    CompressionBoundary = null,
+                    OpposingWallClearanceAtr = sr != null && sr.WallAhead &&
+                        !double.IsNaN(sr.ClearanceAtr) &&
+                        !double.IsInfinity(sr.ClearanceAtr)
+                        ? (double?)sr.ClearanceAtr : null
+                };
+                var result = LiveImpulseFailurePredictor.Evaluate(snapshot);
+                bool reject = LiveImpulseFailurePredictor.ShouldRejectLiveEntry(result);
+                LogFile.Write(result.ToLogLine() +
+                    " | source=GOLD_FASTENTRY_LIVE_CANDIDATE" +
+                    " | fiveMinAvailable=" + fiveMinuteMid.HasValue +
+                    " | wallAhead=" + (sr != null && sr.WallAhead) +
+                    " | decision=" + (reject ? "BLOCK" : "ALLOW"));
+                return reject;
+            }
+            catch (Exception ex)
+            {
+                LogFile.Write($"[{symbol}] IMPULSE FAILURE LIVE GUARD ERROR | " +
+                    $"type={ex.GetType().Name} | reason={ex.Message} | " +
+                    "decision=ALLOW_UNVERIFIED | note=existing safety gates still apply");
+                return false;
+            }
+        }
+
         // GOLD S/R IS ENFORCED FOR LIVE IMPULSE ENTRIES.
         // SupportResistanceEngine supplies the relaxed normal runway (0.30 ATR).
         // Keep the critical no-space, breakout, next-wall, and EMA protections.
@@ -177,6 +304,12 @@ namespace MetaTrader.Services.Helper
                 double liveMid =
                     (bid + ask) /
                     2.0;
+
+                // Collect live quote history on every GOLD evaluation, not
+                // only when a candidate passes the approval pipeline.
+                double? goldFiveMinuteMid = IsGold(symbol)
+                    ? ObserveFiveMinutePrice(symbol, liveMid)
+                    : null;
 
 
                 // =========================================================
@@ -947,6 +1080,25 @@ namespace MetaTrader.Services.Helper
                     // Directional current-H1 wick protection (same thresholds as CASH/FX).
                     if (!PassesObservedGoldH1WickGuard(symbol, observedGoldH1, atr, bid, ask, impulseAction))
                     {
+                        tradeType = TradeType.None;
+                        isImpulse = false;
+                        return (TradeAction.DoNothing, EntryModel.Nothing);
+                    }
+
+                    // LIVE impulse failure protection, after existing M15, S/R,
+                    // follow-through and wick checks, before entry approval.
+                    // A score by itself never vetoes: only a verified compound
+                    // exhaustion/rejection pattern can block this candidate.
+                    if (RejectLiveImpulseFailureRisk(
+                        symbol, impulseAction, atr, bid, ask,
+                        goldFiveMinuteMid, observedGoldH1,
+                        momentum, previousMomentum,
+                        closedEma9, closedEma21,
+                        impulseSrDiagnostics))
+                    {
+                        LogFile.Write($"[{symbol}] GOLD IMPULSE ENTRY BLOCKED | " +
+                            $"action={impulseAction} | " +
+                            "reason=LIVE_PREDICTED_EXHAUSTION_AND_REJECTION");
                         tradeType = TradeType.None;
                         isImpulse = false;
                         return (TradeAction.DoNothing, EntryModel.Nothing);
