@@ -16,8 +16,8 @@ namespace MetaTrader.Util
 
         private static readonly HashSet<string> MetalSymbols = new()
         {
-            "XAUUSD",
-            "XAUEUR",
+            "XAUUSD.s",
+            "XAUEUR.s",
 
         };
 

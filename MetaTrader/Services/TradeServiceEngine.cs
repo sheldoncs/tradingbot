@@ -351,9 +351,9 @@ namespace MetaTrader.Services
 
         List<string> symbolsToTrade = new()
         {
-            "XAUUSD",
+            "XAUUSD.s",
             //"SOLUSD",
-            "XAUEUR"
+            "XAUEUR.s"
         };
 
         /*

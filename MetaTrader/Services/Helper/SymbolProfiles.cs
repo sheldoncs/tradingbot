@@ -10,12 +10,12 @@ namespace MetaTrader.Services.Helper
             new Dictionary<string, SymbolProfile>(StringComparer.OrdinalIgnoreCase)
             {
                 // 🟡 GOLD (fast, spiky, dangerous late entries)
-                ["XAUUSD"] = new SymbolProfile
+                ["XAUUSD.s"] = new SymbolProfile
                 {
                     WeakStructureThreshold = 0.25,
                     ExtensionFactor = 0.6
                 },
-                ["XAUEUR"] = new SymbolProfile
+                ["XAUEUR.s"] = new SymbolProfile
                 {
                     WeakStructureThreshold = 0.25,
                     ExtensionFactor = 0.6

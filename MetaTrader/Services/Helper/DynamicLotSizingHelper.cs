@@ -74,7 +74,7 @@ namespace MetaTrader.Services.Helper
             // -----------------------------
             // GOLD / METALS
             // -----------------------------
-            ["XAUUSD"] = new SymbolLotProfile
+            ["XAUUSD.s"] = new SymbolLotProfile
             {
                 BaseLot = 0.01,
                 VolatilityFactor = 0.80,
@@ -84,7 +84,7 @@ namespace MetaTrader.Services.Helper
                 ContractSize = 100
             },
 
-            ["XAUEUR"] = new SymbolLotProfile
+            ["XAUEUR.s"] = new SymbolLotProfile
             {
                 BaseLot = 0.01,
                 VolatilityFactor = 0.75,
@@ -629,9 +629,6 @@ namespace MetaTrader.Services.Helper
 
             if (Profiles.ContainsKey(symbol))
                 return Profiles[symbol];
-
-            if (IsGold(symbol))
-                return Profiles["XAUUSD"];
 
             if (IsCrypto(symbol))
                 return Profiles["ETHUSD"];

@@ -202,7 +202,7 @@ namespace MetaTrader.Services
             try
             {
                 LogFile.Write("Connecting to MT5...");
-                _client.BeginConnect("127.0.0.1", 8228);
+                _client.Connect("127.0.0.1", 8228);
             }
             catch (Exception ex)
             {

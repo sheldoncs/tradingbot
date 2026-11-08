@@ -80,8 +80,8 @@ namespace MetaTrader.Util
 
         private static readonly HashSet<string> GoldSymbols = new()
         {
-            "XAUUSD",
-            "XAUEUR"
+            "XAUUSD.s",
+            "XAUEUR.s"
         };
 
         private MarketUniverse GetUniverse(string symbol)
