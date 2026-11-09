@@ -153,21 +153,7 @@ namespace MetaTrader.Controllers
                 return BadRequest("SignalR connection ID is required.");
             }
 
-            bool isIis =
-                Environment.GetEnvironmentVariable(
-                    "ASPNETCORE_IIS_PHYSICAL_PATH") != null ||
-                Environment.GetEnvironmentVariable(
-                    "ASPNETCORE_IIS_SITE_NAME") != null;
-
-            if (!isIis)
-            {
-                return Conflict(new
-                {
-                    status = 409,
-                    message = "Trading start is restricted to IIS."
-                });
-            }
-
+            
             await _startLock.WaitAsync(cancellationToken);
 
             try
