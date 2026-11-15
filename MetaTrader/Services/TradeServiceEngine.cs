@@ -57,6 +57,32 @@ namespace MetaTrader.Services
             catch (System.Exception) { /* Dashboard must never interrupt MT5 logic. */ }
         }
 
+        // Dashboard-only throttle. This never gates risk evaluation or MT5 orders.
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, long>
+            _goldTelemetryPositionTicks = new System.Collections.Concurrent.ConcurrentDictionary<ulong, long>();
+        private static readonly long _goldTelemetryIntervalTicks = TimeSpan.FromSeconds(5).Ticks;
+
+        private static bool ShouldPublishGoldPositionTelemetry(ulong positionTicket)
+        {
+            if (positionTicket == 0) return false;
+            long now = DateTime.UtcNow.Ticks;
+            while (true)
+            {
+                if (!_goldTelemetryPositionTicks.TryGetValue(positionTicket, out long last))
+                {
+                    if (_goldTelemetryPositionTicks.TryAdd(positionTicket, now)) return true;
+                    continue;
+                }
+                if (now - last < _goldTelemetryIntervalTicks) return false;
+                if (_goldTelemetryPositionTicks.TryUpdate(positionTicket, now, last)) return true;
+            }
+        }
+
+        private static void ForgetGoldPositionTelemetry(ulong positionTicket)
+        {
+            _goldTelemetryPositionTicks.TryRemove(positionTicket, out _);
+        }
+
         // ============================================================
         // GOLD LIVE ADVERSE-MOVE EXIT ASSESSMENT
         // Called by the existing position risk loop; never issues broker orders directly.
@@ -665,6 +691,7 @@ namespace MetaTrader.Services
                     openTrades.Remove(trade);
                     // Position no longer exists at broker; do not claim realized P/L
                     // without broker history verification.
+                    ForgetGoldPositionTelemetry(trade.Ticket);
                     PublishLive(ui => ui.PublishPositionClosed(
                         trade.Symbol, trade.Ticket.ToString()));
                 }
@@ -5904,6 +5931,11 @@ namespace MetaTrader.Services
                             failedEntryExitPrice
                         );
 
+                        // Telemetry only: closure was independently confirmed above.
+                        ForgetGoldPositionTelemetry(t.Ticket);
+                        publishLive?.Invoke(ui => ui.PublishPositionClosed(
+                            t.Symbol, t.Ticket.ToString()));
+
                         // CloseTradeByTicket may already have removed it.
                         // RemoveAll is deliberately idempotent.
                         lock (_openTradesSync)
@@ -6184,22 +6216,32 @@ namespace MetaTrader.Services
                         riskDecision.Stage, predictorReason);
                 }
 
-                // Position snapshot from the broker values read in this management cycle.
-                // P/L, SL, TP and volume are refreshed above before Evaluate().
-                publishLive?.Invoke(ui => ui.PublishPosition(
-                    t.Symbol, t.Ticket.ToString(), t.Side.ToString(),
-                    (decimal)t.Volume, (decimal)t.EntryPrice,
-                    (decimal)t.StopLoss, (decimal)t.TakeProfit,
-                    (decimal)t.ProfitUsd, (decimal)t.MaxProfitUsd,
-                    riskDecision.Stage.ToString()));
+                // Observation only: broker values were verified above. Throttle the
+                // dashboard feed, never the Evaluate() call or broker order execution.
+                // Publish a terminal risk decision immediately even between snapshots.
+                bool shouldPublishTelemetry = ShouldPublishGoldPositionTelemetry(t.Ticket);
+                if (publishLive != null &&
+                    (shouldPublishTelemetry ||
+                     riskDecision.Action != UnifiedRiskManagementEngine.RiskAction.Hold))
+                {
+                    publishLive(ui =>
+                    {
+                        if (shouldPublishTelemetry)
+                            ui.PublishPosition(
+                                t.Symbol, t.Ticket.ToString(), t.Side.ToString(),
+                                (decimal)t.Volume, (decimal)t.EntryPrice,
+                                (decimal)t.StopLoss, (decimal)t.TakeProfit,
+                                (decimal)t.ProfitUsd, (decimal)t.MaxProfitUsd,
+                                riskDecision.Stage.ToString());
 
-                // Actual risk-engine decision, not a command from the dashboard.
-                publishLive?.Invoke(ui => ui.PublishRisk(
-                    t.Symbol, t.Ticket.ToString(), riskDecision.Action.ToString(),
-                    riskDecision.Stage.ToString(), riskDecision.Reason,
-                    (decimal)t.ProfitUsd, (decimal)t.MaxProfitUsd,
-                    riskDecision.Action == UnifiedRiskManagementEngine.RiskAction.MoveStopLoss
-                        ? (decimal?)riskDecision.NewStopLoss : null));
+                        ui.PublishRisk(
+                            t.Symbol, t.Ticket.ToString(), riskDecision.Action.ToString(),
+                            riskDecision.Stage.ToString(), riskDecision.Reason,
+                            (decimal)t.ProfitUsd, (decimal)t.MaxProfitUsd,
+                            riskDecision.Action == UnifiedRiskManagementEngine.RiskAction.MoveStopLoss
+                                ? (decimal?)riskDecision.NewStopLoss : null);
+                    });
+                }
 
                 LogFile.Write(
                     $"[{t.Symbol}] Unified Risk Decision | " +
@@ -6470,6 +6512,10 @@ namespace MetaTrader.Services
                                     t.Side == TradeSide.Buy ? bid : ask
                                 );
 
+                                // Broker confirms exact ticket no longer open.
+                                ForgetGoldPositionTelemetry(t.Ticket);
+                                publishLive?.Invoke(ui => ui.PublishPositionClosed(
+                                    t.Symbol, t.Ticket.ToString()));
                                 openTrades.Remove(t);
                             }
                             else
