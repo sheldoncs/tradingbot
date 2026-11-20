@@ -213,6 +213,16 @@
                 return 0.00;
             }
 
+            // Mandatory 60% floor from the existing profile activation threshold.
+            // Existing stronger milestone floors remain in force.
+            private static double GoldMandatoryProfitFloorUsd(double peakUsd, Profile profile)
+            {
+                double floor = GoldProfitFloorUsd(peakUsd);
+                if (peakUsd >= profile.ProtectAtProfitUsd)
+                    floor = Math.Max(floor, peakUsd * 0.60);
+                return floor;
+            }
+
             // Diagnostic-only, per tracked trade. Weak keys avoid retaining closed trades.
             private sealed class GoldStudyState
             {
@@ -441,14 +451,24 @@
                     }
                 }
 
-                // GOLD profit milestones are used to request broker-side SL only.
-                // Do NOT software-close merely because observed profit crossed a floor.
-                // The existing hard-loss and structural-failure exits are unchanged.
+                // GOLD minimum milestone floor is independent of trend health.
+                // Check before indicator validation; software close backs up broker SL.
                 if (IsGold(symbol) &&
                     !double.IsNaN(trade.ProfitUsd) &&
                     !double.IsInfinity(trade.ProfitUsd))
                 {
                     trade.MaxProfitUsd = Math.Max(trade.MaxProfitUsd, trade.ProfitUsd);
+                    double minimumFloorUsd = GoldMandatoryProfitFloorUsd(trade.MaxProfitUsd, GetProfile(symbol));
+                    if (minimumFloorUsd > 0 && trade.ProfitUsd <= minimumFloorUsd)
+                    {
+                        RiskStage floorStage = trade.MaxProfitUsd >= GetProfile(symbol).TrailAtProfitUsd
+                            ? RiskStage.Trailing : RiskStage.Protected;
+                        string reason = $"GOLD MANDATORY 60% PROFIT FLOOR CROSSED | " +
+                            $"peak={trade.MaxProfitUsd:F2} | profit={trade.ProfitUsd:F2} | " +
+                            $"floor={minimumFloorUsd:F2}";
+                        LogClose(trade, floorStage, reason);
+                        return RiskDecision.Close(floorStage, reason);
+                    }
                 }
 
                 if (atr <= 0 ||
@@ -1708,9 +1728,9 @@
                 // GOLD:
                 // Winner management is health-aware.
                 //
-                // GOLD: a $8 peak alone does NOT move SL. Protected-stage
-                // stops require persistent structural weakening and >= $12 peak.
-                // Runner-stage (>= $18) protection retains existing behavior.
+                // GOLD: original milestone floors apply without weakness.
+                // Confirmed weakness adds the stronger conditional protection.
+                // Runner-stage (>= $18) adaptive trailing remains unchanged.
                 //
                 // Other assets:
                 // - retain the original fixed protection behaviour.
@@ -1725,17 +1745,17 @@
 
                     if (isGold)
                     {
-                        // Existing gold weakening confirmation now arms the
-                        // persistent 60%-of-peak (or peak-minus-$7) floor.
-                        double floorUsd = goldConditionalFloorUsd;
-                        if (!goldConditionalLockArmed || floorUsd <= 0)
+                        // Always preserve the original minimum milestone floor.
+                        // Confirmed weakness may raise it, but cannot disable it.
+                        double floorUsd = Math.Max(GoldMandatoryProfitFloorUsd(peakProfit, profile), goldConditionalFloorUsd);
+                        if (floorUsd <= 0)
                         {
                             LogFile.Write($"[{trade.Symbol}] GOLD PROTECTED HOLD - RUNNER ROOM | " +
                                 $"peak={peakProfit:F2} | profit={currentProfit:F2} | " +
                                 $"healthy={goldHealthyRunner} | weakening={goldWeakeningRunner} | " +
                                 $"conditionalLockArmed={goldConditionalLockArmed} | " +
-                                "waiting for sustained weakness before 60% lock");
-                            return RiskDecision.Hold(stage, "Gold protected: awaiting confirmed weakening");
+                                "waiting for profit protection activation");
+                            return RiskDecision.Hold(stage, "Gold protected: no mandatory or additional floor yet");
                         }
 
                         bool hasTickValue = tickSize > 0 && tickValue > 0 && trade.Volume > 0;
@@ -1762,7 +1782,8 @@
 
                         if (locksPositive && ShouldImproveStop(trade, validatedSL, tickSize))
                         {
-                            string reason = $"GOLD 60% CONDITIONAL LOCK - REQUEST BROKER SL | " +
+                            string reason = $"GOLD MINIMUM / CONDITIONAL LOCK - REQUEST BROKER SL | " +
+                                $"conditionalLockArmed={goldConditionalLockArmed} | " +
                                 $"peak={peakProfit:F2} | profit={currentProfit:F2} | " +
                                 $"healthy={goldHealthyRunner} | targetUsd={floorUsd:F2} | " +
                                 $"requestedSL={requestedSL:F5} | validatedSL={validatedSL:F5} | " +
@@ -2213,7 +2234,7 @@
                         if (tickSize > 0 && tickValue > 0 && trade.Volume > 0)
                         {
                             double runnerFloorSL = ProfitUsdToStopPrice(
-                                trade, GoldProfitFloorUsd(peakProfit), tickSize, tickValue);
+                                trade, GoldMandatoryProfitFloorUsd(peakProfit, profile), tickSize, tickValue);
                             goldProposedSL = trade.Side == TradeSide.Buy
                                 ? Math.Max(goldProposedSL, runnerFloorSL)
                                 : Math.Min(goldProposedSL, runnerFloorSL);
