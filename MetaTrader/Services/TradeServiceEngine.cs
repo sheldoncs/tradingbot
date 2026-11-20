@@ -2054,418 +2054,362 @@ namespace MetaTrader.Services
             return 1.00;
         }
 
-        private bool ShouldAvoidChoppyMarket(
-    SymbolContext ctx,
-    MqlRates[] rates,
-    double[] emaFast,
-    double[] emaSlow,
-    double atr,
-    MqlRates liveCandle,
-    double livePrice)
+        // GOLD: do not accept a transient EMA lean or a single large candle
+        // as an escape from a sideways market. Track real range breaks separately
+        // for XAUUSD and XAUEUR; observations reset when the setup weakens.
+        private sealed class GoldRangeEscapeCandidate
         {
-            // ========================================================
-            // VALIDATION
-            // ========================================================
+            public int Direction; // +1 BUY, -1 SELL
+            public double Boundary;
+            public DateTime FirstSeenUtc;
+        }
 
-            if (ctx == null ||
-                rates == null ||
-                rates.Length < 6 ||
-                emaFast == null ||
-                emaFast.Length < 2 ||
-                emaSlow == null ||
-                emaSlow.Length < 2 ||
-                atr <= 0)
+        private static readonly object _goldRangeEscapeSync = new object();
+        private static readonly Dictionary<string, GoldRangeEscapeCandidate>
+            _goldRangeEscapeBySymbol =
+                new Dictionary<string, GoldRangeEscapeCandidate>(StringComparer.OrdinalIgnoreCase);
+
+        // Separate persistence for emerging trends; never inherit a range-escape timer.
+        private sealed class GoldEmergingTrendCandidate
+        {
+            public int Direction;
+            public string BarTime;
+            public DateTime FirstSeenUtc;
+            public DateTime LastSeenUtc;
+        }
+
+        private static readonly Dictionary<string, GoldEmergingTrendCandidate>
+            _goldEmergingTrendBySymbol =
+                new Dictionary<string, GoldEmergingTrendCandidate>(StringComparer.OrdinalIgnoreCase);
+
+        // GOLD FINAL MOMENTUM-EXHAUSTION GUARD (XAUUSD / XAUEUR).
+        // Target a narrowly defined weak, sharply fading signal at a recent
+        // structural boundary. Do not reject trend entries merely because
+        // momentum is lower than its prior reading.
+        // Runs after FastEntry's existing impulse/M15/SR/wick approvals, but
+        // before any broker-order attempt. No effect on live position exits.
+        private static bool RejectGoldWeakBoundaryEntry(
+            string symbol, TradeAction action, MqlRates[] closedH1,
+            double atr, double liveOpen, double bid, double ask,
+            double momentum, double previousMomentum, EntryModel model)
+        {
+            if (string.IsNullOrWhiteSpace(symbol) ||
+                !(symbol.StartsWith("XAU", StringComparison.OrdinalIgnoreCase) ||
+                  symbol.StartsWith("GOLD", StringComparison.OrdinalIgnoreCase)) ||
+                (action != TradeAction.EnterBuy && action != TradeAction.EnterSell) ||
+                closedH1 == null || closedH1.Length < 6 ||
+                atr <= 0 || double.IsNaN(atr) || double.IsInfinity(atr) ||
+                bid <= 0 || ask < bid || liveOpen <= 0 ||
+                double.IsNaN(momentum) || double.IsInfinity(momentum) ||
+                double.IsNaN(previousMomentum) || double.IsInfinity(previousMomentum))
+                return false; // Existing entry gates remain responsible for invalid data.
+
+            bool buy = action == TradeAction.EnterBuy;
+            double mid = (bid + ask) * 0.5;
+            double directionalBodyAtr = (buy ? mid - liveOpen : liveOpen - mid) / atr;
+            double boundary = buy
+                ? closedH1.Skip(closedH1.Length - 6).Max(r => r.high)
+                : closedH1.Skip(closedH1.Length - 6).Min(r => r.low);
+            double executablePrice = buy ? ask : bid;
+            double boundaryDistanceAtr = Math.Abs(executablePrice - boundary) / atr;
+
+            // Require all warning signs together: a large decline in the
+            // existing nonnegative hybrid-strength metric, weak present
+            // strength, insufficient directional body, and price near the
+            // six-completed-H1 structural edge. A strong breakout is not vetoed.
+            bool severeFade = previousMomentum >= 0.60 &&
+                              momentum >= 0.0 &&
+                              momentum <= previousMomentum * 0.45;
+            bool weakNow = momentum <= 0.55;
+            bool weakDirectionalBody = directionalBodyAtr < 0.65;
+            bool nearBoundary = boundaryDistanceAtr <= 0.30;
+            bool reject = severeFade && weakNow && weakDirectionalBody && nearBoundary;
+
+            if (reject)
+                LogFile.Write($"[{symbol}] GOLD FINAL MOMENTUM EXHAUSTION BLOCK | " +
+                    $"action={action} | model={model} | momentum={momentum:F3} | " +
+                    $"previousMomentum={previousMomentum:F3} | " +
+                    $"bodyATR={directionalBodyAtr:F3} | " +
+                    $"boundary={boundary:F5} | boundaryDistanceATR={boundaryDistanceAtr:F3} | " +
+                    "reason=SEVERE_FADE_WEAK_BODY_NEAR_H1_BOUNDARY");
+            return reject;
+        }
+
+        // Established trend classification only: six completed H1 bars provide
+        // historical confirmation independently of current impulse strength.
+        // Candle colour is deliberately not used. This does not approve orders.
+        internal static int GetEstablishedChopTrendDirection(
+            MqlRates[] closedRates, double[] closedEmaFast, double[] closedEmaSlow,
+            double atr, double livePrice)
+        {
+            if (closedRates == null || closedRates.Length < 6 ||
+                closedEmaFast == null || closedEmaFast.Length < 3 ||
+                closedEmaSlow == null || closedEmaSlow.Length < 3 ||
+                (double.IsNaN(atr) || double.IsInfinity(atr)) || atr <= 0 ||
+                (double.IsNaN(livePrice) || double.IsInfinity(livePrice)) || livePrice <= 0)
+                return 0;
+
+            double e9 = closedEmaFast[^1], e21 = closedEmaSlow[^1];
+            if (double.IsNaN(e9) || double.IsInfinity(e9) || e9 <= 0 ||
+                double.IsNaN(e21) || double.IsInfinity(e21) || e21 <= 0)
+                return 0;
+            double l9 = e9 + 0.20 * (livePrice - e9);
+            double l21 = e21 + (2.0 / 22.0) * (livePrice - e21);
+            if (Math.Abs(e9 - e21) / atr < 0.40 || Math.Abs(l9 - l21) / atr < 0.30)
+                return 0;
+
+            int side = e9 > e21 ? 1 : -1;
+            // Both closed EMAs must progress in the same direction over two
+            // completed intervals, and live price must maintain that alignment.
+            for (int i = 1; i <= 2; i++)
             {
-                LogFile.Write(
-                    $"[{ctx?.Symbol ?? "UNKNOWN"}] ❌ CHOP FILTER INVALID INPUT | " +
-                    $"ctxNull={ctx == null} | " +
-                    $"ratesNull={rates == null} | " +
-                    $"ratesLength={(rates == null ? -1 : rates.Length)} | " +
-                    $"emaFastNull={emaFast == null} | " +
-                    $"emaFastLength={(emaFast == null ? -1 : emaFast.Length)} | " +
-                    $"emaSlowNull={emaSlow == null} | " +
-                    $"emaSlowLength={(emaSlow == null ? -1 : emaSlow.Length)} | " +
-                    $"ATR={atr:F5}"
-                );
+                int j = closedEmaFast.Length - i;
+                int k = closedEmaSlow.Length - i;
+                if (double.IsInfinity(closedEmaFast[j - 1]) || double.IsInfinity(closedEmaSlow[k - 1]))
+                    return 0;
+                if (!(side * (closedEmaFast[j] - closedEmaFast[j - 1]) > 0 &&
+                      side * (closedEmaSlow[k] - closedEmaSlow[k - 1]) > 0))
+                    return 0;
+            }
+            if (!(side * (l9 - l21) > 0 && side * (livePrice - l9) > 0 &&
+                  side * (livePrice - l21) > 0 && side * (l9 - e9) > 0 &&
+                  side * (l21 - e21) > 0))
+                return 0;
 
+            int start = closedRates.Length - 6;
+            double earlyHigh = 0, earlyLow = 0, lateHigh = 0, lateLow = 0;
+            int advancingHighs = 0, advancingLows = 0;
+            for (int i = start; i < closedRates.Length; i++)
+            {
+                var bar = closedRates[i];
+                if ((double.IsNaN(bar.high) || double.IsInfinity(bar.high)) || (double.IsNaN(bar.low) || double.IsInfinity(bar.low)) ||
+                    bar.low <= 0 || bar.high < bar.low ||
+                    (i > start && bar.time <= closedRates[i - 1].time))
+                    return 0;
+                if (i < start + 3) { earlyHigh += bar.high; earlyLow += bar.low; }
+                else { lateHigh += bar.high; lateLow += bar.low; }
+                if (i > start)
+                {
+                    if (side * (bar.high - closedRates[i - 1].high) > 0) advancingHighs++;
+                    if (side * (bar.low - closedRates[i - 1].low) > 0) advancingLows++;
+                }
+            }
+            // Allow normal pullbacks, but require both the highs and lows of
+            // the recent half to shift directionally by at least 0.15 ATR.
+            if (advancingHighs < 2 || advancingLows < 2 ||
+                !(side * (lateHigh - earlyHigh) / 3.0 >= 0.15 * atr &&
+                  side * (lateLow - earlyLow) / 3.0 >= 0.15 * atr &&
+                  side * (closedRates[^1].close - closedRates[start].close) >= 0.25 * atr))
+                return 0;
+            return side;
+        }
+
+        private bool ShouldAvoidChoppyMarket(
+            SymbolContext ctx,
+            MqlRates[] rates,
+            double[] emaFast,
+            double[] emaSlow,
+            double atr,
+            MqlRates liveCandle,
+            double livePrice,
+            double momentum,
+            out int emergingDirection)
+        {
+            emergingDirection = 0;
+            // Called before FastEntryEngine: includes impulses, structural
+            // break candidates, and all other entries from this service.
+            if (ctx == null || string.IsNullOrWhiteSpace(ctx.Symbol) ||
+                rates == null || rates.Length < 8 ||
+                emaFast == null || emaFast.Length < 2 ||
+                emaSlow == null || emaSlow.Length < 2 ||
+                atr <= 0 || double.IsNaN(atr) || double.IsInfinity(atr) ||
+                livePrice <= 0 || double.IsNaN(livePrice) || double.IsInfinity(livePrice) ||
+                liveCandle.open <= 0 || double.IsNaN(liveCandle.open))
+            {
+                if (ctx != null && !string.IsNullOrWhiteSpace(ctx.Symbol))
+                {
+                    lock (_goldRangeEscapeSync)
+                        _goldEmergingTrendBySymbol.Remove(ctx.Symbol);
+                }
+                LogFile.Write($"[{ctx?.Symbol ?? "UNKNOWN"}] GOLD CHOP DATA INVALID | decision=BLOCK");
                 return true;
             }
 
+            string symbol = ctx.Symbol;
+            double ema9 = emaFast[^1];
+            double ema21 = emaSlow[^1];
+            double priorEma9 = emaFast[^2];
+            double spreadAtr = Math.Abs(ema9 - ema21) / atr;
+            double liveBodyAtr = Math.Abs(livePrice - liveCandle.open) / atr;
 
-            // ========================================================
-            // CLOSED CANDLES
-            //
-            // rates[^1] is the latest CLOSED H1 candle.
-            // These are used only for historical chop / alternation.
-            // ========================================================
-
-            var c0 = rates[^1];
-            var c1 = rates[^2];
-            var c2 = rates[^3];
-            var c3 = rates[^4];
-
-
-            double ema9 =
-                emaFast[^1];
-
-            double ema9Prev =
-                emaFast[^2];
-
-
-            double ema21 =
-                emaSlow[^1];
-
-            double ema21Prev =
-                emaSlow[^2];
-
-
-            // ========================================================
-            // EMA / LIVE PRICE STRUCTURE
-            // ========================================================
-
-            double emaSpreadAtr =
-                Math.Abs(
-                    ema9 - ema21
-                ) / atr;
-
-
-            double priceToEma9Atr =
-                Math.Abs(
-                    livePrice - ema9
-                ) / atr;
-
-
-            double priceToEma21Atr =
-                Math.Abs(
-                    livePrice - ema21
-                ) / atr;
-
-
-            bool compressedEmas =
-                emaSpreadAtr < 0.25;
-
-
-            bool priceNearEma9 =
-                priceToEma9Atr < 0.45;
-
-
-            bool priceNearEma21 =
-                priceToEma21Atr < 0.60;
-
-
-            bool compressionState =
-                ctx.State ==
-                MarketState.Compression;
-
-
-            // ========================================================
-            // HISTORICAL CANDLE CHOP / WHIPSAW
-            // ========================================================
-
-            bool alternatingCandles =
-                (
-                    c0.close > c0.open &&
-                    c1.close < c1.open
-                )
-                ||
-                (
-                    c0.close < c0.open &&
-                    c1.close > c1.open
-                );
-
-
-            int directionChanges =
-                0;
-
-
-            MqlRates[] recent =
+            // The last six COMPLETED H1 candles define a fixed historical
+            // range. Never add the live candle to the range: doing so would
+            // move the breakout boundary as price moves.
+            const int RangeBars = 6;
+            double rangeHigh = double.MinValue;
+            double rangeLow = double.MaxValue;
+            int directionChanges = 0;
+            bool? previousDirection = null;
+            for (int i = rates.Length - RangeBars; i < rates.Length; i++)
             {
-        c0,
-        c1,
-        c2,
-        c3
-    };
-
-
-            for (
-                int i = 0;
-                i < recent.Length - 1;
-                i++)
-            {
-                bool currentBull =
-                    recent[i].close >
-                    recent[i].open;
-
-
-                bool previousBull =
-                    recent[i + 1].close >
-                    recent[i + 1].open;
-
-
-                if (currentBull != previousBull)
-                {
+                MqlRates bar = rates[i];
+                rangeHigh = Math.Max(rangeHigh, bar.high);
+                rangeLow = Math.Min(rangeLow, bar.low);
+                if (bar.close == bar.open) continue; // doji is neutral
+                bool bullish = bar.close > bar.open;
+                if (previousDirection.HasValue && previousDirection.Value != bullish)
                     directionChanges++;
-                }
+                previousDirection = bullish;
             }
 
+            double rangeAtr = (rangeHigh - rangeLow) / atr;
+            bool compressed = spreadAtr < 0.30;
+            bool whipsaw = directionChanges >= 3;
+            bool tightRange = rangeAtr <= 2.50;
+            bool compressionState = ctx.State == MarketState.Compression;
+            bool sideways = compressionState ||
+                (compressed && (directionChanges >= 2 || tightRange)) ||
+                (whipsaw && tightRange);
 
-            bool whipsaw =
-                directionChanges >= 2;
-
-
-            // ========================================================
-            // LIVE CANDLE STRENGTH
-            // ========================================================
-
-            bool liveBullish =
-                livePrice >
-                liveCandle.open;
-
-
-            bool liveBearish =
-                livePrice <
-                liveCandle.open;
-
-
-            double liveBody =
-                Math.Abs(
-                    livePrice -
-                    liveCandle.open
-                );
-
-
-            double liveBodyAtr =
-                liveBody / atr;
-
-
-            // ========================================================
-            // DIRECTIONAL EMA STRUCTURE
-            // ========================================================
-
-            bool ema9Rising =
-                ema9 > ema9Prev;
-
-
-            bool ema9Falling =
-                ema9 < ema9Prev;
-
-
-            bool ema21Rising =
-                ema21 >= ema21Prev;
-
-
-            bool ema21Falling =
-                ema21 <= ema21Prev;
-
-
-            bool bullishAlignment =
-                ema9 > ema21;
-
-
-            bool bearishAlignment =
-                ema9 < ema21;
-
-
-            // ========================================================
-            // COMPRESSION ESCAPE
-            //
-            // A stale Compression state must not block a genuine
-            // directional expansion.
-            // ========================================================
-
-            bool bullishEscape =
-                liveBullish &&
-                liveBodyAtr >= 0.60 &&
-                livePrice > ema9 &&
-                livePrice > ema21 &&
-                bullishAlignment &&
-                ema9Rising;
-
-
-            bool bearishEscape =
-                liveBearish &&
-                liveBodyAtr >= 0.60 &&
-                livePrice < ema9 &&
-                livePrice < ema21 &&
-                bearishAlignment &&
-                ema9Falling;
-
-
-            // ========================================================
-            // STRONGER TREND ESCAPE
-            //
-            // This catches a market which has already transitioned
-            // away from the EMA cluster even without one huge candle.
-            // ========================================================
-
-            bool bullishTrendEscape =
-                bullishAlignment &&
-                ema9Rising &&
-                ema21Rising &&
-                livePrice > ema9 &&
-                c0.close > ema9 &&
-                emaSpreadAtr >= 0.20;
-
-
-            bool bearishTrendEscape =
-                bearishAlignment &&
-                ema9Falling &&
-                ema21Falling &&
-                livePrice < ema9 &&
-                c0.close < ema9 &&
-                emaSpreadAtr >= 0.20;
-
-
-            // ========================================================
-            // IF MARKET HAS ESCAPED, DO NOT BLOCK
-            // ========================================================
-
-            if (bullishEscape ||
-                bearishEscape ||
-                bullishTrendEscape ||
-                bearishTrendEscape)
+            // Do not carry a stale breakout timer into the next sideways zone.
+            // Established trend is a market classification, not a fresh impulse.
+            int establishedDirection = sideways && IsGold(symbol.ToUpperInvariant()) ? GetEstablishedChopTrendDirection(
+                rates, emaFast, emaSlow, atr, livePrice) : 0;
+            if (establishedDirection != 0)
             {
-                LogFile.Write(
-                    $"[{ctx.Symbol}] ✅ CHOP FILTER ESCAPE | " +
-
-                    $"bullEscape={bullishEscape} | " +
-                    $"bearEscape={bearishEscape} | " +
-
-                    $"bullTrendEscape={bullishTrendEscape} | " +
-                    $"bearTrendEscape={bearishTrendEscape} | " +
-
-                    $"liveBodyATR={liveBodyAtr:F2} | " +
-
-                    $"emaSpreadATR={emaSpreadAtr:F2} | " +
-
-                    $"priceToEMA9ATR={priceToEma9Atr:F2} | " +
-                    $"priceToEMA21ATR={priceToEma21Atr:F2} | " +
-
-                    $"ema9Rising={ema9Rising} | " +
-                    $"ema9Falling={ema9Falling} | " +
-
-                    $"state={ctx.State}"
-                );
-
-
+                lock (_goldRangeEscapeSync)
+                {
+                    _goldRangeEscapeBySymbol.Remove(symbol);
+                    _goldEmergingTrendBySymbol.Remove(symbol);
+                }
+                emergingDirection = establishedDirection;
+                LogFile.Write($"[{symbol}] GOLD RANGE/CHOP GATE | decision=ALLOW_ESTABLISHED_TREND | " +
+                    $"direction={(establishedDirection > 0 ? "BUY" : "SELL")} | spreadATR={spreadAtr:F2} | " +
+                    $"flips={directionChanges} | rangeATR={rangeAtr:F2} | momentum={momentum:F2}");
                 return false;
             }
 
-
-            // ========================================================
-            // TRUE CHOP
-            //
-            // Compressed EMAs BY THEMSELVES are not enough.
-            // Price must still be trapped around the EMA cluster,
-            // or there must be whipsaw / alternation evidence.
-            // ========================================================
-
-            bool closeToBothEmas =
-                priceNearEma9 &&
-                priceNearEma21;
-
-
-            bool compressedAndTrapped =
-                compressedEmas &&
-                (
-                    priceNearEma9 ||
-                    priceNearEma21
-                );
-
-
-            bool alternatingNearEmas =
-                alternatingCandles &&
-                closeToBothEmas;
-
-
-            bool actualChop =
-                whipsaw ||
-                compressedAndTrapped ||
-                alternatingNearEmas;
-
-
-            bool shouldBlock =
-                compressionState &&
-                actualChop;
-
-
-            // ========================================================
-            // BLOCK DIAGNOSTIC
-            // ========================================================
-
-            if (shouldBlock)
+            if (!sideways)
             {
-                LogFile.Write(
-                    $"[{ctx.Symbol}] ⛔ CHOP FILTER BLOCK | " +
-
-                    $"state={ctx.State} | " +
-
-                    $"compressionState={compressionState} | " +
-
-                    $"compressedEmas={compressedEmas} | " +
-                    $"compressedAndTrapped={compressedAndTrapped} | " +
-
-                    $"emaSpreadATR={emaSpreadAtr:F2} | " +
-
-                    $"whipsaw={whipsaw} | " +
-                    $"directionChanges={directionChanges} | " +
-
-                    $"alternating={alternatingCandles} | " +
-
-                    $"priceNearEMA9={priceNearEma9} | " +
-                    $"priceNearEMA21={priceNearEma21} | " +
-
-                    $"liveBodyATR={liveBodyAtr:F2} | " +
-
-                    $"liveBullish={liveBullish} | " +
-                    $"liveBearish={liveBearish} | " +
-
-                    $"actualChop={actualChop}"
-                );
+                lock (_goldRangeEscapeSync)
+                {
+                    _goldRangeEscapeBySymbol.Remove(symbol);
+                    _goldEmergingTrendBySymbol.Remove(symbol);
+                }
+                return false;
             }
 
+            // While in chop, require direction, a real boundary clearance,
+            // meaningful live-body expansion and persistence. M15, S/R and
+            // the existing impulse protections are still separate vetoes.
+            const double MinOutsideRangeAtr = 0.12;
+            const double MinEscapeBodyAtr = 0.70;
+            const double ConfirmSeconds = 15.0;
 
-            // ========================================================
-            // ALWAYS LOG FINAL RESULT
-            //
-            // This is especially useful for diagnosing cases where
-            // ctx.State = Neutral but the caller still appears to block.
-            // ========================================================
+            bool bullishEscape =
+                livePrice >= rangeHigh + MinOutsideRangeAtr * atr &&
+                livePrice > liveCandle.open &&
+                liveBodyAtr >= MinEscapeBodyAtr &&
+                ema9 > ema21 && ema9 > priorEma9 &&
+                livePrice > ema9 && livePrice > ema21;
 
-            LogFile.Write(
-                $"[{ctx.Symbol}] 🔎 CHOP FILTER RESULT | " +
+            bool bearishEscape =
+                livePrice <= rangeLow - MinOutsideRangeAtr * atr &&
+                livePrice < liveCandle.open &&
+                liveBodyAtr >= MinEscapeBodyAtr &&
+                ema9 < ema21 && ema9 < priorEma9 &&
+                livePrice < ema9 && livePrice < ema21;
 
-                $"state={ctx.State} | " +
+            int direction = bullishEscape ? 1 : bearishEscape ? -1 : 0;
+            double boundary = direction > 0 ? rangeHigh : rangeLow;
+            bool escapeConfirmed = false;
+            DateTime now = DateTime.UtcNow;
 
-                $"compressionState={compressionState} | " +
+            lock (_goldRangeEscapeSync)
+            {
+                if (direction == 0)
+                {
+                    _goldRangeEscapeBySymbol.Remove(symbol);
+                }
+                else if (_goldRangeEscapeBySymbol.TryGetValue(symbol, out var existing) &&
+                         existing.Direction == direction &&
+                         Math.Abs(existing.Boundary - boundary) <= 0.01 * atr)
+                {
+                    escapeConfirmed = (now - existing.FirstSeenUtc).TotalSeconds >= ConfirmSeconds;
+                }
+                else
+                {
+                    _goldRangeEscapeBySymbol[symbol] = new GoldRangeEscapeCandidate
+                    {
+                        Direction = direction,
+                        Boundary = boundary,
+                        FirstSeenUtc = now
+                    };
+                }
+            }
 
-                $"compressedEmas={compressedEmas} | " +
+            // GOLD ONLY: a separated, directional market can emerge from historical
+            // chop without first breaking the entire six-H1 range. Use live EMA
+            // estimates consistent with FastEntry; retain the original escape path.
+            double liveEma9 = ema9 + 0.20 * (livePrice - ema9);
+            double liveEma21 = ema21 + (2.0 / 22.0) * (livePrice - ema21);
+            bool emergingBase =
+                (symbol.StartsWith("XAU", StringComparison.OrdinalIgnoreCase) ||
+                 symbol.StartsWith("GOLD", StringComparison.OrdinalIgnoreCase)) &&
+                !compressed && spreadAtr >= 0.40 && directionChanges <= 3 &&
+                !double.IsNaN(momentum) && !double.IsInfinity(momentum) &&
+                momentum >= 0.60 && liveBodyAtr >= 0.65;
+            bool emergingBuy = emergingBase && livePrice > liveCandle.open &&
+                liveEma9 > ema9 && livePrice > liveEma9 && livePrice > liveEma21;
+            bool emergingSell = emergingBase && livePrice < liveCandle.open &&
+                liveEma9 < ema9 && livePrice < liveEma9 && livePrice < liveEma21;
+            int candidateDirection = emergingBuy ? 1 : emergingSell ? -1 : 0;
+            bool emergingConfirmed = false;
+            double emergingSeconds = 0;
+            string barTime = rates[^1].time.ToString();
+            lock (_goldRangeEscapeSync)
+            {
+                if (candidateDirection == 0 || escapeConfirmed)
+                    _goldEmergingTrendBySymbol.Remove(symbol);
+                else
+                {
+                    if (!_goldEmergingTrendBySymbol.TryGetValue(symbol, out var watch) ||
+                        watch.Direction != candidateDirection || watch.BarTime != barTime ||
+                        now < watch.LastSeenUtc || (now - watch.LastSeenUtc).TotalSeconds > 30)
+                    {
+                        watch = new GoldEmergingTrendCandidate
+                        {
+                            Direction = candidateDirection,
+                            BarTime = barTime,
+                            FirstSeenUtc = now,
+                            LastSeenUtc = now
+                        };
+                        _goldEmergingTrendBySymbol[symbol] = watch;
+                    }
+                    else
+                    {
+                        watch.LastSeenUtc = now;
+                        emergingSeconds = (now - watch.FirstSeenUtc).TotalSeconds;
+                        emergingConfirmed = emergingSeconds >= 10.0;
+                    }
+                }
+            }
+            if (emergingConfirmed)
+                emergingDirection = candidateDirection;
 
-                $"emaSpreadATR={emaSpreadAtr:F2} | " +
+            LogFile.Write($"[{symbol}] GOLD RANGE/CHOP GATE | " +
+                $"decision={(escapeConfirmed ? "ALLOW_CONFIRMED_RANGE_ESCAPE" : emergingConfirmed ? "ALLOW_EMERGING_TREND" : "BLOCK_CHOP_OR_UNCONFIRMED_ESCAPE")} | " +
+                $"state={ctx.State} | compressed={compressed} | spreadATR={spreadAtr:F2} | " +
+                $"flips={directionChanges} | rangeATR={rangeAtr:F2} | " +
+                $"rangeHigh={rangeHigh:F5} | rangeLow={rangeLow:F5} | " +
+                $"price={livePrice:F5} | bodyATR={liveBodyAtr:F2} | " +
+                $"bullEscape={bullishEscape} | bearEscape={bearishEscape} | " +
+                $"persistent15s={escapeConfirmed} | momentum={momentum:F2} | " +
+                $"liveEMA9={liveEma9:F5} | liveEMA21={liveEma21:F5} | " +
+                $"emergingBuy={emergingBuy} | emergingSell={emergingSell} | " +
+                $"emergingSeconds={emergingSeconds:F1}/10");
 
-                $"whipsaw={whipsaw} | " +
-                $"directionChanges={directionChanges} | " +
-
-                $"alternating={alternatingCandles} | " +
-
-                $"priceNearEMA9={priceNearEma9} | " +
-                $"priceNearEMA21={priceNearEma21} | " +
-
-                $"liveBodyATR={liveBodyAtr:F2} | " +
-
-                $"bullEscape={bullishEscape} | " +
-                $"bearEscape={bearishEscape} | " +
-
-                $"bullTrendEscape={bullishTrendEscape} | " +
-                $"bearTrendEscape={bearishTrendEscape} | " +
-
-                $"actualChop={actualChop} | " +
-
-                $"shouldBlock={shouldBlock}"
-            );
-
-
-            return shouldBlock;
+            return !(escapeConfirmed || emergingConfirmed);
         }
         // Scan all configured Gold symbols rather than letting the coordinator's
         // preferred symbol suppress other valid FastEntry opportunities.
@@ -2871,15 +2815,6 @@ namespace MetaTrader.Services
                     return;
                 }
 
-                HandleLiveEma9Exit(
-                    trackedTrade.Symbol,
-                    trackedTrade,
-                    _client,
-                    atrRaw,
-                    emaFast1H,
-                    emaSlow1H,
-                    ctx);
-
                 return;
             }
 
@@ -3170,12 +3105,14 @@ namespace MetaTrader.Services
                     emaSlow1H,
                     atrRaw,
                     liveCandle,
-                    liveMid
+                    liveMid,
+                    earlyMomentum.Hybrid,
+                    out int goldEmergingDirection
                 ))
                 {
                     LogFile.Write(
                         $"[{SYMBOL}] ⛔ ALL ENTRIES BLOCKED | " +
-                        $"reason=Compression / choppy market"
+                        $"reason=Gold range/chop gate awaiting directional confirmation"
                     );
 
                     string chopDirection = null;
@@ -3186,7 +3123,7 @@ namespace MetaTrader.Services
 
                     if (chopDirection != null)
                         await RegisterMissedOpportunityAsync(SYMBOL, chopDirection, "GlobalChopFilter",
-                            "Compression / choppy market", ctx, bid, ask, emaFast1H[^1], emaSlow1H[^1],
+                            "Gold range/chop gate awaiting directional confirmation", ctx, bid, ask, emaFast1H[^1], emaSlow1H[^1],
                             atrRaw, earlyMomentum.Hybrid,
                             "Directional structure existed but global chop filter blocked all entries.",
                             liveOpen: liveOpen,
@@ -3260,6 +3197,26 @@ namespace MetaTrader.Services
 
                 if (fastAction == TradeAction.EnterBuy || fastAction == TradeAction.EnterSell)
                 {
+                    // An emerging-trend release is directional, not permission
+                    // to enter against the confirmed live movement.
+                    if ((goldEmergingDirection > 0 && fastAction != TradeAction.EnterBuy) ||
+                        (goldEmergingDirection < 0 && fastAction != TradeAction.EnterSell))
+                    {
+                        LogFile.Write($"[{SYMBOL}] GOLD EMERGING TREND DIRECTION BLOCK | " +
+                            $"direction={goldEmergingDirection} | action={fastAction}");
+                        return;
+                    }
+
+                    // Last-chance GOLD quality veto: applies to every FastEntry
+                    // approved model, including armed breakdown and swing breaks.
+                    // Existing global chop, M15, SR and impulse rules are untouched.
+                    if (RejectGoldWeakBoundaryEntry(
+                            SYMBOL, fastAction, rates1H, atrRaw, liveOpen, bid, ask,
+                            earlyMomentum.Hybrid, earlyMomentum.PreviousHybrid, fastModel))
+                    {
+                        return;
+                    }
+
                     double ema9 = emaFast1H[^1];
                     double ema21 = emaSlow1H[^1];
                     double prevEma9 = emaFast1H[^2];
@@ -4047,69 +4004,6 @@ namespace MetaTrader.Services
 
                 LogFile.Write(
                     $"[TradeProven] {symbol} | model={t.Model} | side={t.Side} | confirmations={confirmations}");
-            }
-        }
-        private static void HandleLiveEma9Exit(
-            string symbol,
-            TrackedTrade t,
-            MtApi5Client client,
-            double atr,
-            double[] emaFastH1,
-            double[] emaSlowH1,
-            SymbolContext ctx)
-        {
-            if (t == null || emaFastH1 == null || emaSlowH1 == null)
-                return;
-
-            // ---------------------------------
-            // Determine side
-            // ---------------------------------
-            TradeAction side = t.Side.ToString() == TradeAction.Buy.ToString()
-                ? TradeAction.EnterBuy
-                : TradeAction.EnterSell;
-
-            // ---------------------------------
-            // Determine profile based on entry model
-            // ---------------------------------
-            EntryExitProfile profile =
-                t.Model == EntryModel.Velocity && t.IsProven ? EntryExitProfile.VelocityProven :
-                t.Model == EntryModel.Velocity ? EntryExitProfile.Velocity :
-                t.Model == EntryModel.Sniper ? EntryExitProfile.Sniper :
-                EntryExitProfile.Continuation;
-
-            double ema9 = emaFastH1[^1];
-            double ema21 = emaSlowH1[^1];
-
-            var decision = LiveEma9ExitGuard.Evaluate(
-                symbol,
-                client,
-                atr,
-                ema9,
-                ema21,
-                side,
-                profile,
-                tradeOpen: true,
-                ctx.IsShockActive,
-                out string reason);
-
-            if (decision == LiveExitDecision.ExitToNextRegime)
-            {
-
-
-                LogFile.Write(
-                    $"[LiveEma9Exit] {symbol} EXIT→NEXT | model={t.Model} | {reason}");
-
-
-                TradeServiceEngine.closingTrade = true;
-                ctx.AllowSniperNextCandle = true;
-            }
-            else if (decision == LiveExitDecision.ExitAndDisarm)
-            {
-                LogFile.Write(
-                    $"[LiveEma9Exit] {symbol} EXIT+DISARM | model={t.Model} | {reason}");
-
-                TradeServiceEngine.closingTrade = true;
-                ctx.TransitionTo(MarketState.Pullback);
             }
         }
         private void ResetStructuralState(SymbolContext ctx)

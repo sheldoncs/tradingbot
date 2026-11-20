@@ -743,6 +743,23 @@ namespace MetaTrader.Services.Helper
 
 
 
+                // GOLD: an armed structural break or a newly detected swing
+                // break must not circumvent the same anti-chase location rule
+                // that governs normal LiveImpulseEntryEngine entries.
+                // Do not change normal impulse candidates or any exit rules.
+                if (impulseDetected && (swingStructureCandidate || goldBreakdownTriggered) &&
+                    !LiveImpulseEntryEngine.GoldAlternativeLocationIsSafe(
+                        symbol, liveCandle, atr, ema9, ema9Previous, ema21,
+                        recentHigh, recentLow, bid, ask, impulseAction))
+                {
+                    LogFile.Write($"[{symbol}] GOLD STRUCTURAL ENTRY REJECTED | " +
+                        $"path={(swingStructureCandidate ? "SWING_BREAK" : "ARMED_BREAKDOWN")} | " +
+                        "reason=ANTI_CHASE_LOCATION");
+                    tradeType = TradeType.None;
+                    isImpulse = false;
+                    return (TradeAction.DoNothing, EntryModel.Nothing);
+                }
+
                 // =========================================================
                 // 11. IMPULSE DETECTED
                 // =========================================================
@@ -939,9 +956,8 @@ namespace MetaTrader.Services.Helper
                     //     BUY  -> M15 Bullish must be true
                     //     SELL -> M15 Bearish must be true
                     //
-                    // Exception:
-                    //     An exceptionally strong H1 impulse may override
-                    //     missing/opposite M15 confirmation at momentum >= 1.20.
+                    // GOLD (XAUUSD/XAUEUR): NO exception. M15 must confirm.
+                    // Non-GOLD retains its existing strong-impulse exception.
                     // =====================================================
 
                     var m15 =
@@ -950,35 +966,12 @@ namespace MetaTrader.Services.Helper
                         );
 
 
-                    // Gold H1 alternative: the impulse has already passed the
-                    // impulse detector, follow-through, opposite-H1 and HARD SR
-                    // checks above. Do not add another 1.20 momentum requirement
-                    // merely because the last CLOSED M15 has not caught up.
-                    // Other symbols preserve their previous M15 behavior.
-                    bool goldH1ImpulseAlternative =
-                        IsGold(symbol) &&
-                        (impulseAction == TradeAction.EnterBuy ||
-                         impulseAction == TradeAction.EnterSell) &&
-                        (impulseAction == TradeAction.EnterBuy
-                            ? ema9 > ema21 && ema9 > ema9Previous && liveMid > ema9
-                            : ema9 < ema21 && ema9 < ema9Previous && liveMid < ema9) &&
-                        (impulseAction == TradeAction.EnterBuy
-                            ? Math.Max(0.0, liveMid - liveCandle.open)
-                            : Math.Max(0.0, liveCandle.open - liveMid)) / atr >= 0.55 &&
-                        Math.Abs(momentum) >= 0.30 &&
-                        emaDistanceAtr <= 1.25 &&
-                        (confirmedBreakout || goldBreakdownTriggered);
-
+                    // GOLD (XAUUSD and XAUEUR): closed M15 directional confirmation
+                    // is mandatory. H1 momentum, structural breaks, or regime
+                    // transitions must never override a missing/opposing M15.
+                    // Preserve the original high-momentum exception for NON-GOLD.
                     bool allowStrongImpulseThroughM15 =
-                        goldH1ImpulseAlternative || momentum >= impulseOverrideThreshold;
-
-                    if (goldH1ImpulseAlternative)
-                        LogFile.Write($"[{symbol}] GOLD H1 BREAKOUT M15 ALTERNATIVE | " +
-                            $"action={impulseAction} | breakout={confirmedBreakout} | " +
-                            $"armedBreak={goldBreakdownTriggered} | bodyATR={bodyAtr:F2} | " +
-                            $"momentum={momentum:F2} | emaDistATR={emaDistanceAtr:F2} | " +
-                            "upstreamSR=PASSED | confirmation=H1");
-
+                        !IsGold(symbol) && momentum >= impulseOverrideThreshold;
 
                     if (m15 == null)
                     {
@@ -990,6 +983,8 @@ namespace MetaTrader.Services.Helper
                                 $"action={impulseAction} | momentum={momentum:F2}"
                             );
 
+                            tradeType = TradeType.None;
+                            isImpulse = false;
                             return (
                                 TradeAction.DoNothing,
                                 EntryModel.Nothing
@@ -1033,6 +1028,8 @@ namespace MetaTrader.Services.Helper
                                     $"momentum={momentum:F2}"
                                 );
 
+                                tradeType = TradeType.None;
+                                isImpulse = false;
                                 return (
                                     TradeAction.DoNothing,
                                     EntryModel.Nothing

@@ -220,14 +220,65 @@
                 public bool ReturnedBelowZero;
                 // GOLD protected-stage weakening must persist before tightening.
                 public DateTime WeakeningFirstSeenUtc;
+                public DateTime WeakeningLastSeenUtc;
                 public int WeakeningConfirmedSamples;
                 // Latches the 60% floor once sustained gold weakness is confirmed.
                 public bool ConditionalProfitLockArmed;
+                public readonly System.Collections.Generic.List<GoldQuoteSample> QuoteSamples =
+                    new System.Collections.Generic.List<GoldQuoteSample>();
             }
 
             private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<
                 TrackedTrade, GoldStudyState> GoldStudyStates =
                 new System.Runtime.CompilerServices.ConditionalWeakTable<TrackedTrade, GoldStudyState>();
+
+            private sealed class GoldQuoteSample
+            {
+                public DateTime Utc;
+                public double Mid;
+                public double ExitPrice;
+            }
+
+            // Observe real quotes, not synthetic candle endpoints. A spread-only
+            // spike is insufficient: midpoint AND executable price must reverse.
+            private static bool GoldRapidReversal(TrackedTrade trade, double bid,
+                double ask, double atr, double peak, double giveback,
+                out double adverseMidAtr, out double adverseExitAtr)
+            {
+                adverseMidAtr = adverseExitAtr = 0.0;
+                if (!(atr > 0 && bid > 0 && ask >= bid) ||
+                    double.IsInfinity(atr) || double.IsInfinity(bid) || double.IsInfinity(ask))
+                    return false;
+                var state = GoldStudyStates.GetValue(trade, _ => new GoldStudyState());
+                var now = DateTime.UtcNow;
+                bool buy = trade.Side == TradeSide.Buy;
+                double mid = bid + (ask - bid) * 0.5;
+                double exit = buy ? bid : ask;
+                lock (state)
+                {
+                    var samples = state.QuoteSamples;
+                    if (samples.Count > 0 && (now < samples[samples.Count - 1].Utc ||
+                        (now - samples[samples.Count - 1].Utc).TotalSeconds > 10))
+                        samples.Clear();
+                    samples.RemoveAll(q => (now - q.Utc).TotalSeconds > 30);
+                    foreach (var q in samples)
+                    {
+                        double age = (now - q.Utc).TotalSeconds;
+                        if (age < 2) continue;
+                        double midMove = (buy ? q.Mid - mid : mid - q.Mid) / atr;
+                        double exitMove = (buy ? q.ExitPrice - exit : exit - q.ExitPrice) / atr;
+                        if (Math.Min(midMove, exitMove) > Math.Min(adverseMidAtr, adverseExitAtr))
+                        {
+                            adverseMidAtr = midMove;
+                            adverseExitAtr = exitMove;
+                        }
+                    }
+                    if (samples.Count == 0 || (now - samples[samples.Count - 1].Utc).TotalSeconds >= 1)
+                        samples.Add(new GoldQuoteSample { Utc = now, Mid = mid, ExitPrice = exit });
+                }
+                return peak > 0 && giveback >= Math.Max(2.0, peak * 0.20) &&
+                    adverseMidAtr >= 0.35 && adverseExitAtr >= 0.35;
+            }
 
             private static void RecordGoldProfitStudy(TrackedTrade trade)
             {
@@ -277,20 +328,25 @@
                     if (!weakening)
                     {
                         state.WeakeningFirstSeenUtc = DateTime.MinValue;
+                        state.WeakeningLastSeenUtc = DateTime.MinValue;
                         state.WeakeningConfirmedSamples = 0;
                         return false;
                     }
 
                     DateTime now = DateTime.UtcNow;
-                    if (state.WeakeningFirstSeenUtc == DateTime.MinValue)
+                    if (state.WeakeningFirstSeenUtc == DateTime.MinValue ||
+                        now < state.WeakeningLastSeenUtc ||
+                        (now - state.WeakeningLastSeenUtc).TotalSeconds > 30)
                     {
                         state.WeakeningFirstSeenUtc = now;
+                        state.WeakeningLastSeenUtc = now;
                         state.WeakeningConfirmedSamples = 1;
                         return false;
                     }
 
                     // Two observations at least 10 seconds apart prevent a brief
                     // EMA9 flicker / one-tick pullback from moving the broker SL.
+                    state.WeakeningLastSeenUtc = now;
                     if ((now - state.WeakeningFirstSeenUtc).TotalSeconds < 10)
                         return false;
 
@@ -1140,22 +1196,46 @@
                         : currentPrice <= ema21;
 
 
-                bool goldHealthyRunner =
-                    isGold &&
-                    priceOnCorrectSideOfEma9 &&
-                    priceOnCorrectSideOfEma21 &&
-                    ema9SlopeAligned &&
-                    !adverseCandleEvidence;
-
-
-                bool goldWeakeningRunner =
-                    isGold &&
-                    !goldHealthyRunner &&
-                    (
-                        !priceOnCorrectSideOfEma9 ||
-                        !ema9SlopeAligned ||
-                        adverseCandleEvidence
-                    );
+                // GOLD adaptive winner management: one opposing candle or
+                // a shallow EMA9 breach is not enough to tighten a runner.
+                // Keep existing executable-price convention and closed EMA inputs.
+                double goldEma9BreachAtr = Math.Max(0.0,
+                    trade.Side == TradeSide.Buy ? ema9 - currentPrice : currentPrice - ema9) / atr;
+                double goldEma21BreachAtr = Math.Max(0.0,
+                    trade.Side == TradeSide.Buy ? ema21 - currentPrice : currentPrice - ema21) / atr;
+                double goldEma9AdverseSlopeAtr = Math.Max(0.0,
+                    trade.Side == TradeSide.Buy ? previousEma9 - ema9 : ema9 - previousEma9) / atr;
+                double goldEma21AdverseSlopeAtr = Math.Max(0.0,
+                    trade.Side == TradeSide.Buy ? emaSlow[^2] - ema21 : ema21 - emaSlow[^2]) / atr;
+                bool goldHealthyRunner = isGold && priceOnCorrectSideOfEma9 &&
+                    priceOnCorrectSideOfEma21 && ema9SlopeAligned && !adverseCandleEvidence;
+                bool goldWeakeningRunner = isGold && (
+                    (goldEma9BreachAtr >= 0.12 &&
+                     (adverseCandleEvidence || goldEma9AdverseSlopeAtr >= 0.03)) ||
+                    (goldEma9AdverseSlopeAtr >= 0.03 && goldEma21AdverseSlopeAtr >= 0.02 &&
+                     adverseCandleEvidence) ||
+                    (goldEma21BreachAtr >= profile.Ema21FailureAtr && goldEma9BreachAtr >= 0.12));
+                // Decisive failure of both EMAs plus opposing candle evidence
+                // bypasses the weakness timer, but only after the existing peak
+                // protection trigger. Existing hard-loss/structural exits stay intact.
+                double goldRapidMidAtr = 0.0, goldRapidExitAtr = 0.0;
+                bool goldRapidDanger = isGold && GoldRapidReversal(trade, bid, ask, atr,
+                    peakProfit, giveback, out goldRapidMidAtr, out goldRapidExitAtr);
+                bool goldImmediateDanger = isGold && (goldRapidDanger ||
+                    (goldEma9BreachAtr >= 0.12 &&
+                    goldEma21BreachAtr >= profile.Ema21FailureAtr &&
+                    adverseCandleEvidence && giveback > 0.0));
+                // Strong trend qualification is deliberately conservative and
+                // uses existing EMA inputs, not invented live momentum values.
+                double goldEma9TrendAtr = (trade.Side == TradeSide.Buy
+                    ? ema9 - previousEma9 : previousEma9 - ema9) / atr;
+                double goldEma21TrendAtr = (trade.Side == TradeSide.Buy
+                    ? ema21 - emaSlow[^2] : emaSlow[^2] - ema21) / atr;
+                bool goldStrongTrend = goldHealthyRunner && !goldImmediateDanger &&
+                    (trade.Side == TradeSide.Buy ? ema9 > ema21 : ema9 < ema21) &&
+                    goldEma9TrendAtr >= 0.08 && goldEma21TrendAtr >= 0.03 &&
+                    Math.Abs(ema9 - ema21) / atr >= 0.30;
+                bool goldConfirmedWeakness = false;
 
 
                 // ========================================================
@@ -1173,10 +1253,20 @@
                 {
                     GoldStudyState goldState = GoldStudyStates.GetValue(
                         trade, _ => new GoldStudyState());
-                    bool confirmedWeakness = HasConfirmedGoldWeakness(trade, goldWeakeningRunner);
+                    goldConfirmedWeakness = HasConfirmedGoldWeakness(trade, goldWeakeningRunner);
+                    goldConfirmedWeakness = goldConfirmedWeakness || goldImmediateDanger;
+                    if (goldRapidDanger)
+                        LogFile.Write($"[{trade.Symbol}] GOLD RAPID REVERSAL DANGER | " +
+                            $"midATR={goldRapidMidAtr:F2} | exitATR={goldRapidExitAtr:F2} | " +
+                            $"peak={peakProfit:F2} | giveback={giveback:F2} | action=ARM_IMMEDIATELY");
+                    LogFile.Write($"[{trade.Symbol}] GOLD ADAPTIVE HEALTH | " +
+                        $"health={(goldImmediateDanger ? "DANGER" : goldConfirmedWeakness ? "CONFIRMED_WEAKNESS" : goldWeakeningRunner ? "WEAKNESS_PENDING" : goldHealthyRunner ? "HEALTHY" : "PULLBACK_OR_MIXED")} | " +
+                        $"ema9BreachATR={goldEma9BreachAtr:F3} | ema21BreachATR={goldEma21BreachAtr:F3} | " +
+                        $"ema9AdverseSlopeATR={goldEma9AdverseSlopeAtr:F3} | ema21AdverseSlopeATR={goldEma21AdverseSlopeAtr:F3} | " +
+                        $"oppositeCandle={adverseCandleEvidence} | peak={peakProfit:F2} | current={currentProfit:F2}");
                     lock (goldState)
                     {
-                        if (confirmedWeakness && !goldState.ConditionalProfitLockArmed)
+                        if (goldConfirmedWeakness && !goldState.ConditionalProfitLockArmed)
                         {
                             goldState.ConditionalProfitLockArmed = true;
                             LogFile.Write($"[{trade.Symbol}] GOLD 60% LOCK ARMED | " +
@@ -2002,9 +2092,11 @@
                         // ====================================================
 
                         double goldTrailAtr =
-                            goldHealthyRunner
-                                ? 0.90
-                                : 0.45;
+                            goldConfirmedWeakness
+                                ? 0.45
+                                : goldStrongTrend && !goldConditionalLockArmed
+                                    ? 1.25
+                                    : 0.90;
 
 
                         double goldTrailingDistance =
@@ -2191,7 +2283,7 @@
                                 $"profit={currentProfit:F2} | " +
                                 $"healthy={goldHealthyRunner} | " +
                                 $"weakening={goldWeakeningRunner} | " +
-                                $"trailATR={goldTrailAtr:F2} | " +
+                                $"trailATR={goldTrailAtr:F2} | strongTrend={goldStrongTrend} | " +
                                 $"largeWinner={largeWinnerArmed} | " +
                                 $"largeFloor={largeWinnerFloorUsd:F2} | " +
                                 $"conditionalLockArmed={goldConditionalLockArmed} | " +
@@ -2230,9 +2322,9 @@
                             giveback,
                             largeWinnerArmed
                                 ? $"Gold runner - large winner floor=${largeWinnerFloorUsd:F2}"
-                                : goldHealthyRunner
-                                    ? "Gold runner healthy - wide 0.90 ATR trail"
-                                    : "Gold runner weakening - 0.45 ATR trail"
+                                : goldConfirmedWeakness
+                                    ? "Gold runner confirmed weakness - 0.45 ATR trail"
+                                    : $"Gold runner healthy/pullback - {goldTrailAtr:F2} ATR trail"
                         );
 
 
@@ -2240,9 +2332,9 @@
                             stage,
                             largeWinnerArmed
                                 ? "Gold large winner"
-                                : goldHealthyRunner
-                                    ? "Gold healthy runner"
-                                    : "Gold weakening runner"
+                                : goldConfirmedWeakness
+                                    ? "Gold confirmed weakening runner"
+                                    : "Gold healthy/pullback runner"
                         );
                     }
 

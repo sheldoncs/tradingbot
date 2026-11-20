@@ -103,6 +103,56 @@ namespace MetaTrader.Services.Helper
         }
 
         private const bool EnableConfirmedReversals = false;
+        // Reuse the GOLD live impulse's EXISTING late-location limits for
+        // alternative structural entries. This is a location check only;
+        // it neither approves a trade nor changes the impulse detector.
+        public static bool GoldAlternativeLocationIsSafe(
+            string symbol, MqlRates liveCandle, double atr,
+            double ema9, double ema9Previous, double ema21,
+            double recentHigh, double recentLow, double bid, double ask,
+            TradeAction action)
+        {
+            if (string.IsNullOrWhiteSpace(symbol) || !IsGold(symbol) ||
+                atr <= 0 || ema9 <= 0 || ema21 <= 0 ||
+                bid <= 0 || ask < bid ||
+                (action != TradeAction.EnterBuy && action != TradeAction.EnterSell))
+                return false;
+
+            LiveImpulseProfile profile = GetProfile(symbol);
+            double mid = (bid + ask) / 2.0;
+            bool buy = action == TradeAction.EnterBuy;
+            double bodyAtr = buy
+                ? Math.Max(0.0, mid - liveCandle.open) / atr
+                : Math.Max(0.0, liveCandle.open - mid) / atr;
+            double emaDistanceAtr = Math.Abs((buy ? ask : bid) - ema9) / atr;
+            double breakoutAtr = buy
+                ? (ask - recentHigh) / atr
+                : (recentLow - bid) / atr;
+
+            // Match existing GOLD late-location rule and its strong live
+            // regime override (without modifying TryEnter's logic).
+            bool aligned = buy
+                ? ema9 > ema21 && ema9 > ema9Previous
+                : ema9 < ema21 && ema9 < ema9Previous;
+            bool strongOverride = buy
+                ? mid > liveCandle.open && bodyAtr >= profile.EscapeBody &&
+                  ema9 > ema9Previous && ask > ema9 && ask > ema21
+                : mid < liveCandle.open && bodyAtr >= profile.EscapeBody &&
+                  ema9 < ema9Previous && bid < ema9 && bid < ema21;
+
+            bool late = (aligned || strongOverride) && bodyAtr >= 0.55 &&
+                        (emaDistanceAtr >= 1.35 ||
+                         breakoutAtr >= profile.TransitionBeyondBreakout);
+
+            if (late)
+                LogFile.Write($"[{symbol}] GOLD ALTERNATIVE ENTRY BLOCKED | " +
+                    $"reason=ANTI_CHASE_LOCATION | action={action} | " +
+                    $"bodyATR={bodyAtr:F2} | emaDistATR={emaDistanceAtr:F2} | " +
+                    $"breakATR={breakoutAtr:F2} | limitEMA=1.35 | " +
+                    $"limitBreak={profile.TransitionBeyondBreakout:F2}");
+            return !late;
+        }
+
         public static bool TryEnter(
             string symbol,
             MqlRates liveCandle,
