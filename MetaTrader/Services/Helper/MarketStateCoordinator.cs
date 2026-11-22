@@ -492,9 +492,24 @@ namespace MetaTrader.Services.Helper
                 return;
             }
 
-            if (momentum.Breakout &&
-                ctx.State == MarketState.Compression)
+            // GOLD: an established two-closed-H1 directional recovery can end
+            // Compression even if the live momentum.Breakout flag is false.
+            // This changes MARKET STATE only; it does not authorize a trade.
+            bool closedGoldRecovery =
+                ctx.State == MarketState.Compression &&
+                GetUniverse(SYMBOL) == MarketUniverse.Metals &&
+                HasClosedGoldDirectionalRecovery(rates1H, emaFast1H, emaSlow1H, atrRaw);
+
+            if (ctx.State == MarketState.Compression &&
+                (momentum.Breakout || closedGoldRecovery))
             {
+                if (closedGoldRecovery && !momentum.Breakout)
+                {
+                    LogFile.Write($"[{SYMBOL}] MARKET STATE COMPRESSION ESCAPE | " +
+                        "source=CLOSED_H1_GOLD_DIRECTIONAL_RECOVERY | " +
+                        $"ATR={atrRaw:F5} | lastClosed={rates1H[^1].time:O}");
+                }
+
                 ctx.TransitionTo(MarketState.Impulse);
                 ctx.IncrementExpansion();
 
@@ -1208,6 +1223,57 @@ namespace MetaTrader.Services.Helper
             }
 
             return _contexts.GetValueOrDefault(symbol);
+        }
+
+        // Uses CLOSED H1 rates only (CopyRates starts from shift 1).
+        // Both completed candles must advance in the same direction, with a
+        // meaningful net move relative to ATR and supporting EMA structure.
+        // This helper never places orders or changes entry/risk restrictions.
+        private static bool HasClosedGoldDirectionalRecovery(
+            MqlRates[] closedH1,
+            double[] ema9,
+            double[] ema21,
+            double atr)
+        {
+            if (closedH1 == null || closedH1.Length < 3 ||
+                ema9 == null || ema9.Length < 3 ||
+                ema21 == null || ema21.Length < 2 ||
+                atr <= 0 || double.IsNaN(atr) || double.IsInfinity(atr))
+                return false;
+
+            var prior = closedH1[^3];
+            var first = closedH1[^2];
+            var second = closedH1[^1];
+
+            double rangeFirst = first.high - first.low;
+            double rangeSecond = second.high - second.low;
+            bool meaningfulBody =
+                (rangeFirst > 0 && Math.Abs(first.close - first.open) >= 0.50 * rangeFirst) ||
+                (rangeSecond > 0 && Math.Abs(second.close - second.open) >= 0.50 * rangeSecond);
+
+            if (!meaningfulBody ||
+                Math.Abs(second.close - prior.close) < 0.75 * atr)
+                return false;
+
+            bool bullish =
+                first.close > prior.close &&
+                second.close > first.close &&
+                first.close > first.open &&
+                second.close > second.open &&
+                ema9[^1] > ema9[^2] &&
+                ema9[^1] > ema21[^1] &&
+                second.close > ema9[^1];
+
+            bool bearish =
+                first.close < prior.close &&
+                second.close < first.close &&
+                first.close < first.open &&
+                second.close < second.open &&
+                ema9[^1] < ema9[^2] &&
+                ema9[^1] < ema21[^1] &&
+                second.close < ema9[^1];
+
+            return bullish || bearish;
         }
 
         private bool IsEmaCompressed(
