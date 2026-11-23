@@ -102,6 +102,71 @@ namespace MetaTrader.Services.Helper
             }
         }
 
+        // ================================================================
+        // GOLD ANTI-CHASE HYSTERESIS (BUY / SELL, per symbol)
+        // ================================================================
+        // Once a late entry has been detected, a one-tick move just below the
+        // breakout boundary must not turn the same exhausted setup into a BUY
+        // or SELL. Require a meaningful move back inside BOTH safety limits.
+        // This does not approve any trade: all original gates still apply.
+        private sealed class GoldLateLocationState
+        {
+            public bool Armed;
+            public DateTime LastSeenUtc;
+        }
+
+        private static readonly object GoldLateLocationSync = new object();
+        private static readonly System.Collections.Generic.Dictionary<string, GoldLateLocationState>
+            GoldLateLocations = new System.Collections.Generic.Dictionary<string, GoldLateLocationState>(
+                StringComparer.OrdinalIgnoreCase);
+
+        private static bool GoldLateLocationBlocked(
+            string symbol, bool buy, bool normallyLate,
+            double emaDistanceAtr, double breakoutAtr, double breakoutLimitAtr)
+        {
+            string key = symbol + (buy ? "|BUY" : "|SELL");
+            lock (GoldLateLocationSync)
+            {
+                GoldLateLocationState state;
+                if (!GoldLateLocations.TryGetValue(key, out state))
+                {
+                    state = new GoldLateLocationState();
+                    GoldLateLocations[key] = state;
+                }
+
+                DateTime now = DateTime.UtcNow;
+                // Do not carry a temporary rejection indefinitely across a
+                // quiet period, restart-like gap, or a different market setup.
+                if (now < state.LastSeenUtc ||
+                    (now - state.LastSeenUtc).TotalMinutes > 10.0)
+                    state.Armed = false;
+                state.LastSeenUtc = now;
+
+                if (normallyLate)
+                {
+                    state.Armed = true;
+                    return true;
+                }
+
+                if (!state.Armed)
+                    return false;
+
+                // A genuine retracement can re-arm the usual entry pipeline;
+                // simply falling from 0.500 ATR to 0.499 ATR cannot.
+                const double releaseBufferAtr = 0.08;
+                bool safelyBackInside =
+                    emaDistanceAtr <= 1.35 - releaseBufferAtr &&
+                    breakoutAtr <= breakoutLimitAtr - releaseBufferAtr;
+                if (safelyBackInside)
+                {
+                    state.Armed = false;
+                    return false;
+                }
+
+                return true;
+            }
+        }
+
         private const bool EnableConfirmedReversals = false;
         // Reuse the GOLD live impulse's EXISTING late-location limits for
         // alternative structural entries. This is a location check only;
@@ -140,16 +205,19 @@ namespace MetaTrader.Services.Helper
                 : mid < liveCandle.open && bodyAtr >= profile.EscapeBody &&
                   ema9 < ema9Previous && bid < ema9 && bid < ema21;
 
-            bool late = (aligned || strongOverride) && bodyAtr >= 0.55 &&
-                        (emaDistanceAtr >= 1.35 ||
-                         breakoutAtr >= profile.TransitionBeyondBreakout);
+            bool normallyLate = (aligned || strongOverride) && bodyAtr >= 0.55 &&
+                                (emaDistanceAtr >= 1.35 ||
+                                 breakoutAtr >= profile.TransitionBeyondBreakout);
+            bool late = GoldLateLocationBlocked(symbol, buy, normallyLate,
+                emaDistanceAtr, breakoutAtr, profile.TransitionBeyondBreakout);
 
             if (late)
                 LogFile.Write($"[{symbol}] GOLD ALTERNATIVE ENTRY BLOCKED | " +
                     $"reason=ANTI_CHASE_LOCATION | action={action} | " +
                     $"bodyATR={bodyAtr:F2} | emaDistATR={emaDistanceAtr:F2} | " +
                     $"breakATR={breakoutAtr:F2} | limitEMA=1.35 | " +
-                    $"limitBreak={profile.TransitionBeyondBreakout:F2}");
+                    $"limitBreak={profile.TransitionBeyondBreakout:F2} | " +
+                    $"originalLate={normallyLate} | hysteresisActive={!normallyLate}");
             return !late;
         }
 
@@ -697,7 +765,17 @@ namespace MetaTrader.Services.Helper
                             breakoutDistanceSell >= profile.TransitionBeyondBreakout
                         );
 
-                    if (goldLateBuyLocation)
+                    // Share the same state with structural alternatives so
+                    // a rejected swing-break cannot pass as a normal impulse
+                    // one second later at nearly the same location.
+                    bool goldBuyLocationBlocked = GoldLateLocationBlocked(
+                        symbol, true, goldLateBuyLocation, distFromEmaBuy,
+                        breakoutDistanceBuy, profile.TransitionBeyondBreakout);
+                    bool goldSellLocationBlocked = GoldLateLocationBlocked(
+                        symbol, false, goldLateSellLocation, distFromEmaSell,
+                        breakoutDistanceSell, profile.TransitionBeyondBreakout);
+
+                    if (goldBuyLocationBlocked)
                     {
                         LogFile.Write(
                             $"[{symbol}] ⛔ GOLD BUY BLOCKED - LATE ENTRY LOCATION | " +
@@ -708,13 +786,14 @@ namespace MetaTrader.Services.Helper
                             $"maxPosition={goldLocationMaxCandlePosition:F2} | " +
                             $"hardEmaDist={goldLocationHardEmaDistanceAtr:F2} | " +
                             $"meaningfulWicks={goldHasMeaningfulWicks} | " +
-                            $"reason=expanded bullish candle is too late/extended; wait for next continuation opportunity"
+                            $"hysteresisActive={!goldLateBuyLocation} | " +
+                            $"reason=expanded bullish candle or recent late-location latch; wait for valid pullback"
                         );
 
                         return false;
                     }
 
-                    if (goldLateSellLocation)
+                    if (goldSellLocationBlocked)
                     {
                         LogFile.Write(
                             $"[{symbol}] ⛔ GOLD SELL BLOCKED - LATE ENTRY LOCATION | " +
@@ -725,7 +804,8 @@ namespace MetaTrader.Services.Helper
                             $"maxPosition={goldLocationMaxCandlePosition:F2} | " +
                             $"hardEmaDist={goldLocationHardEmaDistanceAtr:F2} | " +
                             $"meaningfulWicks={goldHasMeaningfulWicks} | " +
-                            $"reason=expanded bearish candle is too late/extended; wait for next continuation opportunity"
+                            $"hysteresisActive={!goldLateSellLocation} | " +
+                            $"reason=expanded bearish candle or recent late-location latch; wait for valid pullback"
                         );
 
                         return false;

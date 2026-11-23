@@ -25,10 +25,12 @@ namespace MetaTrader.Services.Helper
         // 2. Momentum deterioration is significant
         // 3. Current momentum is not strong
         // 4. Price is already extended from EMA9
-        // 5. There is no confirmed breakout
+        // 5. A confirmed breakout does not override a clearly exhausted signal
         //
         // This prevents the filter from rejecting healthy trades simply
         // because momentum temporarily dipped.
+        // Momentum here is a NON-DIRECTIONAL strength measure. A decline
+        // means reduced impulse strength for BUY and SELL alike.
         // ================================================================
 
 
@@ -74,13 +76,6 @@ namespace MetaTrader.Services.Helper
                     );
 
 
-                double momentumIncrease =
-                    Math.Max(
-                        0.0,
-                        momentum - previousMomentum
-                    );
-
-
                 double momentumDropPercent = 0.0;
 
                 if (previousMomentum > 0.000001)
@@ -98,7 +93,8 @@ namespace MetaTrader.Services.Helper
                 // These are deliberately conservative.
                 //
                 // We do NOT want the engine blocking normal momentum
-                // breathing/pullbacks.
+                // breathing/pullbacks. Strong momentum remains exempt; a
+                // strong candle or breakout alone cannot cancel deterioration.
                 // ========================================================
 
                 const double WEAK_MOMENTUM_LEVEL = 0.50;
@@ -107,10 +103,7 @@ namespace MetaTrader.Services.Helper
 
                 const double SIGNIFICANT_DROP_PERCENT = 0.30;
 
-                const double EXTENDED_EMA_DISTANCE = 1.35;
-
-                const double STRONG_BODY_ATR = 1.00;
-
+                const double EXTENDED_EMA_DISTANCE = 0.85;
 
                 // ========================================================
                 // BUY FOLLOW-THROUGH
@@ -135,10 +128,6 @@ namespace MetaTrader.Services.Helper
                         emaDistanceAtr >= EXTENDED_EMA_DISTANCE;
 
 
-                    bool bodyStillPowerful =
-                        bodyAtr >= STRONG_BODY_ATR;
-
-
                     // ----------------------------------------------------
                     // HARD BLOCK
                     // ----------------------------------------------------
@@ -152,9 +141,7 @@ namespace MetaTrader.Services.Helper
                         significantDeterioration &&
                         weakCurrentMomentum &&
                         !strongMomentum &&
-                        priceExtended &&
-                        !bodyStillPowerful &&
-                        !confirmedBreakout;
+                        priceExtended;
 
 
                     if (blockBuy)
@@ -206,25 +193,23 @@ namespace MetaTrader.Services.Helper
 
                 if (action == TradeAction.EnterSell)
                 {
+                    // The supplied momentum value measures impulse STRENGTH,
+                    // not signed direction. Falling momentum weakens SELLs too.
                     bool momentumAgainstTrade =
-                        momentumRising;
-
-
-                    // For SELL, rising momentum represents deterioration
-                    // of the bearish impulse.
+                        momentumFalling;
 
                     double deteriorationPercent = 0.0;
 
                     if (previousMomentum > 0.000001)
                     {
                         deteriorationPercent =
-                            momentumIncrease /
+                            momentumDrop /
                             previousMomentum;
                     }
 
 
                     bool significantDeterioration =
-                        momentumIncrease >= SIGNIFICANT_DROP ||
+                        momentumDrop >= SIGNIFICANT_DROP ||
                         deteriorationPercent >= SIGNIFICANT_DROP_PERCENT;
 
 
@@ -236,18 +221,12 @@ namespace MetaTrader.Services.Helper
                         emaDistanceAtr >= EXTENDED_EMA_DISTANCE;
 
 
-                    bool bodyStillPowerful =
-                        bodyAtr >= STRONG_BODY_ATR;
-
-
                     bool blockSell =
                         momentumAgainstTrade &&
                         significantDeterioration &&
                         weakCurrentMomentum &&
                         !strongMomentum &&
-                        priceExtended &&
-                        !bodyStillPowerful &&
-                        !confirmedBreakout;
+                        priceExtended;
 
 
                     if (blockSell)
@@ -257,8 +236,8 @@ namespace MetaTrader.Services.Helper
                             $"momentum={momentum:F2} | " +
                             $"previousMomentum={previousMomentum:F2} | " +
                             $"change={momentumChange:F2} | " +
-                            $"rise={momentumIncrease:F2} | " +
-                            $"risePct={deteriorationPercent:P0} | " +
+                            $"drop={momentumDrop:F2} | " +
+                            $"dropPct={deteriorationPercent:P0} | " +
                             $"rising={momentumRising} | " +
                             $"falling={momentumFalling} | " +
                             $"strong={strongMomentum} | " +
@@ -278,8 +257,8 @@ namespace MetaTrader.Services.Helper
                         $"momentum={momentum:F2} | " +
                         $"previousMomentum={previousMomentum:F2} | " +
                         $"change={momentumChange:F2} | " +
-                        $"rise={momentumIncrease:F2} | " +
-                        $"risePct={deteriorationPercent:P0} | " +
+                        $"drop={momentumDrop:F2} | " +
+                        $"dropPct={deteriorationPercent:P0} | " +
                         $"rising={momentumRising} | " +
                         $"falling={momentumFalling} | " +
                         $"strong={strongMomentum} | " +
