@@ -233,7 +233,7 @@
                     ct.ThrowIfCancellationRequested();
 
                     // NOTE: adapt this if you use ".s" suffix logic
-                    // Example: symbolToUse = TradingConfig.Mode == XauUsdOnly ? symbol + ".s" : symbol;
+                    // Example: symbolToUse = TradingConfig.Mode == XAUUSD.sOnly ? symbol + ".s" : symbol;
                     string symbolToUse = symbol;
 
                     // startPos=1 to avoid current forming candle; count=bars

@@ -193,7 +193,7 @@ namespace MetaTrader.Services.Helper
                 ? (ask - recentHigh) / atr
                 : (recentLow - bid) / atr;
 
-            // The November 25 XAUEUR/XAUUSD losses both had >1.2 ATR live
+            // The November 25 XAUEUR.s/XAUUSD.s losses both had >1.2 ATR live
             // bodies, >1.1 ATR EMA extension, but only ~0.2 ATR clearance.
             // Do not chase the first small clearance after a mature H1 move.
             bool late = directionalBodyAtr >= 1.10 &&
@@ -735,7 +735,7 @@ namespace MetaTrader.Services.Helper
                 // GOLD ENTRY-LOCATION QUALITY GATE
                 // ========================================================
                 // PURPOSE:
-                // Prevent XAUUSD / XAUEUR from entering at the extreme end of
+                // Prevent XAUUSD.s / XAUEUR.s from entering at the extreme end of
                 // an already-expanded live candle.  This runs BEFORE Gold
                 // Acceleration so that acceleration cannot bypass anti-chase.
                 //
@@ -881,7 +881,7 @@ namespace MetaTrader.Services.Helper
                 // late enough for the anti-chase guard to reject it.
                 //
                 // IMPORTANT:
-                // - Gold only (XAUUSD / XAUEUR through IsGold()).
+                // - Gold only (XAUUSD.s / XAUEUR.s through IsGold()).
                 // - No method signature changes.
                 // - No caller changes.
                 // - Existing wick-rejection guard has already run.
@@ -2379,7 +2379,7 @@ namespace MetaTrader.Services.Helper
 
             // Gold also needs a slightly stronger renewed push after the
             // pullback.  This avoids confirming a reversal on a tiny 0.15-0.16
-            // ATR reaction such as the XAUUSD trade from 25-Sep-2026.
+            // ATR reaction such as the XAUUSD.s trade from 25-Sep-2026.
             double reboundAtrRequired =
                 isGold
                     ? 0.20

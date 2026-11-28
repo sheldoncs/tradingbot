@@ -28,7 +28,7 @@ namespace MetaTrader.Util
             double supportDistance = Math.Abs(midPrice - prevLow);
 
             // Dynamic buffer — tighter for XAU, looser for FX
-            double buffer = symbol == "XAUUSD"
+            double buffer = symbol == "XAUUSD.s"
                 ? Math.Max(atr * 0.30, 0.50)
                 : Math.Max(atr * 0.40, 0.0008);
 

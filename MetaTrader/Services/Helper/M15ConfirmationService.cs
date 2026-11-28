@@ -36,7 +36,7 @@
 
         private static readonly Dictionary<string, M15Profile> Profiles = new()
 {
-    { "XAUUSD", new M15Profile
+    { "XAUUSD.s", new M15Profile
         {
             ImpulseRangeAtr = 1.8,
             BodyRatioMin = 0.65,
@@ -73,7 +73,7 @@
         private static M15Profile GetProfile(string symbol)
         {
             if (symbol.Contains("XAU") || symbol.Contains("XAG"))
-                return Profiles["XAUUSD"];
+                return Profiles["XAUUSD.s"];
 
             if (symbol.Contains("US100") || symbol.Contains("NAS") || symbol.Contains("SPX"))
                 return Profiles["INDEX"];

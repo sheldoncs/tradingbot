@@ -76,7 +76,7 @@ namespace MetaTrader.Util
             double lastBody = Math.Abs(last.close - last.open);
 
             // ===== PARAMETERS =====
-            double buffer = Math.Max(atr * 0.05, 0.50);  // Early breakout buffer for XAUUSD
+            double buffer = Math.Max(atr * 0.05, 0.50);  // Early breakout buffer for XAUUSD.s
             double smallBodyThreshold = atr * 0.20;
             double impulseBodyThreshold = atr * 0.70;
 

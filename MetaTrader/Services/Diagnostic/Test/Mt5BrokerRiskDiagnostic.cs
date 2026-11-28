@@ -10,8 +10,8 @@
         {
             string[] symbols =
             {
-            "XAUUSD",
-            "XAUEUR",
+            "XAUUSD.s",
+            "XAUEUR.s",
             "EURUSD",
             "GBPUSD",
             "USDJPY",

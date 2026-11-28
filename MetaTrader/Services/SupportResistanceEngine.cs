@@ -40,7 +40,7 @@ namespace MetaTrader.Services
         // to punch straight through the hard wall.  Instead we remember
         // the setup and wait for price to CLEAR the outer edge.
         //
-        // This solves the 9/28 XAUUSD case:
+        // This solves the 9/28 XAUUSD.s case:
         // valid SELL near 4138 -> support band blocked it -> support
         // later failed -> price accelerated lower.
         // ============================================================
@@ -215,7 +215,7 @@ namespace MetaTrader.Services
         //
         // Strong impulse must NOT override this.
         //
-        // The XAUEUR trade had only 0.07 ATR of space.
+        // The XAUEUR.s trade had only 0.07 ATR of space.
         // Gold critical floor = 0.25 ATR, therefore it would be blocked.
         // ============================================================
 

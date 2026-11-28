@@ -74,7 +74,7 @@ namespace MetaTrader.Services.Helper
             // -----------------------------
             // GOLD / METALS
             // -----------------------------
-            ["XAUUSD"] = new SymbolLotProfile
+            ["XAUUSD.s"] = new SymbolLotProfile
             {
                 BaseLot = 0.01,
                 VolatilityFactor = 0.80,
@@ -84,7 +84,7 @@ namespace MetaTrader.Services.Helper
                 ContractSize = 100
             },
 
-            ["XAUEUR"] = new SymbolLotProfile
+            ["XAUEUR.s"] = new SymbolLotProfile
             {
                 BaseLot = 0.01,
                 VolatilityFactor = 0.75,
@@ -367,7 +367,7 @@ namespace MetaTrader.Services.Helper
             double riskAmount = accountEquity * riskPercent / 100.0;
             double slDistance = Math.Abs(entryPrice - stopLoss);
 
-            // GOLD: explicit fixed-lot execution mode for XAUUSD / XAUEUR.
+            // GOLD: explicit fixed-lot execution mode for XAUUSD.s / XAUEUR.s.
             // No broker loss calculator, verification configuration or USD-budget
             // veto. The caller must still send a valid broker-side SL.
             if (IsGold(symbol))
@@ -631,7 +631,7 @@ namespace MetaTrader.Services.Helper
                 return Profiles[symbol];
 
             if (IsGold(symbol))
-                return Profiles["XAUUSD"];
+                return Profiles["XAUUSD.s"];
 
             if (IsCrypto(symbol))
                 return Profiles["ETHUSD"];
@@ -656,7 +656,7 @@ namespace MetaTrader.Services.Helper
             symbol = NormalizeSymbol(symbol);
 
             return symbol.Contains("XAU") ||
-                   symbol.Contains("XAUEUR") ||
+                   symbol.Contains("XAUEUR.s") ||
                    symbol.Contains("XAG") ||
                    symbol.Contains("GOLD") ||
                    symbol.Contains("SILVER");

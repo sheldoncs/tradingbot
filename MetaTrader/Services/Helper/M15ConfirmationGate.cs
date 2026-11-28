@@ -242,7 +242,7 @@
             symbol = NormalizeSymbol(symbol);
 
             return symbol.Contains("XAU") ||
-                   symbol.Contains("XAUEUR") ||
+                   symbol.Contains("XAUEUR.s") ||
                    symbol.Contains("XAG") ||
                    symbol.Contains("GOLD") ||
                    symbol.Contains("SILVER");

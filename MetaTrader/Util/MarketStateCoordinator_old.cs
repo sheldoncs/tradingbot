@@ -80,8 +80,8 @@ namespace MetaTrader.Util
 
         private static readonly HashSet<string> GoldSymbols = new()
         {
-            "XAUUSD",
-            "XAUEUR"
+            "XAUUSD.s",
+            "XAUEUR.s"
         };
 
         private MarketUniverse GetUniverse(string symbol)
@@ -154,7 +154,7 @@ namespace MetaTrader.Util
         private void UpdateSymbolState(string marketSymbol)
         {   
             var ctx = GetContext(marketSymbol);
-            //if (TradingConfig.Mode == TradingMode.XauUsdOnly)
+            //if (TradingConfig.Mode == TradingMode.XAUUSD.sOnly)
             _client.CopyRates(marketSymbol, ENUM_TIMEFRAMES.PERIOD_H1, 1, 120, out MqlRates[] rates1H);
             if (rates1H == null || rates1H.Length < 3)
                 return;
@@ -215,17 +215,17 @@ namespace MetaTrader.Util
         )
         {
 
-            if (SYMBOL == "XAUUSD")
+            if (SYMBOL == "XAUUSD.s")
             {
                 Console.WriteLine("");
             }
 
-            if (TradingConfig.Mode == TradingMode.XauUsdOnly &&
-                  SYMBOL != "XAUUSD.s")
+            if (TradingConfig.Mode == TradingMode.XAUUSD.sOnly &&
+                  SYMBOL != "XAUUSD.s.s")
             {
                 return;
             } 
-            if (TradingConfig.Mode == TradingMode.XauUsdOnly)
+            if (TradingConfig.Mode == TradingMode.XAUUSD.sOnly)
                 Console.WriteLine($"Symbol={ctx.Symbol} previous State={ctx.PreviousState} current State={ctx.State} pullback sufficient={ctx.PullbackSufficient} cooldown={ctx.AtrCooldown}");
             
             coordinator = GetCoordinator(SYMBOL);

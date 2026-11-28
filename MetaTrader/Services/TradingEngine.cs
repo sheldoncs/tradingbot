@@ -22,7 +22,7 @@ namespace MetaTrader.Services
         private const int ChoppinessPeriod = 14;
         private const int CooldownCandles = 2;
         private double RiskPerTradeUsd = 40.0;      // USD risk per trade (used for dynamic lot sizing)
-        private static string SYMBOL = "XAUUSD";
+        private static string SYMBOL = "XAUUSD.s";
 
         private int cooldownRemaining = 0;
         private double startingDayEquity = 0;
@@ -570,7 +570,7 @@ namespace MetaTrader.Services
             var request = new MqlTradeRequest
             {
                 Action = ENUM_TRADE_REQUEST_ACTIONS.TRADE_ACTION_DEAL,
-                Symbol = "XAUUSD",
+                Symbol = "XAUUSD.s",
                 Volume = volume,
                 Type = ENUM_ORDER_TYPE.ORDER_TYPE_SELL,
                 Price = price,

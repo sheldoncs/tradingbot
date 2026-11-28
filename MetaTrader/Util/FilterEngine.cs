@@ -32,7 +32,7 @@ namespace MetaTrader.Util
             double previousHigh = prev.high;
             double previousLow = prev.low;
 
-            double minBuffer = SYMBOL == "XAUUSD" ? 0.50 : 0.20;
+            double minBuffer = SYMBOL == "XAUUSD.s" ? 0.50 : 0.20;
             double buffer = Math.Max(atrPoints * 0.05, minBuffer);
 
             bool isBelowHigh = midPrice < previousHigh;

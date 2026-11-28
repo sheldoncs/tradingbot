@@ -800,8 +800,8 @@
 
 
             return
-                s.Contains("XAUUSD") ||
-                s.Contains("XAUEUR") ||
+                s.Contains("XAUUSD.s") ||
+                s.Contains("XAUEUR.s") ||
                 s.StartsWith("XAU");
         }
 

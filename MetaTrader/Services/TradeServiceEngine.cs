@@ -134,7 +134,7 @@ namespace MetaTrader.Services
         const double StopLossPoints = 500.0;       // SL distance in "points"
         const double TakeProfitPoints = 600.0;    // TP distance in "points"
         const double TrailingStopPoints = 500.0;   // trailing stop distance in "points"
-        const double ContractSize = 100.0;        // XAUUSD contract size (100 oz per standard lot)
+        const double ContractSize = 100.0;        // XAUUSD.s contract size (100 oz per standard lot)
         static string lastSignal = null; // "BUY" or "SELL"
 
         double startingEquity = 0;
@@ -252,16 +252,16 @@ namespace MetaTrader.Services
 
         List<string> symbolsToTrade = new()
         {
-            "XAUUSD",
+            "XAUUSD.s",
             //"SOLUSD",
-            "XAUEUR"
+            "XAUEUR.s"
         };
 
         /*
         List<string> symbolsToTrade = new()
         {
             "BNBUSD",
-            "XAUUSD.s",
+            "XAUUSD.s.s",
             //"GBPUSD",
             "SOLUSD",
             //"EURUSD",
@@ -310,16 +310,16 @@ namespace MetaTrader.Services
                     ref _xauH1LiveProbeAttempted, 1, 0) != 0)
                 return;
 
-            const string testSymbol = "XAUUSD";
+            const string testSymbol = "XAUUSD.s";
             try
             {
                 if (_client == null)
                 {
-                    LogFile.Write("[XAUUSD] H1 LIVE TEST | FAILED | MT5 client is null");
+                    LogFile.Write("[XAUUSD.s] H1 LIVE TEST | FAILED | MT5 client is null");
                     return;
                 }
 
-                LogFile.Write($"[XAUUSD] H1 LIVE TEST | START | " +
+                LogFile.Write($"[XAUUSD.s] H1 LIVE TEST | START | " +
                               $"requestedShift=0 | requestedCount=2 | utcNow={DateTime.UtcNow:O}");
 
                 var copied = _client.CopyRates(
@@ -329,29 +329,29 @@ namespace MetaTrader.Services
                     2,
                     out MqlRates[] testRates);
 
-                LogFile.Write($"[XAUUSD] H1 LIVE TEST | RESULT | " +
+                LogFile.Write($"[XAUUSD.s] H1 LIVE TEST | RESULT | " +
                               $"copyResult={copied} | returnedCount={(testRates == null ? 0 : testRates.Length)}");
 
                 if (testRates == null || testRates.Length == 0)
                 {
-                    LogFile.Write("[XAUUSD] H1 LIVE TEST | NO DATA | Shift 0 yielded no candles");
+                    LogFile.Write("[XAUUSD.s] H1 LIVE TEST | NO DATA | Shift 0 yielded no candles");
                     return;
                 }
 
                 for (int i = 0; i < testRates.Length; i++)
                 {
                     var bar = testRates[i];
-                    LogFile.Write($"[XAUUSD] H1 LIVE TEST | index={i} | " +
+                    LogFile.Write($"[XAUUSD.s] H1 LIVE TEST | index={i} | " +
                                   $"time={bar.time} | open={bar.open:F2} | " +
                                   $"high={bar.high:F2} | low={bar.low:F2} | close={bar.close:F2}");
                 }
 
-                LogFile.Write("[XAUUSD] H1 LIVE TEST | END | " +
+                LogFile.Write("[XAUUSD.s] H1 LIVE TEST | END | " +
                               "Compare bar times against current broker H1 hour; array order is not assumed");
             }
             catch (Exception ex)
             {
-                LogFile.Write($"[XAUUSD] H1 LIVE TEST | ERROR | {ex.GetType().Name}: {ex.Message}");
+                LogFile.Write($"[XAUUSD.s] H1 LIVE TEST | ERROR | {ex.GetType().Name}: {ex.Message}");
             }
         }
 
@@ -415,7 +415,7 @@ namespace MetaTrader.Services
         }
 
         // GOLD uses the existing fixed profile lot. No verification flag or
-        // monetary loss-per-lot delegate is required for XAUUSD/XAUEUR.
+        // monetary loss-per-lot delegate is required for XAUUSD.s/XAUEUR.s.
         // Keep the method for existing constructor/reconnect calls.
         private void ConfigureGoldLotRisk()
         {
@@ -938,7 +938,7 @@ namespace MetaTrader.Services
         {
             try
             {
-                var copied = client.CopyRates("XAUUSD", ENUM_TIMEFRAMES.PERIOD_H1, 1, BarsToFetch, out MqlRates[] rates);
+                var copied = client.CopyRates("XAUUSD.s", ENUM_TIMEFRAMES.PERIOD_H1, 1, BarsToFetch, out MqlRates[] rates);
                 return rates != null && rates.Length > 0;
             }
             catch
@@ -2262,8 +2262,8 @@ namespace MetaTrader.Services
                 //
                 // IMPORTANT:
                 // RunParallelStrategy may begin with one Gold symbol
-                // (for example XAUUSD) and the coordinator can then select
-                // another (for example XAUEUR).
+                // (for example XAUUSD.s) and the coordinator can then select
+                // another (for example XAUEUR.s).
                 //
                 // Never reuse the old symbol's H1/H4 rates, EMA values,
                 // ATR, or candle time with the newly selected symbol's
@@ -3913,7 +3913,7 @@ namespace MetaTrader.Services
                         // symbol + magic. Verify the selected broker position
                         // once more before accepting the snapshot.
                         //
-                        // This prevents XAUUSD/XAUEUR position data from being
+                        // This prevents XAUUSD.s/XAUEUR.s position data from being
                         // accepted if MT5's selected-position state changes
                         // unexpectedly during concurrent callbacks.
                         // --------------------------------------------------
@@ -4999,7 +4999,7 @@ namespace MetaTrader.Services
                 // HARD SYMBOL OWNERSHIP BOUNDARY
                 //
                 // openTrades is static/shared. A timer running for
-                // XAUUSD must never evaluate an ETHUSD/XRPUSD/etc.
+                // XAUUSD.s must never evaluate an ETHUSD/XRPUSD/etc.
                 // trade with XAU market data.
                 // ==================================================
                 if (!string.Equals(

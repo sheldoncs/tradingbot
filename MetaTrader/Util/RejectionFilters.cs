@@ -23,7 +23,7 @@ namespace MetaTrader.Util
             bool longUpperWick = upperWick >= body * 1.2;     // wick bigger than body
             bool bearishClose = c.close < c.open;             // candle closes bearish
 
-            // 3️⃣ Allow XAUUSD volatility: upper wick can be big but body MUST be weak
+            // 3️⃣ Allow XAUUSD.s volatility: upper wick can be big but body MUST be weak
             bool weakBody = body <= atr * 0.25;
 
             // FINAL RULE:

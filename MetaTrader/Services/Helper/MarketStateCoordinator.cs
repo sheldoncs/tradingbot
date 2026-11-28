@@ -99,8 +99,8 @@ namespace MetaTrader.Services.Helper
 
         private static readonly HashSet<string> GoldSymbols = new()
         {
-                "XAUUSD",
-                "XAUEUR"
+                "XAUUSD.s",
+                "XAUEUR.s"
         };
 
         private MarketUniverse GetUniverse(string symbol)
@@ -170,7 +170,7 @@ namespace MetaTrader.Services.Helper
         // GOLD LIVE IMPULSE PRESELECTION
         // ================================================================
         // The original selector ranked closed-H1 MarketState and freshness.
-        // That could select XAUEUR while XAUUSD already had a valid live
+        // That could select XAUEUR.s while XAUUSD.s already had a valid live
         // impulse. Evaluate BOTH symbols against the EXISTING impulse rules.
         // This is selection only: M15/SR/risk/duplicate/MT5 final guards
         // remain authoritative inside TradeServiceEngine.
@@ -363,8 +363,8 @@ namespace MetaTrader.Services.Helper
             MqlRates[] rates1H
         )
         {
-            if (TradingConfig.Mode == TradingMode.XauUsdOnly &&
-                SYMBOL != "XAUUSD.s")
+            if (TradingConfig.Mode == TradingMode.XAUUSD.sOnly &&
+                SYMBOL != "XAUUSD.s.s")
             {
                 return;
             }

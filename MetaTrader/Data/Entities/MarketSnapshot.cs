@@ -4,7 +4,7 @@ namespace MetaTrader.Data.Entities
 {
     public class MarketSnapshot
     {
-        //public string Symbol { get; set; } = "XAUUSD";
+        //public string Symbol { get; set; } = "XAUUSD.s";
         public string Timeframe { get; set; } = "H1";
 
         // Last N candles

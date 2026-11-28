@@ -27,7 +27,7 @@ namespace MetaTrader.Util
             double resistanceDistance = Math.Abs(prevHigh - midPrice);
 
             // Dynamic buffer tuned for each symbol
-            double buffer = symbol == "XAUUSD"
+            double buffer = symbol == "XAUUSD.s"
                 ? Math.Max(atr * 0.30, 0.50)      // Gold = bigger noise
                 : Math.Max(atr * 0.40, 0.0008);  // Forex = pip-sized noise
 

@@ -16,11 +16,11 @@ namespace MetaTrader.Util
         )
         {
             // ---------------------------------------
-            // MODE: XAUUSD ONLY
+            // MODE: XAUUSD.s ONLY
             // ---------------------------------------
-            if (TradingConfig.Mode == TradingMode.XauUsdOnly)
+            if (TradingConfig.Mode == TradingMode.XAUUSD.sOnly)
             {
-                if (symbol != "XAUUSD.s")
+                if (symbol != "XAUUSD.s.s")
                     return false;
 
                 return InternalPermission(

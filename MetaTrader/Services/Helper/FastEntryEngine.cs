@@ -30,7 +30,7 @@ namespace MetaTrader.Services.Helper
 
         // GOLD: do not accept a transient EMA lean or a single large candle
         // as an escape from a sideways market. Track real range breaks separately
-        // for XAUUSD and XAUEUR; observations reset when the setup weakens.
+        // for XAUUSD.s and XAUEUR.s; observations reset when the setup weakens.
         private sealed class GoldRangeEscapeCandidate
         {
             public int Direction; // +1 BUY, -1 SELL
@@ -357,7 +357,7 @@ namespace MetaTrader.Services.Helper
 
             return !(escapeConfirmed || emergingConfirmed);
         }
-        // GOLD FINAL MOMENTUM-EXHAUSTION GUARD (XAUUSD / XAUEUR).
+        // GOLD FINAL MOMENTUM-EXHAUSTION GUARD (XAUUSD.s / XAUEUR.s).
         // Target a narrowly defined weak, sharply fading signal at a recent
         // structural boundary. Do not reject trend entries merely because
         // momentum is lower than its prior reading.
@@ -546,14 +546,14 @@ namespace MetaTrader.Services.Helper
             double retention = momentum / previousMomentum;
 
             // Pattern A: modest (>=5%) deterioration but only after a clearly
-            // expanded breakout, as seen in the losing XAUUSD entry.
+            // expanded breakout, as seen in the losing XAUUSD.s entry.
             bool fadingExtendedBreakout =
                 retention <= 0.95 && momentum <= 0.65 &&
                 emaDistAtr >= 1.10 && directionalBodyAtr >= 0.80 &&
                 breakAtr >= 0.35;
 
             // Pattern B: more pronounced (>=15%) deterioration at a similarly
-            // mature location, as seen in the losing XAUEUR entry.
+            // mature location, as seen in the losing XAUEUR.s entry.
             bool sharplyFadingExtendedBreakout =
                 retention <= 0.85 && momentum <= 0.65 &&
                 emaDistAtr >= 1.00 && directionalBodyAtr >= 0.75 &&
@@ -1671,7 +1671,7 @@ namespace MetaTrader.Services.Helper
                     //     BUY  -> M15 Bullish must be true
                     //     SELL -> M15 Bearish must be true
                     //
-                    // GOLD (XAUUSD.s/XAUEUR.s): NO exception. M15 must confirm.
+                    // GOLD (XAUUSD.s.s/XAUEUR.s.s): NO exception. M15 must confirm.
                     // Non-GOLD retains its existing strong-impulse exception.
                     // =====================================================
 
@@ -1681,7 +1681,7 @@ namespace MetaTrader.Services.Helper
                         );
 
 
-                    // GOLD (XAUUSD.s and XAUEUR.s): closed M15 directional confirmation
+                    // GOLD (XAUUSD.s.s and XAUEUR.s.s): closed M15 directional confirmation
                     // is mandatory. H1 momentum, structural breaks, or regime
                     // transitions must never override a missing/opposing M15.
                     // Preserve the original high-momentum exception for NON-GOLD.

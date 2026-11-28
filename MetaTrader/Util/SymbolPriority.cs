@@ -13,8 +13,8 @@ namespace MetaTrader.Util
 
         private static readonly Dictionary<string, double> GoldPriority = new()
         {
-            { "XAUUSD", 0.60 },
-            { "XAUEUR", 0.40 },
+            { "XAUUSD.s", 0.60 },
+            { "XAUEUR.s", 0.40 },
         };
 
         private static readonly Dictionary<string, double> IndexPriority = new()
