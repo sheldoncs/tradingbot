@@ -91,6 +91,147 @@
 
 
             // ============================================================
+            // GOLD LIVE ADVERSE-MOVE EXIT ASSESSMENT
+            // Called by the existing position risk loop; never issues broker orders directly.
+            // The unified risk engine keeps priority over this additional early-exit rule.
+            // A high-risk signal must persist across TWO samples (at least 10s apart).
+            // Thresholds are experimental and should be validated against tick replay.
+            // ============================================================
+            private sealed class GoldPredictionSample
+            {
+                public double Price;
+                public DateTime SeenUtc;
+                public DateTime LastEvaluatedUtc;
+                public int ConsecutiveHighRisk;
+            }
+
+            private static readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, GoldPredictionSample>
+                _goldPredictionSamples = new System.Collections.Concurrent.ConcurrentDictionary<ulong, GoldPredictionSample>();
+            private static readonly TimeSpan _goldPredictionInterval = TimeSpan.FromSeconds(10);
+            private const double GoldPredictionMinimumLossUsd = 1.50;
+
+            private static bool ShouldExitGoldAdverseMove(
+                TrackedTrade trade,
+                double bid,
+                double ask,
+                double atr,
+                MqlRates[] closedH1,
+                double[] ema9,
+                double[] ema21,
+                out string reason)
+            {
+                reason = string.Empty;
+                try
+                {
+                    if (trade == null || trade.Ticket == 0 ||
+                        string.IsNullOrWhiteSpace(trade.Symbol) ||
+                        !(trade.Symbol.Contains("XAU", StringComparison.OrdinalIgnoreCase) ||
+                          trade.Symbol.Contains("GOLD", StringComparison.OrdinalIgnoreCase)) ||
+                        trade.Side != TradeSide.Buy && trade.Side != TradeSide.Sell ||
+                        double.IsNaN(trade.ProfitUsd) || double.IsInfinity(trade.ProfitUsd) ||
+                        atr <= 0 || bid <= 0 || ask <= 0 ||
+                        closedH1 == null || closedH1.Length < 2 ||
+                        ema9 == null || ema9.Length < 2 ||
+                        ema21 == null || ema21.Length < 2)
+                        return false;
+
+                    DateTime now = DateTime.UtcNow;
+                    bool buy = trade.Side == TradeSide.Buy;
+                    double executable = buy ? bid : ask;
+                    var sample = _goldPredictionSamples.GetOrAdd(trade.Ticket, _ => new GoldPredictionSample
+                    {
+                        Price = executable,
+                        SeenUtc = now,
+                        LastEvaluatedUtc = DateTime.MinValue
+                    });
+
+                    double previousPrice;
+                    double elapsedSeconds;
+                    lock (sample)
+                    {
+                        if (now - sample.LastEvaluatedUtc < _goldPredictionInterval)
+                            return false;
+                        previousPrice = sample.Price;
+                        elapsedSeconds = Math.Max(0.001, (now - sample.SeenUtc).TotalSeconds);
+                        sample.Price = executable;
+                        sample.SeenUtc = now;
+                        sample.LastEvaluatedUtc = now;
+                    }
+
+                    double adverse = Math.Max(0, buy ? trade.EntryPrice - executable : executable - trade.EntryPrice);
+                    double adverseAtr = adverse / atr;
+                    double movementAgainst = buy ? previousPrice - executable : executable - previousPrice;
+                    double velocityAtrPerMinute = movementAgainst / atr * 60.0 / elapsedSeconds;
+                    bool wrongSide9 = buy ? executable < ema9[^1] : executable > ema9[^1];
+                    bool wrongSide21 = buy ? executable < ema21[^1] : executable > ema21[^1];
+                    bool ema9SlopeAgainst = buy ? ema9[^1] < ema9[^2] : ema9[^1] > ema9[^2];
+                    var closed = closedH1[^1];
+                    double range = Math.Max(0, closed.high - closed.low);
+                    double bodyRatio = range > 0 ? Math.Abs(closed.close - closed.open) / range : 0;
+                    bool oppositeStrong =
+                        (buy ? closed.close < closed.open : closed.close > closed.open) &&
+                        bodyRatio >= 0.62;
+                    bool adverseAcceleration = adverseAtr >= 0.20 && velocityAtrPerMinute > 0.04;
+                    int evidence = (wrongSide9 ? 1 : 0) + (wrongSide21 ? 1 : 0) +
+                                   (ema9SlopeAgainst ? 1 : 0) + (oppositeStrong ? 1 : 0) +
+                                   (adverseAcceleration ? 1 : 0);
+
+                    // This is a rules-based failure assessment, not a calibrated probability.
+                    // Do not exit positive trades or repeatedly exit on EMA conditions alone.
+                    bool highRisk = trade.ProfitUsd <= -GoldPredictionMinimumLossUsd &&
+                                    evidence >= 4 && adverseAtr >= 0.10 &&
+                                    (oppositeStrong || adverseAcceleration);
+                    int confirmations;
+                    lock (sample)
+                    {
+                        sample.ConsecutiveHighRisk = highRisk ? sample.ConsecutiveHighRisk + 1 : 0;
+                        confirmations = sample.ConsecutiveHighRisk;
+                    }
+                    LogFile.Write(
+                        $"[GOLD LIVE PREDICTION] ticket={trade.Ticket} | symbol={trade.Symbol} | " +
+                        $"side={trade.Side} | evidence={evidence}/5 | confirm={confirmations}/2 | " +
+                        $"profitUsd={trade.ProfitUsd:F2} | adverseATR={adverseAtr:F3} | " +
+                        $"velocityATRmin={velocityAtrPerMinute:F3} | " +
+                        $"EMA9Wrong={wrongSide9} | EMA21Wrong={wrongSide21} | " +
+                        $"EMA9SlopeWrong={ema9SlopeAgainst} | oppositeBody={oppositeStrong} | " +
+                        $"accelerating={adverseAcceleration}");
+
+                    if (_goldPredictionSamples.Count > 256)
+                        foreach (var item in _goldPredictionSamples)
+                            if (now - item.Value.SeenUtc > TimeSpan.FromHours(12))
+                                _goldPredictionSamples.TryRemove(item.Key, out _);
+
+                    if (confirmations < 2) return false;
+                    reason = $"GOLD predictive adverse-move exit | evidence={evidence}/5 | " +
+                             $"confirmations={confirmations} | profit={trade.ProfitUsd:F2} | " +
+                             $"adverseATR={adverseAtr:F3} | velocityATRmin={velocityAtrPerMinute:F3}";
+                    // Avoid retaining confirmation state after triggering a close request.
+                    _goldPredictionSamples.TryRemove(trade.Ticket, out _);
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    try { LogFile.Write($"[GOLD LIVE PREDICTION] assessment failed: {ex.Message}"); }
+                    catch { }
+                    return false; // Existing unified risk handling remains authoritative.
+                }
+            }
+
+            // GOLD predictive early-exit assessment, migrated from TradeServiceEngine.
+            // This cannot override an existing Close or MoveStopLoss decision.
+            public static RiskDecision ApplyGoldAdverseMoveProtection(
+                RiskDecision decision, TrackedTrade trade, double bid, double ask,
+                double atr, MqlRates[] closedH1, double[] ema9, double[] ema21)
+            {
+                if (decision == null || decision.Action != RiskAction.Hold)
+                    return decision;
+                if (ShouldExitGoldAdverseMove(trade, bid, ask, atr, closedH1,
+                        ema9, ema21, out string reason))
+                    return RiskDecision.Close(decision.Stage, reason);
+                return decision;
+            }
+
+            // ============================================================
             // SYMBOL PROFILE
             // ============================================================
 
@@ -210,6 +351,11 @@
                 if (peakUsd >= 13.00) return 6.00;
                 if (peakUsd >= 10.00) return 4.00;
                 if (peakUsd >= 8.00) return 2.00;
+                // Small-winner tiers: prevent an established +$4/+6 GOLD
+                // winner from fully reversing into a loss. These are
+                // deliberately smaller than the 60% lock at +$8.
+                if (peakUsd >= 6.00) return 2.00;
+                if (peakUsd >= 4.00) return 0.50;
                 return 0.00;
             }
 
@@ -893,6 +1039,45 @@
                 //
                 // This runs while stage is still Developing.
                 // ========================================================
+
+                // GOLD SMALL-WINNER BROKER STOP (peak +$4 to below +$8).
+                // The mandatory profit-floor check above provides a software
+                // close even when broker stop modification is impossible.
+                // Never intentionally replace the protective SL with a losing stop.
+                if (IsGold(s) &&
+                    peakProfit >= 4.00 &&
+                    peakProfit < profile.ProtectAtProfitUsd &&
+                    tickSize > 0 && tickValue > 0 && trade.Volume > 0 &&
+                    bid > 0 && ask >= bid)
+                {
+                    double smallGoldFloorUsd = GoldMandatoryProfitFloorUsd(peakProfit, profile);
+                    if (smallGoldFloorUsd > 0 && currentProfit > smallGoldFloorUsd)
+                    {
+                        double goldMinDistance = Math.Max(
+                            brokerMinStopDistancePrice,
+                            atr * Math.Max(profile.MinStopDistanceAtr, profile.EarlyBrokerMinDistanceAtr));
+                        double requestedGoldSL = ProfitUsdToStopPrice(
+                            trade, smallGoldFloorUsd, tickSize, tickValue);
+                        double validatedGoldSL = NormalizeStopLossToTick(
+                            trade,
+                            ValidateStopLoss(trade, requestedGoldSL, bid, ask, goldMinDistance),
+                            tickSize);
+                        bool goldStopLocksProfit = trade.Side == TradeSide.Buy
+                            ? validatedGoldSL > trade.EntryPrice
+                            : validatedGoldSL < trade.EntryPrice;
+                        if (goldStopLocksProfit &&
+                            ShouldImproveStop(trade, validatedGoldSL, tickSize))
+                        {
+                            string reason = $"GOLD SMALL-WINNER BROKER SL | " +
+                                $"peak={peakProfit:F2} | profit={currentProfit:F2} | " +
+                                $"floorUsd={smallGoldFloorUsd:F2} | " +
+                                $"requestedSL={requestedGoldSL:F5} | " +
+                                $"validatedSL={validatedGoldSL:F5}";
+                            LogMoveSL(trade, stage, validatedGoldSL, reason);
+                            return RiskDecision.MoveSL(stage, validatedGoldSL, reason);
+                        }
+                    }
+                }
 
                 if (!IsGold(s) &&
                     earlyProtectionArmed &&

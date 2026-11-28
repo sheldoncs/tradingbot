@@ -168,6 +168,47 @@ namespace MetaTrader.Services.Helper
         }
 
         private const bool EnableConfirmedReversals = false;
+        // GOLD: reject an already-expanded H1 candle that is only just past a
+        // closed-structure boundary and materially stretched from LIVE EMA9.
+        // This is NOT a blanket 1.10-ATR cap: early acceleration, pullbacks,
+        // and substantial clean breakouts retain their existing requirements.
+        // Shared by direct impulses and armed/swing structural promotions.
+        private static bool GoldLateShallowBreakBlocked(
+            string symbol, TradeAction direction, MqlRates liveCandle,
+            double atr, double ema9, double recentHigh, double recentLow,
+            double bid, double ask)
+        {
+            if (!IsGold(symbol) || atr <= 0 || ema9 <= 0 ||
+                bid <= 0 || ask < bid ||
+                (direction != TradeAction.EnterBuy && direction != TradeAction.EnterSell))
+                return false;
+
+            bool buy = direction == TradeAction.EnterBuy;
+            double mid = (bid + ask) * 0.5;
+            double directionalBodyAtr = buy
+                ? Math.Max(0.0, mid - liveCandle.open) / atr
+                : Math.Max(0.0, liveCandle.open - mid) / atr;
+            double emaDistanceAtr = Math.Abs((buy ? ask : bid) - ema9) / atr;
+            double breakAtr = buy
+                ? (ask - recentHigh) / atr
+                : (recentLow - bid) / atr;
+
+            // The November 25 XAUEUR/XAUUSD losses both had >1.2 ATR live
+            // bodies, >1.1 ATR EMA extension, but only ~0.2 ATR clearance.
+            // Do not chase the first small clearance after a mature H1 move.
+            bool late = directionalBodyAtr >= 1.10 &&
+                        emaDistanceAtr >= 1.10 &&
+                        breakAtr >= 0.05 && breakAtr <= 0.30;
+            if (late)
+            {
+                LogFile.Write($"[{symbol}] GOLD LATE SHALLOW BREAK BLOCK | " +
+                    $"action={direction} | bodyATR={directionalBodyAtr:F2} | " +
+                    $"emaDistATR={emaDistanceAtr:F2} | breakATR={breakAtr:F2} | " +
+                    "reason=H1 already expanded and stretched while structure clearance remains small");
+            }
+            return late;
+        }
+
         // Reuse the GOLD live impulse's EXISTING late-location limits for
         // alternative structural entries. This is a location check only;
         // it neither approves a trade nor changes the impulse detector.
@@ -181,6 +222,10 @@ namespace MetaTrader.Services.Helper
                 atr <= 0 || ema9 <= 0 || ema21 <= 0 ||
                 bid <= 0 || ask < bid ||
                 (action != TradeAction.EnterBuy && action != TradeAction.EnterSell))
+                return false;
+
+            if (GoldLateShallowBreakBlocked(symbol, action, liveCandle,
+                    atr, ema9, recentHigh, recentLow, bid, ask))
                 return false;
 
             LiveImpulseProfile profile = GetProfile(symbol);
@@ -812,6 +857,18 @@ namespace MetaTrader.Services.Helper
                     }
                 }
 
+
+                // Apply the same late shallow-break location veto to NORMAL
+                // impulse detection. Armed/swing paths call it from the
+                // GoldAlternativeLocationIsSafe helper above.
+                if (IsGold(symbol) &&
+                    ((bearishLiveCandle && sellRegimeAllowed &&
+                      GoldLateShallowBreakBlocked(symbol, TradeAction.EnterSell,
+                          liveCandle, atr, ema9, recentHigh, recentLow, bid, ask)) ||
+                     (bullishLiveCandle && buyRegimeAllowed &&
+                      GoldLateShallowBreakBlocked(symbol, TradeAction.EnterBuy,
+                          liveCandle, atr, ema9, recentHigh, recentLow, bid, ask))))
+                    return false;
 
                 // ========================================================
                 // GOLD ACCELERATION IMPULSE
